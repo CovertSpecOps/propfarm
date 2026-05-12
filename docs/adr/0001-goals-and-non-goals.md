@@ -23,6 +23,13 @@ Phase-0 or Phase-1 decision. Firm risk (~80–100 prop firms collapsed
 this distinguishes the system from a naive "pass evaluation and compound"
 playbook.
 
+**Target firms (priority order):** FTMO is the primary firm. FundedNext is
+the secondary firm, run in parallel for diversification. FundingPips is the
+cheap-retry bucket for failed challenges. The capital deployment ladder
+(how the $1000 evaluation budget splits across Phase A / Phase B / Phase C)
+lives in the Phase-1 budget plan; this ADR pins the firm-priority order but
+not the dollar splits.
+
 ## Decision: Objectives in priority order (do not invert)
 
 The order is binding. A later objective is never optimized at the expense of
@@ -36,11 +43,12 @@ one wins by construction.
    either threshold in any single simulated path is rejected, not
    re-tuned.
 2. **Pass evaluations reliably.** Bootstrapped historical paths must show
-   ≥ 60% pass rate on one-step challenges at conservative risk and
-   ≥ 40% on two-step challenges. A single backtest pass does not count —
-   the metric is the distribution over resampled paths, not a point
-   estimate. "Reliable" is a property of the distribution, not the
-   headline number.
+   ≥ 60% pass rate on one-step challenges (single profit target, no
+   verification leg) and ≥ 40% on two-step challenges (challenge phase
+   + verification phase) at conservative risk. The "pass rate" is the
+   **5th-percentile** of the bootstrap distribution of pass outcomes, not
+   the point estimate from one backtest. "Reliable" is a property of the
+   lower tail, not the headline number.
 3. **Maximize risk-adjusted ROI.** Optimize for Sortino and Calmar, not
    raw return. Sharpe is reported but never optimized against directly
    (it punishes upside volatility identically to downside). Stretch
@@ -64,10 +72,11 @@ Withdrawal converts firm liability into user asset.
 
 Operational corollary: a funded account's sizing mode switches from
 **AGGRESSIVE** to **PRESERVATION** the moment it becomes payout-eligible
-and remains in PRESERVATION until the withdrawal clears. Defined in the
-challenge state machine (see Day 12 plan / `rules/state_machine.py`).
-PRESERVATION roughly halves per-trade risk and tightens daily-loss
-predicates; the exact numbers live in the state-machine module, not here.
+and remains in PRESERVATION until the withdrawal clears. The switch is
+implemented in the challenge state-machine module. PRESERVATION roughly
+halves per-trade risk and tightens daily-loss predicates; the exact
+magnitudes live with the state machine, not in this ADR, so the values
+can be tuned without amending project goals.
 
 ## Decision: Hard constraints
 
@@ -131,6 +140,14 @@ not a code change.
 - **No reliance on a single firm.** Diversify firm exposure from day
   one. Concentration on one firm is a single point of failure regardless
   of that firm's current reputation.
+- **No copy-trading across accounts at the same firm.** (Mirrors the
+  hard-constraint above; flagged here so scope-creep audits skimming only
+  the Non-goals list still catch it. The hard-constraint version is the
+  binding one; this entry is redundancy on purpose.)
+- **No silent relaxation of validation-gate thresholds.** DSR > 0.95,
+  PBO < 0.5, and the MC 5th-percentile equity-curve gate are floors, not
+  targets. A future validation-gates ADR may tighten them but never relax
+  them without amending this ADR explicitly.
 
 ## Consequences
 
@@ -178,3 +195,8 @@ occur:
   industry, regulatory change), the priority order may need to be
   revisited — survival still wins, but pass-rate ceases to be
   objective 2 and ROI moves up.
+- **A strategy passes everything except DSR/PBO** (or the MC 5th-pct
+  gate). Do not relax the threshold silently to ship. Either tighten
+  sizing, kill the strategy, or reopen this ADR with a written
+  justification. The whole point of pinning the deploy bar here is to
+  make this decision visible.
