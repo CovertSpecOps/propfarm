@@ -237,9 +237,19 @@ Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementati
 
 | Blocker | Owner | Status |
 |---|---|---|
-| Provision Windows VPS (Contabo Frankfurt recommended, ~$11/mo) | user | ⬜ pending |
-| Sign up FTMO MT5 demo (free, ftmo.com/en/free-trial) | user | ⬜ pending |
-| Install MT5 terminal + Python 3.12 on VPS, drop secrets file | user | ⬜ pending |
-| Run `scripts/spike_mt5.py` on VPS and paste stdout to STATUS.md | user | ⬜ pending |
+| Provision Windows VPS | user | ✅ done 2026-05-12 — Vultr Amsterdam, voc-c-2c-4gb-50s, Win Server 2022 Std, IP `95.179.153.105`. UTC TZ, sleep/screen disabled, IE ESC disabled, updates applied, RDP from Mac confirmed working |
+| FTMO Client Area signup | user | ✅ done |
+| FTMO Free Trial activation | user | ⬜ pending (user mid-Block-C) |
+| Install MT5 terminal + Python 3.11 on VPS, drop secrets file | user | ⬜ pending |
+| Run `scripts/spike_mt5.py` on VPS and paste stdout | user | ⬜ pending — **ETA 24h** |
 
-Until the spike result lands, ADR-0002 (stack-lock) and ADR-0003 (bridge choice) cannot finalize. The data-layer and validation-math work (B1, B2.5, B3a, B3b) can proceed in parallel.
+Until the spike result lands, ADR-0002 (stack-lock) and ADR-0003 (bridge choice) cannot finalize. The data-layer and validation-math work (B1, B2.5, W1+) proceeds in parallel without blocking on the spike.
+
+### W1 drift-check rule (active until ADR-0002 + 0003 close)
+
+**VPS IP `95.179.153.105` and any MT5 host string belong in ADR-0002 / ADR-0003 and the bridge config that derives from them — NOT in any W1 artifact.** Reviewer rejects any W1 file (downloaders, snapshot writer, tests) that hardcodes:
+- The VPS IP literal.
+- An MT5 server string (e.g. `FTMO-Demo`, `FTMO-Demo2`).
+- Anything that presumes the direct-pkg path will win for the eventual bridge.
+
+Data-layer code stays broker-agnostic. Period.
