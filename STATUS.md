@@ -1,8 +1,15 @@
 # STATUS
 
 **Phase:** 0 — Foundations
-**Last validated:** —
-**Next:** await DAG approval, then dispatch Layer 0 (Tasks 1.1 + 1.3 in parallel)
+**Last validated:** 2026-05-12 — B0 complete (Tasks 1.1 and 1.3 both passed two-stage review)
+**Next:** B1 (Task 1.2 pre-commit + Task 2.1 ADR-0001), B2 (Task 2.2 ADR-0002 stack-lock), B2.5 (synthetic returns fixture), then B3 fan-out
+
+## Session log
+
+- **2026-05-12** — DAG approved. B0 dispatched (parallel agents for 1.1 and 1.3). Both impl agents passed self-review. Two fresh reviewer agents returned APPROVED WITH FOLLOW-UPS. Real bugs caught by reviewers: (a) `.gitignore` had broken `~/...` pattern that git does not expand; (b) `spike_mt5.py` leaked MT5 session on failure paths. Both fixed. Three commits on `main`:
+  - `e041372` chore: init repo skeleton with pyproject and tooling
+  - `1397dd7` fix(repo): apply Task 1.1 reviewer follow-ups
+  - `1af89a6` feat(bridge): Task 1.3 MT5 spike script, runbook, and ZMQ fallback design
 
 ---
 
@@ -155,10 +162,12 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 
 | Batch | When | Tasks | Notes |
 |---|---|---|---|
-| **B0** | now | 1.1, 1.3 | Repo init + MT5 spike (different machines). 1.3 owner needs Windows VPS access |
-| **B1** | after 1.1 | 1.2, 2.1 | Tooling gate + goals ADR |
-| **B2** | after 1.3 | 2.2 | Stack-lock ADR (gated on spike result) |
-| **B3** | after 1.2 | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 8.1, 8.2, 9.1, 9.2, 10.1, 11.1, 11.2 | **14 parallel agents** — largest batch |
+| **B0** | ✅ done 2026-05-12 | 1.1, 1.3 | Repo init + MT5 spike package (script + runbook + ZMQ fallback). User-side: VPS provisioning still pending |
+| **B1** | next | 1.2, 2.1 | Pre-commit gate + ADR-0001 goals |
+| **B2** | after B1 + spike result | 2.2 | Stack-lock ADR (gated on user running the spike) |
+| **B2.5** | parallel with B1/B2 | synthetic returns fixture | Canonical `fixtures/synthetic_returns.parquet` (trending, mean-reverting, choppy, fat-tailed). **Hard prerequisite for B3 validation-math subset.** |
+| **B3a** | after B2.5 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV/walkforward/DSR/PBO/MC). All consume the fixture |
+| **B3b** | after B1 (parallel with B2.5) | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 11.1, 11.2 | Data DLs + snapshot + quality + linter + cost components + rules predicates |
 | **B4** | after 3.1+3.2 | 3.3 | Background fetch (long-running, single agent) |
 | **B5** | after 4.1 | 5.2 | Gap report (needs snapshot iface, not real data) |
 | **B6** | after 11.1+11.2 | 12.1 | State machine |
@@ -171,7 +180,7 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 | **B13** | after 14.2+7.2 | **14.3 (Gate 2)** | MT5 hello-world + sim/live compare |
 | **B14** | after 13.1+14.3 + everything | **15.1 Phase 0 gate review** | Final |
 
-B3 is the big one — 14 tasks dispatched simultaneously via `superpowers:dispatching-parallel-agents`. This is the single biggest wall-clock saver.
+B3 has been split into B3a (validation math, 5 tasks, blocked by B2.5 fixture) and B3b (everything else, 9 tasks, parallel-friendly). B2.5 was added per user constraint: all validation-math agents must consume the same canonical synthetic-returns fixture. Reviewer flags any B3a agent that generates its own.
 
 ---
 
@@ -194,3 +203,14 @@ Acceptance gates (13.1, 14.3, 15.1) get an additional `superpowers:verification-
 | Gate 1: Placebo (alpha-leak detector) | ⬜ pending | — |
 | Gate 2: MT5 hello-world + sim/live fill compare (cost-leak detector) | ⬜ pending | — |
 | Phase 0 gate review | ⬜ pending | — |
+
+## User-side blockers (cannot be done by agents)
+
+| Blocker | Owner | Status |
+|---|---|---|
+| Provision Windows VPS (Contabo Frankfurt recommended, ~$11/mo) | user | ⬜ pending |
+| Sign up FTMO MT5 demo (free, ftmo.com/en/free-trial) | user | ⬜ pending |
+| Install MT5 terminal + Python 3.12 on VPS, drop secrets file | user | ⬜ pending |
+| Run `scripts/spike_mt5.py` on VPS and paste stdout to STATUS.md | user | ⬜ pending |
+
+Until the spike result lands, ADR-0002 (stack-lock) and ADR-0003 (bridge choice) cannot finalize. The data-layer and validation-math work (B1, B2.5, B3a, B3b) can proceed in parallel.
