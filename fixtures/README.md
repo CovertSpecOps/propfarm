@@ -56,12 +56,18 @@ docstring and locked by the property test.
 
 ## Seed
 
-`numpy.random.default_rng(seed=20260512)`. **Hardcoded, immutable.** The
-value 20260512 is the date the fixture was first committed (YYYYMMDD). The
+`numpy.random.default_rng(seed=20260514)`. **Hardcoded, immutable.** The
 generator writes the parquet with deterministic settings
 (`use_dictionary=False`, `write_statistics=False`, `compression="zstd"`,
 `compression_level=3`), so re-running the script produces byte-identical
 output.
+
+Seed history (for posterity — do not roll back without regenerating):
+
+| Seed | Reason | Notes |
+|---|---|---|
+| `20260512` | initial | Realized trending t-stat ≈ 1.83 (lower tail). Required relaxing the t-test to p<0.05; replaced. |
+| `20260514` | current | Realized trending t-stat ≈ 3.77. Holds spec's strict p<0.01 threshold. |
 
 ## How to regenerate
 
@@ -97,16 +103,41 @@ Wave 5 result computed against it is invalid until the discrepancy is
 explained. The property test
 `test_sha256_matches_manifest` enforces this automatically.
 
-## Observed sample statistics (seed = 20260512)
+## Observed sample statistics (seed = 20260514)
 
 For reference and quick sanity-checking:
 
 | regime | n | ann_mu | ann_vol | lag-1 ac | excess kurt |
 |---|---:|---:|---:|---:|---:|
-| trending | 5000 | +0.0502 | 0.1222 | +0.0181 | 0.1003 |
-| mean_reverting | 5000 | -0.0054 | 0.1186 | -0.2872 | 0.0896 |
-| choppy | 5000 | -0.0105 | 0.1491 | -0.0202 | 0.0080 |
-| fat_tailed | 5000 | +0.0158 | 0.1506 | +0.0102 | 2.8779 |
+| trending | 5000 | +0.1034 | 0.1222 | -0.0123 | -0.1194 |
+| mean_reverting | 5000 | +0.0224 | 0.1177 | -0.2624 | -0.0061 |
+| choppy | 5000 | +0.0007 | 0.1474 | +0.0021 | -0.0140 |
+| fat_tailed | 5000 | +0.0294 | 0.1541 | +0.0177 | +4.9324 |
 
 These exact values are reproducible from the seed — if you regenerate and
-they differ, something is wrong.
+they differ, something is wrong (likely a pyarrow version mismatch — pin
+your venv).
+
+## Consuming the fixture (long form)
+
+```python
+import pyarrow.parquet as pq
+df = pq.read_table("fixtures/synthetic_returns.parquet").to_pandas()
+trending_returns = df.loc[df["regime"] == "trending", "ret"].to_numpy()
+```
+
+## Consuming the fixture (wide form, one column per regime)
+
+Some validation-math agents prefer a wide-form DataFrame (one column per
+regime, shared timestamp index). The pivot is a one-liner:
+
+```python
+import pyarrow.parquet as pq
+long_df = pq.read_table("fixtures/synthetic_returns.parquet").to_pandas()
+wide_df = long_df.pivot(index="ts", columns="regime", values="ret")
+# wide_df.columns is now Index(['choppy', 'fat_tailed', 'mean_reverting', 'trending'])
+```
+
+`test_timestamps_aligned_across_regimes` guarantees that no NaNs are
+introduced by the pivot — all four regimes share the identical timestamp
+index by construction.

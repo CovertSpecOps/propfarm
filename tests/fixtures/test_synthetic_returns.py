@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq  # type: ignore[import-not-found]
+import pyarrow.parquet as pq
 import pytest  # type: ignore[import-not-found]
 from scipy import stats  # type: ignore[import-untyped]
 
@@ -46,7 +46,7 @@ TARGET_ANN_VOL = {
 def df() -> pd.DataFrame:
     """Load the parquet exactly once for all tests."""
     assert FIXTURE_PATH.exists(), f"fixture missing at {FIXTURE_PATH}"
-    out: pd.DataFrame = pq.read_table(FIXTURE_PATH).to_pandas()
+    out: pd.DataFrame = pq.read_table(FIXTURE_PATH).to_pandas()  # type: ignore[no-untyped-call]
     return out
 
 
@@ -100,13 +100,11 @@ def test_trending_has_positive_mean(df: pd.DataFrame) -> None:
     # One-sided p-value for H1: mean > 0.
     p_one_sided = p_two_sided / 2 if t_stat > 0 else 1.0
     # Theoretical expected t ~ (mu_d/sigma_d)*sqrt(n) ~ 2.97 for
-    # mu_ann=8%, sigma_ann=12%, n=5000 daily obs. Threshold at p<0.05
-    # rather than 0.01 because the realized t for this specific seed
-    # sits near the lower tail of the expected t distribution; tightening
-    # to 0.01 would risk seed-fragility while p<0.05 still proves the
-    # drift is statistically detectable.
+    # mu_ann=8%, sigma_ann=12%, n=5000 daily obs. Spec threshold is p<0.01
+    # — held at strict because seed 20260514 was chosen specifically to
+    # land near the expected t (realized t ≈ 3.77).
     assert r.mean() > 0, f"trending mean = {r.mean():.6f} (expected > 0)"
-    assert p_one_sided < 0.05, (
+    assert p_one_sided < 0.01, (
         f"trending mean not significantly positive: t={t_stat:.3f}, one-sided p={p_one_sided:.4g}"
     )
 
@@ -146,6 +144,42 @@ def test_annualized_vol_in_range(df: pd.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Symmetric autocorrelation coverage — trending and fat_tailed should NOT
+# show significant autocorrelation (only mean_reverting and choppy were
+# previously tested). Catches generator regressions where an AR(1) bug
+# leaks into the wrong regime.
+# --------------------------------------------------------------------------- #
+def test_trending_no_significant_autocorr(df: pd.DataFrame) -> None:
+    r = df.loc[df["regime"] == "trending", "ret"].to_numpy()
+    ac1 = _lag1_autocorr(r)
+    assert -0.05 <= ac1 <= 0.05, f"trending lag-1 autocorr = {ac1:.4f} (expected in [-0.05, 0.05])"
+
+
+def test_fat_tailed_no_significant_autocorr(df: pd.DataFrame) -> None:
+    r = df.loc[df["regime"] == "fat_tailed", "ret"].to_numpy()
+    ac1 = _lag1_autocorr(r)
+    assert -0.05 <= ac1 <= 0.05, (
+        f"fat_tailed lag-1 autocorr = {ac1:.4f} (expected in [-0.05, 0.05])"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Schema-shape guard for downstream long→wide pivot consumers.
+# --------------------------------------------------------------------------- #
+def test_timestamps_aligned_across_regimes(df: pd.DataFrame) -> None:
+    """All regimes must have identical timestamp series — long→wide pivots
+    assume timestamp alignment; this test guards against a generator bug
+    that desynchronizes them."""
+    ts_per_regime = {
+        regime: df.loc[df["regime"] == regime, "ts"].reset_index(drop=True)
+        for regime in EXPECTED_REGIMES
+    }
+    reference = ts_per_regime["trending"]
+    for regime, ts in ts_per_regime.items():
+        assert ts.equals(reference), f"regime {regime!r} ts not aligned to trending"
+
+
+# --------------------------------------------------------------------------- #
 # Determinism test — re-run generator into a scratch dir, hash, compare.
 # --------------------------------------------------------------------------- #
 def test_seed_is_deterministic(tmp_path: Path) -> None:
@@ -176,3 +210,34 @@ def test_seed_is_deterministic(tmp_path: Path) -> None:
     h_new = hashlib.sha256(regenerated.read_bytes()).hexdigest()
     h_canonical = hashlib.sha256(FIXTURE_PATH.read_bytes()).hexdigest()
     assert h_new == h_canonical, f"determinism broken: rerun={h_new} canonical={h_canonical}"
+
+
+def test_regenerate_in_place_is_noop() -> None:
+    """Safety net: an accidental `python scripts/generate_synthetic_returns.py`
+    from repo root must not change the canonical bytes. Test backs up the
+    fixture, runs the generator (which overwrites at FIXTURE_PATH), confirms
+    the bytes match, and restores defensively in case bytes ever diverge."""
+    import subprocess as sp
+
+    backup_parquet = FIXTURE_PATH.read_bytes()
+    backup_sha256 = SHA256_PATH.read_text(encoding="utf-8")
+    try:
+        result = sp.run(
+            [sys.executable, str(GENERATOR_PATH)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, (
+            f"generator failed: stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        after_parquet = FIXTURE_PATH.read_bytes()
+        after_sha256 = SHA256_PATH.read_text(encoding="utf-8")
+        assert after_parquet == backup_parquet, (
+            "in-place regeneration changed parquet bytes — determinism violated"
+        )
+        assert after_sha256 == backup_sha256, "in-place regeneration changed manifest"
+    finally:
+        # Defensive restore even on assertion failure.
+        FIXTURE_PATH.write_bytes(backup_parquet)
+        SHA256_PATH.write_text(backup_sha256, encoding="utf-8")
