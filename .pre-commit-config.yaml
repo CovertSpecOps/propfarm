@@ -97,3 +97,24 @@ repos:
         pass_filenames: false
         stages: [pre-push]
         exclude: ^scripts/spike_mt5\.py$
+
+  # --------------------------------------------------------------------------
+  # Look-ahead bias linter (Task 5.4). AST walker that scans @strategy-decorated
+  # functions for negative shifts, negative np.roll, forward iloc offsets inside
+  # for-loops, and forward-timedelta loc[] accesses.
+  #
+  # Scope is constrained to src/propfarm/strategies/ — too noisy repo-wide.
+  # That directory does not yet exist in Phase 0, so this hook is a no-op on
+  # every Phase-0 commit. The moment Phase 1 lands the first strategy module
+  # under src/propfarm/strategies/, the hook starts blocking look-ahead bugs.
+  # --------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: lookahead-linter
+        name: lookahead-bias linter
+        entry: python -m propfarm.data.lookahead_linter
+        language: system
+        types: [python]
+        pass_filenames: true
+        stages: [pre-commit]
+        files: ^src/propfarm/strategies/.*\.py$
