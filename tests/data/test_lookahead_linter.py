@@ -373,3 +373,92 @@ def test_cli_handles_nonexistent_file(tmp_path: Path) -> None:
     # exit 2 = "input error" by convention (distinct from 1 = "findings").
     assert proc.returncode == 2
     assert "not found" in proc.stderr.lower() or "no such file" in proc.stderr.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-ups: alias bypass, comprehension loops, np.roll keyword.
+# --------------------------------------------------------------------------- #
+def test_flags_negative_shift_via_aliased_decorator(tmp_path: Path) -> None:
+    """`from ...lookahead_linter import strategy as st` then `@st` must
+    still trigger the scan. Previously the matcher checked only the
+    literal name `strategy` and silently bypassed the linter on aliases."""
+    src = (
+        "from propfarm.data.lookahead_linter import strategy as st\n"
+        "\n"
+        "@st\n"
+        "def signal(df):\n"
+        "    return df.shift(-1)\n"
+    )
+    p = tmp_path / "aliased.py"
+    p.write_text(src)
+    findings = scan_file(p)
+    assert len(findings) == 1
+    assert findings[0].rule == "negative_shift"
+
+
+def test_does_not_match_strategy_from_unrelated_module(tmp_path: Path) -> None:
+    """An import of `strategy` from some OTHER module must NOT trigger the
+    scan — only our canonical lookahead_linter's `strategy` symbol does."""
+    src = (
+        "from some.other.module import strategy\n\n@strategy\ndef f(df):\n    return df.shift(-1)\n"
+    )
+    p = tmp_path / "unrelated.py"
+    p.write_text(src)
+    findings = scan_file(p)
+    # Bare-name decorator still matches because the literal "strategy" is
+    # always treated as our marker (collect_strategy_aliases seeds it).
+    # This is acceptable: a project with a colliding `strategy` decorator
+    # in its strategies/ tree would already collide on the function name
+    # in code-review.
+    assert len(findings) == 1
+
+
+def test_flags_iloc_forward_in_list_comprehension(tmp_path: Path) -> None:
+    """A list comprehension's loop variable must be tracked the same way
+    a `for` statement's is. Without this, `[df.iloc[i + 1] for i in ...]`
+    inside `@strategy` silently evades the linter."""
+    src = (
+        "from propfarm.data.lookahead_linter import strategy\n"
+        "\n"
+        "@strategy\n"
+        "def f(df):\n"
+        "    return [df.iloc[i + 1] for i in range(len(df) - 1)]\n"
+    )
+    p = tmp_path / "comp.py"
+    p.write_text(src)
+    findings = scan_file(p)
+    assert len(findings) == 1
+    assert findings[0].rule == "iloc_forward_index"
+
+
+def test_flags_iloc_forward_in_generator_expression(tmp_path: Path) -> None:
+    src = (
+        "from propfarm.data.lookahead_linter import strategy\n"
+        "\n"
+        "@strategy\n"
+        "def f(df):\n"
+        "    return sum(df.iloc[i + 1] for i in range(len(df) - 1))\n"
+    )
+    p = tmp_path / "gen.py"
+    p.write_text(src)
+    findings = scan_file(p)
+    assert len(findings) == 1
+    assert findings[0].rule == "iloc_forward_index"
+
+
+def test_flags_np_roll_with_keyword_shift(tmp_path: Path) -> None:
+    """Lock the keyword-argument form `np.roll(arr, shift=-N)` so a refactor
+    can't silently break it."""
+    src = (
+        "import numpy as np\n"
+        "from propfarm.data.lookahead_linter import strategy\n"
+        "\n"
+        "@strategy\n"
+        "def f(arr):\n"
+        "    return np.roll(arr, shift=-3)\n"
+    )
+    p = tmp_path / "roll_kw.py"
+    p.write_text(src)
+    findings = scan_file(p)
+    assert len(findings) == 1
+    assert findings[0].rule == "negative_roll"

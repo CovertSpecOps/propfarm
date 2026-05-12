@@ -82,9 +82,12 @@ def strategy[F: Callable[..., object]](func: F | None = None) -> F | Callable[[F
     """Marker decorator. Tags a function as a strategy entrypoint.
 
     Identity at runtime — the decorator returns the wrapped function unchanged.
-    Its only purpose is to be visible to :func:`scan_file`, which limits its
-    AST walk to functions wearing this marker (or any spelling thereof — bare
-    ``@strategy``, ``@strategy()``, or ``@module.strategy``).
+    Its only purpose is to be visible to :func:`scan_file`, which scans
+    functions wearing this marker. Recognized spellings: bare ``@strategy``,
+    call form ``@strategy()``, dotted ``@module.strategy``, and ``as``-aliased
+    imports from our canonical module (``from propfarm.data.lookahead_linter
+    import strategy as st`` → ``@st``). An imported ``strategy`` from a
+    different module is NOT recognized as a marker.
 
     Supports both bare and call-form usage::
 
@@ -191,18 +194,47 @@ def _attr_chain(node: ast.AST) -> list[str]:
     return list(reversed(parts))
 
 
-def _decorator_is_strategy(dec: ast.expr) -> bool:
+def _collect_strategy_aliases(tree: ast.AST) -> set[str]:
+    """Return every local name that resolves to our ``@strategy`` marker.
+
+    Always includes the literal ``"strategy"``. Also resolves ``from
+    propfarm.data.lookahead_linter import strategy as st`` (the ``as``
+    form) so that ``@st``-decorated functions are not silently skipped
+    by the scanner. Without this resolution, an author could bypass the
+    entire linter just by renaming the import.
+    """
+    aliases: set[str] = {"strategy"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # Only resolve imports whose module ends with ``lookahead_linter``;
+            # this avoids a separate project's "strategy" symbol falsely
+            # claiming our protection.
+            mod = node.module or ""
+            if not (mod == "lookahead_linter" or mod.endswith(".lookahead_linter")):
+                continue
+            for alias in node.names:
+                if alias.name == "strategy":
+                    aliases.add(alias.asname or alias.name)
+    return aliases
+
+
+def _decorator_is_strategy(dec: ast.expr, aliases: set[str]) -> bool:
     """True if a decorator AST node names our ``@strategy`` marker.
 
     Accepts: bare ``@strategy``, dotted ``@a.b.strategy``, called form
-    ``@strategy()`` or ``@a.b.strategy()``.
+    ``@strategy()`` or ``@a.b.strategy()``, and ``as``-aliased imports
+    (e.g. ``from ...lookahead_linter import strategy as st`` → ``@st``).
     """
     target: ast.expr = dec
     if isinstance(dec, ast.Call):
         target = dec.func
     if isinstance(target, ast.Name):
-        return target.id == "strategy"
+        return target.id in aliases
     if isinstance(target, ast.Attribute):
+        # Dotted form (e.g. @propfarm.data.lookahead_linter.strategy) — the
+        # final attribute name is what we match. An author could still
+        # bypass via `import propfarm.data.lookahead_linter as p; @p.strategy`
+        # which works because the attr is still "strategy".
         return target.attr == "strategy"
     return False
 
@@ -254,6 +286,42 @@ class _LookaheadVisitor(ast.NodeVisitor):
             self.generic_visit(node)
         finally:
             self._loop_index_stack.pop()
+
+    def _visit_comprehension(
+        self,
+        node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
+    ) -> None:
+        """Push every ``for`` clause's target onto the loop-index stack.
+
+        ``[df.iloc[i + 1] for i in range(n)]`` exposes ``i`` as a loop
+        index just like a ``for`` statement; without this hook the
+        ``iloc_forward_index`` rule silently misses it.
+        """
+        indices: set[str] = set()
+        for gen in node.generators:
+            if isinstance(gen.target, ast.Name):
+                indices.add(gen.target.id)
+            elif isinstance(gen.target, ast.Tuple):
+                for elt in gen.target.elts:
+                    if isinstance(elt, ast.Name):
+                        indices.add(elt.id)
+        self._loop_index_stack.append(indices)
+        try:
+            self.generic_visit(node)
+        finally:
+            self._loop_index_stack.pop()
+
+    def visit_ListComp(self, node: ast.ListComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_SetComp(self, node: ast.SetComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_DictComp(self, node: ast.DictComp) -> None:
+        self._visit_comprehension(node)
+
+    def visit_GeneratorExp(self, node: ast.GeneratorExp) -> None:
+        self._visit_comprehension(node)
 
     # -- call-based rules ---------------------------------------------------
 
@@ -419,10 +487,11 @@ def _find_strategy_functions(
     tree: ast.AST,
 ) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     """Return every function (sync or async) in ``tree`` decorated with ``@strategy``."""
+    aliases = _collect_strategy_aliases(tree)
     out: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
-            _decorator_is_strategy(d) for d in node.decorator_list
+            _decorator_is_strategy(d, aliases) for d in node.decorator_list
         ):
             out.append(node)
     return out

@@ -39,15 +39,22 @@ Source choices and conventions
 * **XAUUSD.** Same week shape as FX but reopens **Sunday 23:00 UTC** per
   LBMA's spot-gold convention — one hour later than FX. The Friday close
   is at 22:00 UTC, identical to FX.
-* **GER40 (DAX).** Cash session **07:00-21:00 UTC** Mon-Fri (Xetra plus
-  the post-close auction). Closed on the FX holiday calendar too, since
-  Dec 25 / Dec 26 / Jan 1 are also Xetra holidays.
-* **US100 (NDX).** *Cash session only:* **14:30-21:00 UTC** Mon-Fri.
-  Dukascopy quotes US100 in extended hours (pre-market + after-hours), but
-  liquidity is thin, the cost model has not been calibrated outside the
-  cash window, and the gap report would systematically over-flag if we
-  widened the definition here. The decision to use the cash window is
-  documented again in the corresponding test.
+* **GER40 (DAX).** Xetra extended hours **08:00-22:00 Frankfurt local**,
+  Mon-Fri. UTC equivalent shifts with European DST: 07:00-21:00 UTC in
+  winter (CET = UTC+1), 06:00-20:00 UTC in summer (CEST = UTC+2). The
+  session is computed per-day via ``ZoneInfo("Europe/Berlin")`` rather
+  than hardcoded to UTC, so backtests stay in-phase across the spring
+  and autumn DST transitions. Closed on the FX holiday calendar too,
+  since Dec 25 / Dec 26 / Jan 1 are also Xetra holidays.
+* **US100 (NDX).** *Cash session only:* **09:30-16:00 New York local**,
+  Mon-Fri. UTC equivalent shifts with US DST: 14:30-21:00 UTC in winter
+  (EST = UTC-5), 13:30-20:00 UTC in summer (EDT = UTC-4). Computed
+  per-day via ``ZoneInfo("America/New_York")`` for the same reason as
+  GER40 — hardcoding UTC silently mis-times every backtest for the ~8
+  months/year the US observes DST. Dukascopy quotes US100 in extended
+  hours (pre-market + after-hours), but liquidity is thin, the cost
+  model has not been calibrated outside the cash window, and the gap
+  report would systematically over-flag if we widened the definition.
 
 Constraints
 -----------
@@ -72,6 +79,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Final
+from zoneinfo import ZoneInfo
 
 # --------------------------------------------------------------------------- #
 # Symbol registry
@@ -152,6 +160,17 @@ def expect_data(symbol: str, d: date) -> bool:
     bool
         ``False`` if ``d`` is a weekend, ``False`` if ``d`` is a global FX
         full-close (Jan 1 / Dec 25 / Dec 26), ``True`` otherwise.
+
+    Notes
+    -----
+    No Monday-substitution is applied for holidays that fall on a weekend.
+    If Jan 1 lands on a Saturday, the calendar date is closed (so the
+    weekend check already returns False), but the following Monday is
+    treated as an ordinary trading day even though some venues (e.g. UK
+    bank-holiday substitution) observe the holiday on Monday. This is
+    deliberate: the data layer asks "should vendor ticks exist on this
+    date?", not "is human trading allowed?". The latter is the rules
+    layer's job (Task 11.1).
 
     Raises
     ------
@@ -300,23 +319,38 @@ def _xau_session_open(ts: datetime) -> bool:
 
 
 def _ger40_session_open(ts: datetime) -> bool:
-    """GER40: 07:00-21:00 UTC, Mon-Fri only. 21:00 is the close (exclusive)."""
-    if ts.weekday() > _FRI:
-        return False
-    return 7 <= ts.hour < 21
+    """GER40: Xetra extended hours 08:00-22:00 Frankfurt local, Mon-Fri.
 
-
-def _us100_session_open(ts: datetime) -> bool:
-    """US100 cash: Mon-Fri, 14:30-21:00 UTC. Extended hours intentionally excluded.
-
-    See module docstring for the rationale: cost model is not calibrated
-    in extended hours, so the gap report should not expect data there.
+    UTC equivalent shifts with European DST: 07:00-21:00 UTC in winter
+    (CET = UTC+1), 06:00-20:00 UTC in summer (CEST = UTC+2). We compute
+    the session window per-day via ``ZoneInfo("Europe/Berlin")`` so the
+    gap report does not silently flag the first or last hour of summer
+    sessions as phantom outages.
     """
     if ts.weekday() > _FRI:
         return False
-    # Compute minutes-of-day to handle the 14:30 half-hour boundary.
-    minute_of_day = ts.hour * 60 + ts.minute
-    return 14 * 60 + 30 <= minute_of_day < 21 * 60
+    local = ts.astimezone(ZoneInfo("Europe/Berlin"))
+    minute_of_day = local.hour * 60 + local.minute
+    return 8 * 60 <= minute_of_day < 22 * 60
+
+
+def _us100_session_open(ts: datetime) -> bool:
+    """US100 cash: Mon-Fri, 09:30-16:00 New York local. Extended hours excluded.
+
+    UTC equivalent shifts with US DST: 14:30-21:00 UTC in winter (EST),
+    13:30-20:00 UTC in summer (EDT). We compute the session per-day via
+    ``ZoneInfo("America/New_York")`` so backtests are not silently off by
+    one hour for the ~8 months/year the US observes DST.
+
+    Extended-hours quotes (pre-market and after-hours) are intentionally
+    excluded: the cost model is calibrated only for the cash session, so
+    the gap report should not expect data outside it.
+    """
+    if ts.weekday() > _FRI:
+        return False
+    local = ts.astimezone(ZoneInfo("America/New_York"))
+    minute_of_day = local.hour * 60 + local.minute
+    return 9 * 60 + 30 <= minute_of_day < 16 * 60
 
 
 _SESSION_FN: Final[dict[str, Callable[[datetime], bool]]] = {
