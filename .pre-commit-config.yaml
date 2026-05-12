@@ -67,6 +67,9 @@ repos:
           - pandas-stubs
           - pyarrow
           - numpy
+          - pytest
+          - hypothesis
+          - typer
         stages: [pre-commit]
         exclude: ^scripts/spike_mt5\.py$
 

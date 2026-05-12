@@ -38,8 +38,11 @@ warn_unused_ignores = true
 disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
-addopts = "-q --strict-markers --cov=src/propfarm --cov-report=term-missing"
+addopts = "-q --strict-markers --cov=src/propfarm --cov-report=term-missing -m 'not integration'"
 testpaths = ["tests"]
+markers = [
+  "integration: live-network or external-resource tests; skipped by default (run with `pytest -m integration`).",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
