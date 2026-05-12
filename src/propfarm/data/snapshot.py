@@ -168,11 +168,21 @@ def _snapshot_path(root: Path, name: str, partition: PartitionKey | None) -> Pat
     base = root / _SNAPSHOTS_SUBDIR
     if partition is None:
         return base / f"{name}.parquet"
+    # Reject absolute paths (POSIX or Windows) and backslash separators outright
+    # — partition keys are Hive-style logical paths, never filesystem paths.
+    if partition.startswith(("/", "\\")) or "\\" in partition:
+        raise ValueError(
+            f"partition must not be absolute or contain backslashes, got {partition!r}"
+        )
     # Normalize partition: split on '/' and join — defends against accidental
     # leading slashes or double slashes in the caller's input.
     parts = [p for p in partition.split("/") if p]
     if not parts:
         raise ValueError(f"partition must be None or a non-empty string, got {partition!r}")
+    # Reject any '..' component: prevents partition keys derived from filenames
+    # or vendor metadata from escaping the snapshots tree.
+    if any(p == ".." or p == "." for p in parts):
+        raise ValueError(f"partition must not contain '..' or '.' components, got {partition!r}")
     return base.joinpath(name, *parts).with_suffix(".parquet")
 
 

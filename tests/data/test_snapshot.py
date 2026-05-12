@@ -289,3 +289,13 @@ def test_rewrite_upserts_manifest_entry(tmp_path: Path) -> None:
 
     loaded = load_snapshot("eurusd_ticks", root=tmp_path)
     pltest.assert_frame_equal(loaded, df_v2)
+
+
+def test_partition_rejects_path_traversal(tmp_path: Path) -> None:
+    """Partitions derived from untrusted filenames must not escape the
+    snapshots tree. _snapshot_path rejects '..', '.', absolute paths, and
+    backslash separators."""
+    df = _tiny_frame()
+    for bad in ("../escape", "year=2024/../../../etc", "/abs/path", "year\\month", ".", ".."):
+        with pytest.raises(ValueError, match="partition"):
+            write_snapshot(df, "eurusd_ticks", vendor="dukascopy", root=tmp_path, partition=bad)

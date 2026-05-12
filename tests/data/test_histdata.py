@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import polars as pl
-import pytest  # type: ignore[import-not-found]
+import pytest
 
 from propfarm.data.vendors import histdata
 from propfarm.data.vendors.histdata import HistDataFetchError, fetch_month, parse_csv_bytes
@@ -244,7 +244,7 @@ def test_http_client_protocol_is_structural() -> None:
 # --------------------------------------------------------------------------- #
 # Live smoke — skipped by default. Run manually with `pytest -m integration`.
 # --------------------------------------------------------------------------- #
-@pytest.mark.integration  # type: ignore[untyped-decorator]
+@pytest.mark.integration
 def test_live_fetch_smoke() -> None:
     """Fetch EURUSD Jan 2024 from HistData. Asserts > 20000 rows.
 

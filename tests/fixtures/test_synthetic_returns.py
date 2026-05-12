@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-import pytest  # type: ignore[import-not-found]
+import pytest
 from scipy import stats  # type: ignore[import-untyped]
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -42,7 +42,7 @@ TARGET_ANN_VOL = {
 }
 
 
-@pytest.fixture(scope="module")  # type: ignore[untyped-decorator]
+@pytest.fixture(scope="module")
 def df() -> pd.DataFrame:
     """Load the parquet exactly once for all tests."""
     assert FIXTURE_PATH.exists(), f"fixture missing at {FIXTURE_PATH}"
