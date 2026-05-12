@@ -1,8 +1,8 @@
 # STATUS
 
 **Phase:** 0 — Foundations
-**Last validated:** 2026-05-12 — B0, B1, B2.5, and W1 all complete (8 tasks total, two-stage review)
-**Next:** W2 (Tasks 5.1 holiday/DST + 5.4 lookahead linter), W3 (sim cost components), W4 (rules-as-code, 11.1→11.2 sequential), W5 (validation math, gated on B2.5). B2 (ADR-0002 stack-lock) blocked on user-side MT5 spike
+**Last validated:** 2026-05-12 — B0, B1, B2.5, W1, W2, B2 (ADR-0002), and ADR-0003 all complete; MT5 spike PASS (Run-2 clean)
+**Next:** W3 (Tasks 6.2 commission + 6.3 swap), W4 (rules-as-code, 11.1→11.2 sequential), W5 (validation math, gated on B2.5). Then the remaining sim-cost-stack (Task 4.2 ingest, 5.3 reconciliation, 6.1 spread, 7.1 slippage, 7.2 fill engine), then placebo Gate 1, then sim-vs-live Gate 2, then Phase-0 gate review
 
 ## Session log
 
@@ -26,6 +26,9 @@ W1 added the `propfarm.data` and `propfarm.data.vendors` packages, the `HttpClie
 ### Between-wave drift check — W2 → W3
 
 W2 added `propfarm.data.quality` (holiday/DST/session predicates) and `propfarm.data.lookahead_linter` (AST walker + pre-commit hook scoped to `src/propfarm/strategies/`). W3 (sim cost components — 6.2 commission, 6.3 swap) does not consume these directly, but **W2's `is_market_open` is the canonical session predicate** and the W3 commission/swap calibration should consume it rather than reinventing session boundaries. Reviewer for W3 will flag if 6.2 or 6.3 hardcodes session hours. The lookahead linter is dormant in Phase 0 (no `src/propfarm/strategies/` yet) but pre-armed for Phase 1.
+
+- **2026-05-12 #6** — MT5 spike Run-1 result reported: partial PASS (open OK at 151.4 ms, close failed with retcode 10016 INVALID_STOPS due to SL/TP inheritance through `{**req, ...}` spread). Bug fixed: `_build_close_req` helper rebuilds the close request from scratch with explicit `sl=0.0`/`tp=0.0`. Added 5 regression tests at `tests/scripts/test_spike_mt5.py`. Runbook widened to Python 3.11+ (cp314 wheels confirmed working). Commit `36ca2a6`.
+- **2026-05-12 #7** — Spike Run-2 reported: **clean PASS** (open + close both retcode 10009, RTT 167.5 ms). ADR-0002 (stack-lock) and ADR-0003 (bridge choice) both written and Accepted. MT5-stack-assumption block policy LIFTED. Phase 0 Gate 2 Part A (MT5 hello-world) marked GREEN; Gate 2 Part B (sim/live fill comparison) and Gate 1 (placebo) remain pending — they require the simulator + cost model + ingest, which is W3/W4/W5 plus the sim-cost stack (4.2, 5.3, 6.1, 7.1, 7.2).
 
 ---
 
@@ -180,7 +183,7 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 |---|---|---|---|
 | **B0** | ✅ done 2026-05-12 | 1.1, 1.3 | Repo init + MT5 spike package (script + runbook + ZMQ fallback). User-side: VPS provisioning still pending |
 | **B1** | ✅ done 2026-05-12 | 1.2, 2.1 | Pre-commit gate (CRITICAL pre-push fix applied) + ADR-0001 goals |
-| **B2** | after spike result | 2.2 | Stack-lock ADR (gated on user running the spike) |
+| **B2** | ✅ done 2026-05-12 | 2.2 (ADR-0002) + ADR-0003 | Stack-lock + bridge-choice ADRs both committed Accepted. MT5 spike Run-2 clean PASS. Latency band 150–170 ms Amsterdam → FTMO |
 | **B2.5** | ✅ done 2026-05-12 | synthetic returns fixture | Canonical fixture sha256=`f937ab719140...` — pins regenerated with seed 20260514 |
 | **W1** | ✅ done 2026-05-12 | 3.1, 3.2, 4.1 | Dukascopy DL + HistData DL + snapshot writer. Real bug caught by 4.1 reviewer: path traversal in `_snapshot_path` (fixed) |
 | **W2** | ✅ done 2026-05-12 | 5.1, 5.4 | Holiday/DST + lookahead linter. Critical bug caught by 5.1 reviewer: US100/GER40 session hours hardcoded UTC (off by 1h for ~8 months/year). Fixed via DST-aware zoneinfo |
@@ -241,14 +244,21 @@ W4 has two tasks that look independent but share a base class:
 
 Reviewer rejects 11.2 if it (a) redefines or shadows the ABC, (b) diverges from FTMO's predicate pattern without justification, or (c) introduces inconsistencies that would force a refactor of 11.1.
 
-## MT5-stack-assumption block policy (active until ADR-0002 + 0003 close)
+## MT5-stack-assumption block policy — LIFTED 2026-05-12
 
-Until the user's MT5 spike runs and the bridge ADRs finalize, the reviewer **rejects** any agent output that:
-- Imports `MetaTrader5` at module top-level outside `src/propfarm/bridge/` or `scripts/spike_*`.
-- Hard-codes the assumption that the direct-pkg path will win (e.g., naming things `mt5_*` where the abstraction would be `bridge_*`).
-- Takes a runtime dep on broker-specific behavior the spike hasn't yet validated.
+ADR-0002 (stack-lock) and ADR-0003 (bridge choice) both committed `Accepted`
+on 2026-05-12 after the MT5 spike Run-2 clean PASS. Subsequent agents may
+reference the direct `MetaTrader5` pkg path by name inside
+`src/propfarm/bridge/` and derived nautilus adapters. Bridge interfaces
+remain Protocol/ABC-shaped for test injection and for the (unlikely) future
+case where ADR-0002's revisit triggers fire and the ZMQ fallback gets
+instantiated.
 
-Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementation (direct pkg vs ZMQ fallback vs nautilus adapter) is swappable per ADR-0003. **This policy auto-lifts** once both ADRs commit `Accepted` status.
+**Historical (now-lifted) policy text:** reviewer rejected any agent
+output that imported `MetaTrader5` at module top-level outside
+`src/propfarm/bridge/` or `scripts/spike_*`, hardcoded the assumption that
+the direct-pkg path would win, or took a runtime dep on unvalidated
+broker behavior. Active from W1 dispatch through 2026-05-12 ADR closure.
 
 ---
 
@@ -260,9 +270,12 @@ Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementati
 | Canonical fixture (B2.5) | ✅ PASSED 2026-05-12 | sha256=`f937ab719140ddd4f14d29be876de225c44df069bf4038a877e1987b9b226ff9`; 13 property tests pass; commit `9c49812` |
 | W1 data layer (3.1, 3.2, 4.1) | ✅ PASSED 2026-05-12 | All offline unit tests green; integration tests deferred behind `pytest -m integration`; commits `82921bc`, `76dbb61`, `7d640eb`, `63d511b` |
 | W2 quality + linter (5.1, 5.4) | ✅ PASSED 2026-05-12 | 29 quality tests + 24 lookahead linter tests green; DST regressions land; commits `adb2660`, `40b0039`, `d38430d` |
-| Gate 1: Placebo (alpha-leak detector) | ⬜ pending | — |
-| Gate 2: MT5 hello-world + sim/live fill compare (cost-leak detector) | ⬜ pending | — |
-| Phase 0 gate review | ⬜ pending | — |
+| ADR-0002 stack-lock | ✅ ACCEPTED 2026-05-12 | vectorbt + nautilus-trader + MetaTrader5 pkg locked. Spike Run-2 PASS cited. 150–170 ms RTT band |
+| ADR-0003 bridge choice | ✅ ACCEPTED 2026-05-12 | Direct MetaTrader5 pkg adopted. ZMQ fallback CLOSED-NOT-PURSUED but design preserved at `scripts/spike_mt5_fallback_zmq.md` |
+| Gate 2 part A: MT5 hello-world | ✅ PASSED 2026-05-12 | Run-2 stdout: `send rtt_ms=167.5 retcode=10009` open + close. See `docs/runbooks/mt5-spike-result.md` |
+| Gate 2 part B: sim/live fill comparison ≤ 1 pip | ⬜ pending | Needs Task 7.2 fill engine + Task 14.3 nautilus integration + a 10-cycle live distribution |
+| Gate 1: Placebo (alpha-leak detector) | ⬜ pending | Needs the full pipeline: 4.2 ingest, 6.1/7.1 sim calibration, 7.2 fill engine |
+| Phase 0 gate review | ⬜ pending | Needs everything above |
 
 ## User-side blockers (cannot be done by agents)
 
@@ -272,7 +285,7 @@ Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementati
 | FTMO Client Area signup | user | ✅ done |
 | FTMO Free Trial activation | user | ⬜ pending (user mid-Block-C) |
 | Install MT5 terminal + Python 3.11 on VPS, drop secrets file | user | ⬜ pending |
-| Run `scripts/spike_mt5.py` on VPS and paste stdout | user | ⬜ pending — **ETA 24h** |
+| Run `scripts/spike_mt5.py` on VPS and paste stdout | user | ✅ done 2026-05-12 — Run-1 partial PASS (close bug, fixed), Run-2 **clean PASS** 167.5 ms RTT. See `docs/runbooks/mt5-spike-result.md` |
 
 Until the spike result lands, ADR-0002 (stack-lock) and ADR-0003 (bridge choice) cannot finalize. The data-layer and validation-math work (B1, B2.5, W1+) proceeds in parallel without blocking on the spike.
 

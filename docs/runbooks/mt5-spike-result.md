@@ -37,12 +37,43 @@ overwrite entries; append a new dated row for each rerun.
 - **Open question for re-run:** confirm a clean PASS end-to-end after the
   close-leg fix, then close ADR-0002 + ADR-0003 with the second result row.
 
-## Run 2 — pending re-run
+## Run 2 — 2026-05-12 (CLEAN PASS)
 
-To be filled in after the user runs the patched `scripts/spike_mt5.py`
-on the VPS. Acceptance:
+| Field | Value |
+|---|---|
+| Date | 2026-05-12 (same day, after patch) |
+| VPS | unchanged — Vultr Amsterdam, `95.179.153.105` |
+| Python | unchanged (3.14) |
+| MT5 server | unchanged (`FTMO-Demo`, $10k Free Trial) |
+| MT5 pkg version | unchanged (5.0.5735) |
+| Open leg | **PASS** — retcode 10009 |
+| **Open RTT** | **167.5 ms** |
+| Close leg | **PASS** — retcode 10009 (no AssertionError; `{**req, ..., "sl": 0.0, "tp": 0.0}` fix held) |
+| Exit code | 0 |
 
-- Open + close both return retcode 10009.
-- Total RTT (open send) < 500 ms.
-- Position appears in the Trade tab during the hold, disappears after close.
-- `mt5.last_error()` never logged.
+### Combined empirical latency band (Run-1 open + Run-2 open)
+
+- Run-1: 151.4 ms
+- Run-2: 167.5 ms
+- **Range: 150–170 ms** Amsterdam → FTMO
+- Both samples are single-shot opens; a 10-cycle distribution is still
+  required to confirm Phase-0 Gate 2's p95 < 500 ms claim.
+
+### What ADR-0002 and ADR-0003 cite
+
+- Run-2 is the empirical justification for closing both ADRs. The
+  150–170 ms band is the latency floor we expect from a Frankfurt-class
+  EU VPS to FTMO's demo cluster.
+- Future spike re-runs (e.g. for Phase-0 Gate 2 acceptance — the
+  simulator-vs-live fill comparison) append new dated rows here. Do not
+  edit Run-1 or Run-2 in place.
+
+## Future runs — protocol
+
+- Append a new dated row with the same field set.
+- If the open / close RTT regresses materially (> 300 ms sustained),
+  open an issue and re-check VPS region, FTMO server load (status.ftmo.com),
+  and Windows Update activity on the VPS.
+- The next planned run is Phase-0 Gate 2's 10-cycle distribution capture,
+  which produces (open_rtt, close_rtt, sim_predicted_price,
+  live_actual_price) tuples for divergence analysis.
