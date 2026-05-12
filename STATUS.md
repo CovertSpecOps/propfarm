@@ -195,6 +195,19 @@ B3 has been split into B3a (validation math, 5 tasks, blocked by B2.5 fixture) a
 
 ---
 
+## Remote / branching policy
+
+**Origin:** `https://github.com/CovertSpecOps/propfarm.git` (private). Initial push of `main` landed 2026-05-12 covering Phase-0 work through W1.
+
+**Branching rule from now on (Phase 1+ work):**
+- `main` is protected. **No direct commits to `main` after this initial push.**
+- Each phase or major sub-effort branches: `feat/phase-1-london-mr`, `feat/phase-2-risk-layer`, `feat/phase-3-validation`, `feat/phase-4-deploy`. Multi-strategy work inside a phase may sub-branch further (`feat/phase-1-london-mr/sleeve-X`).
+- Branches PR back to `main` with two-stage review still required (impl agent + fresh reviewer). The PR description summarizes which tasks the branch closes.
+- Strategy worktrees created via `superpowers:using-git-worktrees` live on their own branches; failed sleeves get the worktree (and branch) deleted, never merged.
+- Phase-0 remaining work (W2, W3, W4, W5, B2 stack-lock, gates 1+2, gate review) **still lands on `main`** because it's all foundation work that can't be meaningfully isolated. The branching rule kicks in at Phase 1.
+
+**Pre-push hook gotcha:** `pytest` runs under `language: system`, which means the active shell needs the project venv on PATH. Run pushes from a shell with `.venv` activated (`source .venv/bin/activate`), or the pre-push hook errors with `pytest: command not found`. Documented here because the symptom is non-obvious.
+
 ## Per-task review protocol (every batch)
 
 1. Implementation agent (fresh) executes the task per the plan.
