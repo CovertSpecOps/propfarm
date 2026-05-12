@@ -1,8 +1,8 @@
 # STATUS
 
 **Phase:** 0 — Foundations
-**Last validated:** 2026-05-12 — B0, B1, and B2.5 all complete (5 tasks total, two-stage review)
-**Next:** B2 (Task 2.2 ADR-0002 stack-lock — blocked on user-side MT5 spike result), then W1 (Tasks 3.1 + 3.2 + 4.1)
+**Last validated:** 2026-05-12 — B0, B1, B2.5, and W1 all complete (8 tasks total, two-stage review)
+**Next:** W2 (Tasks 5.1 holiday/DST + 5.4 lookahead linter), W3 (sim cost components), W4 (rules-as-code, 11.1→11.2 sequential), W5 (validation math, gated on B2.5). B2 (ADR-0002 stack-lock) blocked on user-side MT5 spike
 
 ## Session log
 
@@ -13,6 +13,12 @@
 ### Between-wave drift check — B1+B2.5 → W1
 
 After B1+B2.5 merged, upstream impact on subsequent waves: **none**. The pre-commit hook fix is forward-compatible (any W1+ agent benefits from the working pre-push gate). The B2.5 fixture's new SHA256 (`f937ab719140...`) is now the canonical hash that W5 agents will pin. The mypy `additional_dependencies` now includes `pyarrow` and `numpy`, which is forward-compatible. ADR-0001 wording changes do not invalidate any prior task. **Cleared to dispatch W1 once user signals.**
+
+- **2026-05-12 #3** — W1 dispatched (3 parallel impl agents for Tasks 3.1, 3.2, 4.1). All three reported. Three fresh reviewers ran in parallel. Verdicts: 3.1 REJECTED (mypy red because 3.1's `additional_dependencies` expansion broke sibling test files' type-ignores), 3.2 APPROVED WITH FOLLOW-UPS, 4.1 APPROVED WITH FOLLOW-UPS. **One real bug caught by 4.1's reviewer**: path traversal in `_snapshot_path` — `partition="../escape"` escaped the snapshots tree. Fixed with explicit rejection of `..`, `.`, absolute prefixes, and backslash separators; added `test_partition_rejects_path_traversal` with 6 adversarial inputs. Commits: `82921bc` (3.1), `76dbb61` (3.2), `7d640eb` (4.1), `63d511b` (fix-ups).
+
+### Between-wave drift check — W1 → W2
+
+W1 added the `propfarm.data` and `propfarm.data.vendors` packages, the `HttpClient` Protocol (twice — intentionally duplicated between Dukascopy and HistData, defer dedupe), the snapshot writer with manifest, and the `integration` pytest marker (in pyproject + addopts). W2 (holiday/DST + lookahead linter) consumes none of this directly — both are pure-Python, no data deps. **No upstream impact**. W3 will consume the snapshot interface for cost calibration; the `_snapshot_path` validator is now strict against path traversal, so any W3 caller passing an unvalidated partition string will get a loud ValueError early (this is the desired behavior, not drift).
 
 ---
 
@@ -169,6 +175,8 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 | **B1** | ✅ done 2026-05-12 | 1.2, 2.1 | Pre-commit gate (CRITICAL pre-push fix applied) + ADR-0001 goals |
 | **B2** | after spike result | 2.2 | Stack-lock ADR (gated on user running the spike) |
 | **B2.5** | ✅ done 2026-05-12 | synthetic returns fixture | Canonical fixture sha256=`f937ab719140...` — pins regenerated with seed 20260514 |
+| **W1** | ✅ done 2026-05-12 | 3.1, 3.2, 4.1 | Dukascopy DL + HistData DL + snapshot writer. Real bug caught by 4.1 reviewer: path traversal in `_snapshot_path` (fixed) |
+| **W2** | next | 5.1, 5.4 | Holiday/DST module + lookahead linter (independent, pure Python) |
 | **B3a** | after B2.5 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV/walkforward/DSR/PBO/MC). All consume the fixture |
 | **B3b** | after B1 (parallel with B2.5) | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 11.1, 11.2 | Data DLs + snapshot + quality + linter + cost components + rules predicates |
 | **B4** | after 3.1+3.2 | 3.3 | Background fetch (long-running, single agent) |
@@ -229,6 +237,7 @@ Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementati
 |---|---|---|
 | Pre-commit gate (Task 1.2) | ✅ PASSED 2026-05-12 | `pre-commit run --all-files` green; `pre-commit run --hook-stage pre-push` green; commit `9c49812` |
 | Canonical fixture (B2.5) | ✅ PASSED 2026-05-12 | sha256=`f937ab719140ddd4f14d29be876de225c44df069bf4038a877e1987b9b226ff9`; 13 property tests pass; commit `9c49812` |
+| W1 data layer (3.1, 3.2, 4.1) | ✅ PASSED 2026-05-12 | All offline unit tests green; integration tests deferred behind `pytest -m integration`; commits `82921bc`, `76dbb61`, `7d640eb`, `63d511b` |
 | Gate 1: Placebo (alpha-leak detector) | ⬜ pending | — |
 | Gate 2: MT5 hello-world + sim/live fill compare (cost-leak detector) | ⬜ pending | — |
 | Phase 0 gate review | ⬜ pending | — |
@@ -253,3 +262,19 @@ Until the spike result lands, ADR-0002 (stack-lock) and ADR-0003 (bridge choice)
 - Anything that presumes the direct-pkg path will win for the eventual bridge.
 
 Data-layer code stays broker-agnostic. Period.
+
+## Deferred follow-ups (non-blocking — track or fold into later phases)
+
+Reviewer-flagged items that did NOT block the current task but should not be silently dropped. Each has a phase/task home.
+
+| Item | Owner | Home |
+|---|---|---|
+| Verify GER40/US100 Dukascopy digit count empirically (currently locked to `2` unverified) | data-layer | Run `scripts/download_dukascopy.py` against one hour of GER40/US100 ticks before Phase 1 index strategy. Fix `_DIGITS` if wrong. Phase 1 entry gate |
+| HistData OHLC consistency: parser trusts vendor blindly (`low≤open,close≤high` not enforced per row) | data-layer | Decide in W2 (data quality): document non-enforcement, OR enforce + raise on violation. Reconciliation report (Day 5 in plan) catches drift in bulk |
+| HistData BOM strip in `parse_csv_bytes` (defensive one-liner) | data-layer | Optional W2 polish |
+| `HttpClient` Protocol duplicated between Dukascopy (GET-only) and HistData (GET+POST) | data-layer | Extract to `propfarm.data.http` if/when a third vendor appears. Premature to dedupe now |
+| Snapshot writer: no fsync on parquet/manifest write | data-layer | Phase 4 deployment task (production VPS); single-process dev is fine |
+| Snapshot writer: no concurrent-write protection (file lock) | data-layer | Phase 4 (multi-vendor downloader on VPS); single-process Phase 0 is safe |
+| Snapshot writer: corrupt manifest JSON raises raw `JSONDecodeError` (could wrap in `SnapshotIntegrityError`) | data-layer | Optional polish |
+| Snapshot manifest `min_ts`/`max_ts` use `str(polars_value)` which produces naive-looking strings for naive ts (tick data will be tz-aware) | data-layer | Address when Dukascopy ingest lands (Task 4.2 / Day 4 finishing) |
+| Test gaps: ZIP-without-CSV (HistData), missing-manifest-file (snapshot), corrupt-manifest-JSON (snapshot) | data-layer | Cheap follow-up tests; add when next touching those files |
