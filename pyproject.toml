@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "propfarm"
 version = "0.0.1"
@@ -36,3 +40,6 @@ disallow_untyped_defs = true
 [tool.pytest.ini_options]
 addopts = "-q --strict-markers --cov=src/propfarm --cov-report=term-missing"
 testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

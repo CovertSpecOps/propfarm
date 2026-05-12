@@ -48,7 +48,8 @@ coverage.xml
 .env.*
 !.env.example
 *.secret
-~/.propfarm-secrets.json
+.propfarm-secrets.json
+**/.propfarm-secrets.json
 
 # --- OS ---
 .DS_Store
