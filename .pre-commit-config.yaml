@@ -13,10 +13,11 @@ default_install_hook_types: [pre-commit, pre-push]
 default_language_version:
   python: python3.12
 
-# Per-hook excludes for scripts/spike_mt5.py live with each hook below.
-# Hygiene hooks (trailing-whitespace, EOF, check-yaml/toml) DO run on the spike
-# — only ruff/ruff-format/mypy/pytest exclude it, because that script imports
-# MetaTrader5 (no macOS/Linux wheel) and is a throwaway pending ADR-0003.
+# scripts/spike_mt5.py defers its MetaTrader5 import into main() so the
+# pure helpers (e.g. _build_close_req) are importable on macOS/Linux for
+# unit testing. Ruff/ruff-format/pytest run on it normally. Only mypy
+# excludes it, because MetaTrader5 has no macOS/Linux wheel for type
+# resolution.
 
 repos:
   # --------------------------------------------------------------------------
@@ -45,10 +46,8 @@ repos:
       - id: ruff
         args: [--fix]
         stages: [pre-commit]
-        exclude: ^scripts/spike_mt5\.py$
       - id: ruff-format
         stages: [pre-commit]
-        exclude: ^scripts/spike_mt5\.py$
 
   # --------------------------------------------------------------------------
   # mypy --strict. Mirrors the [tool.mypy] block in pyproject.toml.
@@ -96,7 +95,6 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
-        exclude: ^scripts/spike_mt5\.py$
 
   # --------------------------------------------------------------------------
   # Look-ahead bias linter (Task 5.4). AST walker that scans @strategy-decorated

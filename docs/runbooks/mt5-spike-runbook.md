@@ -57,16 +57,19 @@ Record all three exactly — typos in the server string are the #1 cause of
 4. Verify: bottom-right shows green connection bar, kbps flowing.
 5. Open an EURUSD chart. Confirm ticks stream.
 
-## 5. Install Python 3.12 on VPS (5 min)
+## 5. Install Python 3.11+ on VPS (5 min)
 
 1. Browser to **https://www.python.org/downloads/windows/**. Grab the
-   latest 3.12.x **Windows installer (64-bit)**.
+   latest **Windows installer (64-bit)** for Python 3.11, 3.12, 3.13, or
+   3.14 — `MetaTrader5` 5.0.5735 ships wheels for all four (cp311..cp314).
+   3.12 is what the dev `.venv` uses; matching it is convenient but not
+   required for the spike host.
 2. Install. Check **"Add python.exe to PATH"** on the first screen.
 3. Open **PowerShell** (not WSL — `MetaTrader5` pkg is Windows-native and
    will not see the terminal from inside WSL).
 4. Verify:
    ```powershell
-   python --version          # Python 3.12.x
+   python --version          # Python 3.11+ acceptable
    python -m pip install --upgrade pip
    python -m pip install MetaTrader5
    python -c "import MetaTrader5; print(MetaTrader5.__version__)"
