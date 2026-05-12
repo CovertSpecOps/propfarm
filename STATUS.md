@@ -20,6 +20,13 @@ After B1+B2.5 merged, upstream impact on subsequent waves: **none**. The pre-com
 
 W1 added the `propfarm.data` and `propfarm.data.vendors` packages, the `HttpClient` Protocol (twice — intentionally duplicated between Dukascopy and HistData, defer dedupe), the snapshot writer with manifest, and the `integration` pytest marker (in pyproject + addopts). W2 (holiday/DST + lookahead linter) consumes none of this directly — both are pure-Python, no data deps. **No upstream impact**. W3 will consume the snapshot interface for cost calibration; the `_snapshot_path` validator is now strict against path traversal, so any W3 caller passing an unvalidated partition string will get a loud ValueError early (this is the desired behavior, not drift).
 
+- **2026-05-12 #4** — Initial push of `main` to private origin. Branching policy added for Phase 1+ (no more direct-to-main).
+- **2026-05-12 #5** — W2 dispatched (5.1 holiday/DST + 5.4 lookahead linter, parallel). Two impl agents reported, two fresh reviewers in parallel. **5.1 REJECTED** by reviewer on critical US100 + GER40 DST bug (session hours hardcoded UTC, off by 1h for ~8 months/year). **5.4 APPROVED WITH FOLLOW-UPS** but with 3 important false-negative holes (alias decorator bypass, comprehension loops, while loops). Fixes applied: DST-aware session windows via `ZoneInfo("America/New_York")` and `Europe/Berlin`; alias-resolver in linter; comprehension visitors. While-loops tracked as deferred (harder static analysis). Commits: `adb2660` (5.1), `40b0039` (5.4), `d38430d` (fix-ups).
+
+### Between-wave drift check — W2 → W3
+
+W2 added `propfarm.data.quality` (holiday/DST/session predicates) and `propfarm.data.lookahead_linter` (AST walker + pre-commit hook scoped to `src/propfarm/strategies/`). W3 (sim cost components — 6.2 commission, 6.3 swap) does not consume these directly, but **W2's `is_market_open` is the canonical session predicate** and the W3 commission/swap calibration should consume it rather than reinventing session boundaries. Reviewer for W3 will flag if 6.2 or 6.3 hardcodes session hours. The lookahead linter is dormant in Phase 0 (no `src/propfarm/strategies/` yet) but pre-armed for Phase 1.
+
 ---
 
 ## Phase 0 Task DAG
@@ -176,7 +183,8 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 | **B2** | after spike result | 2.2 | Stack-lock ADR (gated on user running the spike) |
 | **B2.5** | ✅ done 2026-05-12 | synthetic returns fixture | Canonical fixture sha256=`f937ab719140...` — pins regenerated with seed 20260514 |
 | **W1** | ✅ done 2026-05-12 | 3.1, 3.2, 4.1 | Dukascopy DL + HistData DL + snapshot writer. Real bug caught by 4.1 reviewer: path traversal in `_snapshot_path` (fixed) |
-| **W2** | next | 5.1, 5.4 | Holiday/DST module + lookahead linter (independent, pure Python) |
+| **W2** | ✅ done 2026-05-12 | 5.1, 5.4 | Holiday/DST + lookahead linter. Critical bug caught by 5.1 reviewer: US100/GER40 session hours hardcoded UTC (off by 1h for ~8 months/year). Fixed via DST-aware zoneinfo |
+| **W3** | next | 6.2, 6.3 | Commission tables + swap/financing (independent, both fetch firm ToS snapshots) |
 | **B3a** | after B2.5 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV/walkforward/DSR/PBO/MC). All consume the fixture |
 | **B3b** | after B1 (parallel with B2.5) | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 11.1, 11.2 | Data DLs + snapshot + quality + linter + cost components + rules predicates |
 | **B4** | after 3.1+3.2 | 3.3 | Background fetch (long-running, single agent) |
@@ -251,6 +259,7 @@ Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementati
 | Pre-commit gate (Task 1.2) | ✅ PASSED 2026-05-12 | `pre-commit run --all-files` green; `pre-commit run --hook-stage pre-push` green; commit `9c49812` |
 | Canonical fixture (B2.5) | ✅ PASSED 2026-05-12 | sha256=`f937ab719140ddd4f14d29be876de225c44df069bf4038a877e1987b9b226ff9`; 13 property tests pass; commit `9c49812` |
 | W1 data layer (3.1, 3.2, 4.1) | ✅ PASSED 2026-05-12 | All offline unit tests green; integration tests deferred behind `pytest -m integration`; commits `82921bc`, `76dbb61`, `7d640eb`, `63d511b` |
+| W2 quality + linter (5.1, 5.4) | ✅ PASSED 2026-05-12 | 29 quality tests + 24 lookahead linter tests green; DST regressions land; commits `adb2660`, `40b0039`, `d38430d` |
 | Gate 1: Placebo (alpha-leak detector) | ⬜ pending | — |
 | Gate 2: MT5 hello-world + sim/live fill compare (cost-leak detector) | ⬜ pending | — |
 | Phase 0 gate review | ⬜ pending | — |
@@ -291,3 +300,9 @@ Reviewer-flagged items that did NOT block the current task but should not be sil
 | Snapshot writer: corrupt manifest JSON raises raw `JSONDecodeError` (could wrap in `SnapshotIntegrityError`) | data-layer | Optional polish |
 | Snapshot manifest `min_ts`/`max_ts` use `str(polars_value)` which produces naive-looking strings for naive ts (tick data will be tz-aware) | data-layer | Address when Dukascopy ingest lands (Task 4.2 / Day 4 finishing) |
 | Test gaps: ZIP-without-CSV (HistData), missing-manifest-file (snapshot), corrupt-manifest-JSON (snapshot) | data-layer | Cheap follow-up tests; add when next touching those files |
+| Lookahead linter: `while` loops not tracked (static analysis is harder than `for`) | data-layer / linter | Revisit when first Phase-1 strategy lands and we see real loop patterns |
+| Lookahead linter: `df.bfill()` and `df.resample(label='right', closed='right')` not in rule set (both leak future) | data-layer / linter | Same — add rules driven by real Phase-1 strategy code |
+| Quality: Boxing Day 2027 substitution (UK observes Dec 27 when Dec 26 is Sunday) not handled | data-layer / quality | Backtest range stops at 2025; gate before any 2027 backtest |
+| Quality: Xetra half-days (Dec 24, Dec 31) for GER40 not handled | data-layer / quality | Optional, low-impact for Phase-0 spread calibration |
+| Quality: optional `pandas-market-calendars` cross-check test marked `@pytest.mark.network` (cheap insurance against silent calendar drift) | data-layer / quality | Wire into nightly CI when CI exists |
+| Lookahead linter: scan `src/propfarm/sim/` and `src/propfarm/validation/` (sim engine can leak future bars) | data-layer / linter | Revisit when 7.2 fill engine lands — needs a non-`@strategy` marker pattern |
