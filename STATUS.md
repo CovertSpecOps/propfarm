@@ -188,11 +188,35 @@ B3 has been split into B3a (validation math, 5 tasks, blocked by B2.5 fixture) a
 
 1. Implementation agent (fresh) executes the task per the plan.
 2. Implementation agent runs its own self-review (announce `superpowers:requesting-code-review` and report findings).
-3. Second fresh reviewer agent runs `superpowers:receiving-code-review` from the opposite perspective.
+3. Second fresh reviewer agent reviews from the opposite perspective.
 4. Task only marked completed when **both** pass.
-5. If either flags issues, a third fresh agent fixes; loop until both clean.
+5. If either flags issues, fixes are applied (by main session for small integration glue, or a fresh fixer agent for substantive changes); loop until both clean.
 
 Acceptance gates (13.1, 14.3, 15.1) get an additional `superpowers:verification-before-completion` invocation with command output pasted into STATUS.md before the "PASSED" claim.
+
+## Between-wave protocol (B3 sub-batches W1→W5)
+
+After each wave's commits land:
+1. Post a one-line drift note to STATUS.md: **"Wave Wn merged — upstream impact: none / <specific change>"**.
+2. If drift detected (e.g., W1's snapshot manifest schema differs from what W3/W4/W5 will need): pause, fold the change back through the plan, then dispatch the next wave.
+3. Cheap insurance — catches schema drift before 5 downstream agents are working from a stale assumption.
+
+## W4 sequencing (rules-as-code) — NOT parallel within wave
+
+W4 has two tasks that look independent but share a base class:
+1. **W4a: Task 11.1 (Predicate ABC + FTMO predicates)** — dispatch first, alone. Defines `Predicate` base class, FTMO predicates inherit it.
+2. **W4b: Task 11.2 (FundedNext + FundingPips predicates)** — dispatch ONLY after 11.1's commit lands. 11.2 inherits the same ABC.
+
+Reviewer rejects 11.2 if it (a) redefines or shadows the ABC, (b) diverges from FTMO's predicate pattern without justification, or (c) introduces inconsistencies that would force a refactor of 11.1.
+
+## MT5-stack-assumption block policy (active until ADR-0002 + 0003 close)
+
+Until the user's MT5 spike runs and the bridge ADRs finalize, the reviewer **rejects** any agent output that:
+- Imports `MetaTrader5` at module top-level outside `src/propfarm/bridge/` or `scripts/spike_*`.
+- Hard-codes the assumption that the direct-pkg path will win (e.g., naming things `mt5_*` where the abstraction would be `bridge_*`).
+- Takes a runtime dep on broker-specific behavior the spike hasn't yet validated.
+
+Bridge interfaces stay abstract (Protocol or ABC) so the underlying implementation (direct pkg vs ZMQ fallback vs nautilus adapter) is swappable per ADR-0003. **This policy auto-lifts** once both ADRs commit `Accepted` status.
 
 ---
 
