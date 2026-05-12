@@ -1,0 +1,89 @@
+# Pre-commit gate for prop-farm.
+#
+# Stages:
+#   pre-commit (default) — fast checks: hygiene + ruff (lint+format) + mypy --strict.
+#   pre-push             — slower checks: pytest -q. Pytest is on pre-push (not commit)
+#                          so an empty `tests/` tree does not block early commits;
+#                          once tests exist they still gate `git push`.
+#
+# Install both hook types with:
+#   pre-commit install --install-hooks --hook-type pre-commit --hook-type pre-push
+
+default_install_hook_types: [pre-commit, pre-push]
+default_language_version:
+  python: python3.12
+
+# Files excluded from lint/type-check.
+# scripts/spike_mt5.py is a Windows-only throwaway (per the Phase-0 plan, deleted
+# after ADR-0003). It imports MetaTrader5 which has no macOS/Linux wheel, so
+# mypy cannot resolve it on dev machines. Excluding it here, not editing the
+# script, keeps the gate green without touching the spike artifact under review.
+exclude: ^scripts/spike_mt5\.py$
+
+repos:
+  # --------------------------------------------------------------------------
+  # Hygiene: cheap insurance against whitespace/newline/parse errors.
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-commit]
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: check-yaml
+        stages: [pre-commit]
+      - id: check-toml
+        stages: [pre-commit]
+
+  # --------------------------------------------------------------------------
+  # Ruff: lint (with autofix) + format. Config lives in pyproject.toml.
+  # Rev pins the hook repo; the underlying ruff binary it ships still satisfies
+  # `ruff>=0.5` from pyproject.toml's [project.optional-dependencies].dev.
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.12
+    hooks:
+      - id: ruff
+        args: [--fix]
+        stages: [pre-commit]
+      - id: ruff-format
+        stages: [pre-commit]
+
+  # --------------------------------------------------------------------------
+  # mypy --strict. Mirrors the [tool.mypy] block in pyproject.toml.
+  # additional_dependencies seeds the hook's isolated env with the type stubs
+  # we know we'll need early in Phase 0. Add more as modules import them.
+  # --------------------------------------------------------------------------
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.20.2
+    hooks:
+      - id: mypy
+        args: [--strict]
+        additional_dependencies:
+          - polars
+          - pydantic
+          - types-PyYAML
+          - pandas-stubs
+        stages: [pre-commit]
+
+  # --------------------------------------------------------------------------
+  # pytest on pre-push only. pass_filenames=false → pytest is invoked once,
+  # not once per changed file. Runs `pytest -q` against the repo's pyproject
+  # config (testpaths=["tests"]).
+  #
+  # The `bash -c` wrapper maps pytest's exit-code-5 ("no tests collected") to
+  # success. Phase 0 starts with an empty tests/ tree; without this, every
+  # push during Days 1–2 would be blocked before any test files exist. Once
+  # tests land in tests/, exit-code-5 stops appearing and the gate is real.
+  # Any other non-zero exit (failure, collection error) still fails the push.
+  # --------------------------------------------------------------------------
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (pre-push)
+        entry: bash -c 'pytest -q "$@"; rc=$?; [ $rc -eq 5 ] && exit 0 || exit $rc' --
+        language: python
+        additional_dependencies: [pytest>=8, pytest-cov>=5]
+        pass_filenames: false
+        stages: [pre-push]
