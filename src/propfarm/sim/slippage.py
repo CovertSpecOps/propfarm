@@ -171,44 +171,13 @@ _SNAPSHOT_SOURCE: Final[str] = (
 # --------------------------------------------------------------------------- #
 # Data models
 # --------------------------------------------------------------------------- #
-class MarketState(BaseModel):
-    """Snapshot of the prevailing market regime at a single instant.
-
-    Coordination note: this class lives in :mod:`propfarm.sim.slippage`
-    because slippage.py was written before spread.py. The Task 6.1 spread
-    model imports :class:`MarketState` from here; if a future refactor moves
-    it to a shared module, update both consumers and this docstring.
-
-    Attributes
-    ----------
-    symbol : str
-        Trading symbol; must be in :data:`SUPPORTED_SYMBOLS`.
-    ts_utc : datetime.datetime
-        Timestamp of the snapshot. **Must be tz-aware UTC** — naive datetimes
-        raise at :func:`evaluate` time.
-    realized_vol_5m : float | None
-        Annualized realized return volatility over the most-recent 5 minutes.
-        ``None`` falls back to :data:`_DEFAULT_REALIZED_VOL` (10%). Must be
-        non-negative when provided. Note: the value is annualized
-        (e.g. 0.10 == 10% annualized vol), not per-bar.
-    news_window : bool
-        True if the snapshot falls inside a published economic-event window
-        (NFP, CPI, central-bank decisions). Toggles the news multiplier
-        (2x) on slip. Ignored when ``stress_mode`` is True.
-    stress_mode : bool
-        True if the snapshot is being replayed under a Task 10.2 stress
-        scenario (Lehman, SNB, GBP-flash, COVID, UK-gilts, SVB). Toggles
-        the calibrated ``stress_multiplier`` (10-20x for FX, ~5x for
-        indices) on slip.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    symbol: str
-    ts_utc: datetime
-    realized_vol_5m: float | None = None
-    news_window: bool = False
-    stress_mode: bool = False
+# ``MarketState`` is re-exported from :mod:`propfarm.sim.market` — the
+# canonical source for the shared market-context model. Wave 6b shipped a
+# local copy here; W6b reviewer flagged the duplication as a HIGH-severity
+# coupling problem for Wave 6c (the fill engine would otherwise accumulate
+# adapter code between two nominally-distinct Pydantic types of the same
+# name). Consolidated 2026-05-13.
+from propfarm.sim.market import MarketState  # noqa: E402 — re-export
 
 
 class SlippageRequest(BaseModel):

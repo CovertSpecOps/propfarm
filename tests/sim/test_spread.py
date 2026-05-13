@@ -540,3 +540,36 @@ def test_session_open_window_returns_none_far_from_any_open() -> None:
     name, minutes = session_open_window("EURUSD", datetime(2026, 5, 12, 3, 0, tzinfo=UTC))
     assert name is None
     assert minutes == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# W6b reviewer follow-up: MarketState consolidation. Both spread.py and
+# slippage.py must re-export the SAME class from propfarm.sim.market.
+# --------------------------------------------------------------------------- #
+def test_market_state_is_single_canonical_class() -> None:
+    """spread.MarketState and slippage.MarketState are the same Python class.
+
+    Wave 6b shipped two locally-defined MarketState classes. Wave-6b reviewer
+    flagged the duplication as a HIGH-severity coupling problem for the
+    Wave-6c fill engine. Consolidated 2026-05-13 to propfarm.sim.market.
+    This test locks the invariant so a future agent cannot silently
+    re-fork the class.
+    """
+    from propfarm.sim.market import MarketState as canonical
+    from propfarm.sim.slippage import MarketState as slip_ms
+    from propfarm.sim.spread import MarketState as spread_ms
+
+    assert spread_ms is canonical, "spread.MarketState must be the canonical class"
+    assert slip_ms is canonical, "slippage.MarketState must be the canonical class"
+    assert spread_ms is slip_ms, "Both modules must re-export the SAME class object"
+
+
+def test_canonical_market_state_has_stress_mode() -> None:
+    """The consolidated MarketState carries the superset fields including
+    stress_mode (which slippage needs and which the fill engine will consume).
+    """
+    from propfarm.sim.market import MarketState
+
+    ms = MarketState(symbol="EURUSD", ts_utc=datetime(2026, 6, 15, 10, 0, tzinfo=UTC))
+    assert hasattr(ms, "stress_mode")
+    assert ms.stress_mode is False  # default

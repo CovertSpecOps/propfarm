@@ -16,13 +16,13 @@ The model captures four empirical facts about retail-MT5 spread behaviour:
    during London hours) that holds for ~95% of the trading week.
 2. **Session-open widening.** At each major session open — London 07:00 UTC,
    New York 12:00/13:00 UTC (DST-aware), Tokyo 23:00 UTC, and the FX Sunday
-   reopen at 22:00 UTC — liquidity providers reposition their quotes, and
+   reopen at **22:00 UTC** — liquidity providers reposition their quotes, and
    the spread widens to ~5-10x baseline at the open instant. The Sunday
    reopen instant aligns with :func:`propfarm.data.quality.is_market_open`,
-   which gates tradability on Sunday ``hour >= 22``; the spec calls this
-   the "Sunday 21:00 UTC reopen" using the retail-aggregator quote-start
-   convention, but actual tradable liquidity (and therefore the spread the
-   simulator pays) is anchored to 22:00 UTC.
+   which gates tradability on Sunday ``hour >= 22``. (A common retail-
+   aggregator convention quotes pre-open prints from 21:00 UTC onwards, but
+   those are indicative; tradable liquidity — and therefore the spread the
+   simulator pays — is anchored to 22:00 UTC.)
 3. **Post-open decay.** The widening decays back toward baseline within
    ~30 minutes; we model this as an exponential with a per-symbol half-life.
 4. **News-window multiplier.** During a news event (NFP, CPI, FOMC, …) the
@@ -188,10 +188,12 @@ class SpreadCalibrationEntry(BaseModel):
         The flag is set by an upstream news-calendar module (not part of
         Task 6.1). Typical 5-50x. Must be ≥ 1.0.
     weekend_reopen_multiplier : float
-        Multiplicative factor at the Sunday 21:00 UTC FX reopen. Typically
-        *larger* than ``session_open_multiplier`` (10-30x) because the
-        market has been offline for ~50 hours and liquidity is thin.
-        Decays with the same ``decay_half_life_min``. Must be ≥ 1.0.
+        Multiplicative factor at the Sunday 22:00 UTC FX reopen (the
+        tradable-liquidity anchor; see ``_SUNDAY_REOPEN_UTC_HOUR``).
+        Typically *larger* than ``session_open_multiplier`` (10-30x)
+        because the market has been offline for ~50 hours and liquidity
+        is thin. Decays with the same ``decay_half_life_min``.
+        Must be ≥ 1.0.
     confidence : Literal["high", "uncertain"]
         Runtime marker. ``"uncertain"`` until live MT5 capture replaces the
         seeded defaults. Downstream Gate 2B refuses to certify a sim-vs-live
@@ -227,38 +229,16 @@ class SpreadCalibrationEntry(BaseModel):
     snapshot_source: str
 
 
-class MarketState(BaseModel):
-    """Market context the spread model consumes.
-
-    The shape mirrors what the slippage model (Task 7.1) and the fill engine
-    (Task 7.2) will read, so we can route the same ``MarketState`` instance
-    through all three layers without re-projecting fields.
-
-    Attributes
-    ----------
-    symbol : str
-        Trading symbol. Must be in :data:`SUPPORTED_SYMBOLS`.
-    ts_utc : datetime.datetime
-        Tz-aware UTC timestamp. Naive datetimes raise ``ValueError`` at the
-        :func:`evaluate` entry point.
-    realized_vol_5m : float | None
-        Realised 5-minute volatility (annualised, fraction not percent).
-        **Not consumed by Task 6.1.** Present in the interface so the
-        slippage and fill-engine layers can share the same ``MarketState``
-        without us having to invent a wider context object later.
-    news_window : bool
-        Set ``True`` by the news-calendar module when the timestamp falls
-        inside a flagged news event. Task 6.1 multiplies the spread by
-        ``calibration.news_multiplier`` when this is set; it does NOT
-        decide *when* the flag is true.
-    """
-
-    model_config = ConfigDict(frozen=True)
-
-    symbol: str
-    ts_utc: datetime
-    realized_vol_5m: float | None = None
-    news_window: bool = False
+# ``MarketState`` is re-exported from :mod:`propfarm.sim.market` — the canonical
+# source for the shared market-context model. Wave 6b shipped a local copy
+# here; W6b reviewer flagged the duplication as a HIGH-severity coupling
+# problem for Wave 6c (the fill engine would otherwise accumulate adapter code
+# between two nominally-distinct Pydantic types). Consolidated 2026-05-13.
+#
+# Task 6.1 ignores the ``stress_mode`` field on :class:`MarketState`; stress
+# replay drives spread via the ``news_window`` flag and event-specific
+# calibration entries (see :mod:`propfarm.sim.stress_replay` when it lands).
+from propfarm.sim.market import MarketState  # noqa: E402 — re-export
 
 
 class SpreadRequest(BaseModel):
@@ -355,7 +335,7 @@ def session_open_window(symbol: str, ts_utc: datetime) -> tuple[str | None, floa
     Looks back up to :data:`_SESSION_WINDOW_MIN` minutes and picks the most
     recent session open from the four tracked sessions:
 
-    * ``"sunday_reopen"`` — Sunday 21:00 UTC (FX weekly reopen)
+    * ``"sunday_reopen"`` — Sunday 22:00 UTC (FX weekly reopen, tradable-liquidity anchor)
     * ``"tokyo"`` — 23:00 UTC each tradable weekday-eve
     * ``"london"`` — 07:00 UTC each weekday
     * ``"ny"`` — 12:00 UTC (EDT) / 13:00 UTC (EST), DST-aware
@@ -423,7 +403,7 @@ def session_open_window(symbol: str, ts_utc: datetime) -> tuple[str | None, floa
             candidates.append(
                 ("tokyo", datetime(d.year, d.month, d.day, _TOKYO_OPEN_UTC_HOUR, 0, tzinfo=UTC))
             )
-        # Sunday reopen 21:00 UTC: only on Sundays.
+        # Sunday reopen 22:00 UTC (tradable-liquidity anchor): only on Sundays.
         if d.weekday() == 6:
             candidates.append(
                 (

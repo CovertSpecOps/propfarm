@@ -784,11 +784,26 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             if now >= session_deadline:
                 print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
                 break
-            if target > now:
+            # W6b reviewer fix: wait UNTIL the scheduled target, even if the
+            # gap is > 1h. The earlier version did a single `time.sleep(min(
+            # sleep_s, 3600))` and then unconditionally fell through to the
+            # `order_send` block, which fired the order up to (gap - 1h)
+            # before its scheduled time. Functionally rare at n=200/24h (avg
+            # gap ~7 min), but a real defect under low-n or quiet-zone-heavy
+            # schedules. The 1h-cap-per-sleep stays as a watchdog (so a
+            # corrupt entry can't block forever in a single syscall), but is
+            # now wrapped in a loop that re-checks `now` and the deadline.
+            while True:
+                now = datetime.now(tz=UTC)
+                if now >= session_deadline:
+                    break
+                if now >= target:
+                    break
                 sleep_s = (target - now).total_seconds()
-                # Cap each sleep at 1h so a corrupt schedule entry can't wedge
-                # the recorder for the entire window.
                 time.sleep(min(sleep_s, 3600.0))
+            if datetime.now(tz=UTC) >= session_deadline:
+                print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
+                break
 
             # SAFETY ASSERT #2 — open position cap.
             open_positions = mt5.positions_get() or ()
