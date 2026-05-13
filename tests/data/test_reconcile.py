@@ -104,7 +104,9 @@ def test_aggregate_ticks_to_1m() -> None:
             "ask_vol": pl.Float64,
         },
     )
-    out = aggregate_dukascopy_ticks_to_1m(duka)
+    # Use price_source="mid" explicitly here — this test exercises the OHLC
+    # aggregation mechanics; the bid/ask/mid switch is tested separately.
+    out = aggregate_dukascopy_ticks_to_1m(duka, price_source="mid")
     assert out.height == 1
     row = out.row(0, named=True)
     assert row["open"] == pytest.approx(mids[0])
@@ -139,7 +141,7 @@ def test_aggregate_handles_unsorted_input() -> None:
             "ask_vol": pl.Float64,
         },
     )
-    out = aggregate_dukascopy_ticks_to_1m(duka)
+    out = aggregate_dukascopy_ticks_to_1m(duka, price_source="mid")
     row = out.row(0, named=True)
     # Sorted order: 1.10000 (open) -> 1.10010 -> 1.10020 (close).
     assert row["open"] == pytest.approx(1.10000)
@@ -483,3 +485,57 @@ def test_end_to_end_tick_to_reconcile() -> None:
     top = report.findings[0]
     assert top.field == "open"
     assert top.ts_utc == base + timedelta(minutes=1)
+
+
+def test_aggregate_default_is_bid_price() -> None:
+    """Default price_source is "bid" to match the HistData ASCII M1 FX convention.
+
+    W6a reviewer flagged that aggregating Dukascopy ticks to mid against
+    HistData bid bars introduces a systemic half-spread offset on every
+    minute (~0.5 bps on EURUSD; can approach the 5-bps reconciliation
+    threshold during spread-widening events and produce false positives).
+    The default switched to "bid"; this test locks it.
+    """
+    base = datetime(2024, 6, 3, 10, 0, tzinfo=UTC)
+    ts = [base + timedelta(seconds=s) for s in range(3)]
+    duka = pl.DataFrame(
+        {
+            "ts": ts,
+            "bid": [1.10000, 1.10010, 1.10020],
+            "ask": [1.10002, 1.10012, 1.10022],
+        },
+        schema={
+            "ts": pl.Datetime(time_unit="us", time_zone="UTC"),
+            "bid": pl.Float64,
+            "ask": pl.Float64,
+        },
+    )
+    out = aggregate_dukascopy_ticks_to_1m(duka)  # no price_source kwarg -> default
+    row = out.row(0, named=True)
+    # If default were "mid", open would be 1.10001 (mid of first tick).
+    # If default is "bid", open is 1.10000 (bid of first tick).
+    assert row["open"] == pytest.approx(1.10000), (
+        "Default price_source must be 'bid' to match HistData M1 FX convention"
+    )
+    assert row["close"] == pytest.approx(1.10020)
+
+
+def test_aggregate_ask_price_source() -> None:
+    """price_source='ask' uses the ask column for OHLC."""
+    base = datetime(2024, 6, 3, 10, 0, tzinfo=UTC)
+    duka = pl.DataFrame(
+        {
+            "ts": [base, base + timedelta(seconds=1)],
+            "bid": [1.10000, 1.10010],
+            "ask": [1.10002, 1.10012],
+        },
+        schema={
+            "ts": pl.Datetime(time_unit="us", time_zone="UTC"),
+            "bid": pl.Float64,
+            "ask": pl.Float64,
+        },
+    )
+    out = aggregate_dukascopy_ticks_to_1m(duka, price_source="ask")
+    row = out.row(0, named=True)
+    assert row["open"] == pytest.approx(1.10002)
+    assert row["close"] == pytest.approx(1.10012)

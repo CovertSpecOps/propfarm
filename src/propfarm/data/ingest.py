@@ -60,6 +60,7 @@ from typing import Final
 import polars as pl
 from pydantic import BaseModel, ConfigDict
 
+from propfarm.data.quality import SUPPORTED_SYMBOLS
 from propfarm.data.snapshot import (
     SnapshotEntry,
     _load_manifest,
@@ -76,15 +77,10 @@ logger = logging.getLogger(__name__)
 # --------------------------------------------------------------------------- #
 
 #: The six instruments Phase 0 (and the Phase-0 plan, Day 3 Task 3.1 Step 5)
-#: targets. Order is canonical for CLI output stability.
-PHASE0_SYMBOLS: Final[tuple[str, ...]] = (
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "XAUUSD",
-    "GER40",
-    "US100",
-)
+#: targets. Imported from the canonical `propfarm.data.quality.SUPPORTED_SYMBOLS`
+#: rather than re-declared inline — W6a reviewer flagged the previous duplicate
+#: as a silent drift risk. Order matches the registry's tuple iteration order.
+PHASE0_SYMBOLS: Final[tuple[str, ...]] = SUPPORTED_SYMBOLS
 
 #: Regex for Dukascopy hourly tick filenames: e.g. ``10h_ticks.bi5``.
 _HOUR_FILENAME_RE: Final[re.Pattern[str]] = re.compile(r"^(?P<hour>\d{2})h_ticks\.bi5$")

@@ -638,3 +638,60 @@ def test_unknown_model_raises() -> None:
     """Unknown (firm, model) combo surfaces at construction."""
     with pytest.raises(ValueError, match="No predicate set registered"):
         ChallengeStateMachine("fundednext", "imaginary_model")
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-up (W6a): kill routing for PAYOUT_PENDING and POST_PAYOUT
+# --------------------------------------------------------------------------- #
+def test_kill_violation_in_payout_pending_yields_account_lost() -> None:
+    """Daily DD kill while in PAYOUT_PENDING → ACCOUNT_LOST.
+
+    A kill during the payout window is a worst-case scenario (operator
+    just hit a payout milestone; account dies on the next session).
+    The state machine maps PAYOUT_PENDING into the funded-side terminal
+    (ACCOUNT_LOST), not the pre-funded terminal (FAILED).
+    """
+    sm = ChallengeStateMachine("ftmo")
+    snap = StateMachineSnapshot(
+        firm="ftmo",
+        model="default",
+        phase=Phase.PAYOUT_PENDING,
+        sizing_mode=SizingMode.PRESERVATION,
+        account_state=_state(),
+    )
+    bad_state = _state(
+        account_size=100_000.0,
+        daily_start_equity=100_000.0,
+        current_equity=100_000.0 - 5_010.0,
+        current_balance=100_000.0 - 5_010.0,
+    )
+    result = sm.step(snap, new_account_state=bad_state, candidate=None)
+    assert result.phase_changed is True
+    assert result.snapshot.phase is Phase.ACCOUNT_LOST
+
+
+def test_kill_violation_in_post_payout_yields_account_lost() -> None:
+    """Daily DD kill while in POST_PAYOUT → ACCOUNT_LOST.
+
+    POST_PAYOUT is the transient phase that immediately precedes the
+    return to FUNDED with a reset baseline. A kill caught at this instant
+    routes to the funded-side terminal (ACCOUNT_LOST), consistent with
+    PAYOUT_PENDING and FUNDED.
+    """
+    sm = ChallengeStateMachine("ftmo")
+    snap = StateMachineSnapshot(
+        firm="ftmo",
+        model="default",
+        phase=Phase.POST_PAYOUT,
+        sizing_mode=SizingMode.AGGRESSIVE,
+        account_state=_state(),
+    )
+    bad_state = _state(
+        account_size=100_000.0,
+        daily_start_equity=100_000.0,
+        current_equity=100_000.0 - 5_010.0,
+        current_balance=100_000.0 - 5_010.0,
+    )
+    result = sm.step(snap, new_account_state=bad_state, candidate=None)
+    assert result.phase_changed is True
+    assert result.snapshot.phase is Phase.ACCOUNT_LOST

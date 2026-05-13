@@ -157,14 +157,25 @@ def _require_tz_aware_utc_ts(df: pl.DataFrame, label: str) -> None:
 # --------------------------------------------------------------------------- #
 # Aggregation: tick mid -> 1m OHLC
 # --------------------------------------------------------------------------- #
-def aggregate_dukascopy_ticks_to_1m(duka_ticks: pl.DataFrame) -> pl.DataFrame:
-    """Aggregate Dukascopy ticks into 1-minute OHLC bars on mid price.
+def aggregate_dukascopy_ticks_to_1m(
+    duka_ticks: pl.DataFrame,
+    *,
+    price_source: Literal["bid", "ask", "mid"] = "bid",
+) -> pl.DataFrame:
+    """Aggregate Dukascopy ticks into 1-minute OHLC bars.
 
-    Each tick has a ``bid`` and ``ask``; we compute ``mid = (bid + ask) / 2``
-    and resample to 1-minute floor boundaries. ``volume`` is the sum of
-    ``bid_vol + ask_vol`` across the minute (a coarse activity proxy; the
-    cost model does not consume this column, but the reconciliation report
-    surfaces it as a sanity check).
+    ``price_source`` selects which tick column drives OHLC. **Default is
+    ``"bid"``** to match the HistData ASCII M1 FX convention (HistData M1
+    bars are documented as bid prices, not mid). Aggregating Dukascopy to
+    mid against HistData bid introduces a systemic half-spread offset on
+    every bar — fine in liquid hours (~0.5 bps on EURUSD), but during
+    spread-widening events the offset alone can approach the 5-bps
+    reconciliation threshold and produce false positives. W6a reviewer
+    flagged this MEDIUM concern; default switched to ``"bid"`` to keep
+    both vendors on the same convention.
+
+    ``volume`` is the sum of ``bid_vol + ask_vol`` across the minute (a
+    coarse activity proxy; the cost model does not consume this column).
 
     Parameters
     ----------
@@ -172,6 +183,10 @@ def aggregate_dukascopy_ticks_to_1m(duka_ticks: pl.DataFrame) -> pl.DataFrame:
         Columns ``ts`` (tz-aware UTC Datetime), ``bid``, ``ask``, optionally
         ``bid_vol`` / ``ask_vol``. Order need not be sorted — we sort
         deterministically inside the function so OHLC are stable.
+    price_source : Literal["bid", "ask", "mid"]
+        Which price drives OHLC. Default ``"bid"`` matches HistData. Use
+        ``"mid"`` only when explicitly reconciling against a mid-quoted
+        feed, and document the convention choice.
 
     Returns
     -------
@@ -193,7 +208,6 @@ def aggregate_dukascopy_ticks_to_1m(duka_ticks: pl.DataFrame) -> pl.DataFrame:
 
     has_vol = "bid_vol" in duka_ticks.columns and "ask_vol" in duka_ticks.columns
 
-    # Sort first so .first()/.last() resolve deterministically per minute.
     # Empty input fast-path: build the canonical empty schema.
     if duka_ticks.height == 0:
         return pl.DataFrame(
@@ -207,22 +221,30 @@ def aggregate_dukascopy_ticks_to_1m(duka_ticks: pl.DataFrame) -> pl.DataFrame:
             }
         )
 
-    with_mid = duka_ticks.sort(_TS_COL).with_columns(
-        ((pl.col("bid") + pl.col("ask")) / 2.0).alias("_mid"),
+    if price_source == "bid":
+        price_expr = pl.col("bid")
+    elif price_source == "ask":
+        price_expr = pl.col("ask")
+    else:  # "mid"
+        price_expr = (pl.col("bid") + pl.col("ask")) / 2.0
+
+    # Sort first so .first()/.last() resolve deterministically per minute.
+    with_price = duka_ticks.sort(_TS_COL).with_columns(
+        price_expr.alias("_price"),
         ((pl.col("bid_vol") + pl.col("ask_vol")) if has_vol else pl.lit(0.0)).alias("_vol"),
     )
 
     aggs = [
-        pl.col("_mid").first().alias("open"),
-        pl.col("_mid").max().alias("high"),
-        pl.col("_mid").min().alias("low"),
-        pl.col("_mid").last().alias("close"),
+        pl.col("_price").first().alias("open"),
+        pl.col("_price").max().alias("high"),
+        pl.col("_price").min().alias("low"),
+        pl.col("_price").last().alias("close"),
         pl.col("_vol").sum().cast(pl.Float64).alias("volume"),
     ]
 
     # group_by_dynamic floors timestamps to minute boundaries deterministically.
     # closed="left" matches the [t, t+1m) convention used by HistData M1 bars.
-    return with_mid.group_by_dynamic(_TS_COL, every="1m", closed="left").agg(aggs).sort(_TS_COL)
+    return with_price.group_by_dynamic(_TS_COL, every="1m", closed="left").agg(aggs).sort(_TS_COL)
 
 
 # --------------------------------------------------------------------------- #
