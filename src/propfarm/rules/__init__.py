@@ -12,8 +12,34 @@ The :class:`Predicate` ABC carries a ``confidence: Literal["high",
 :class:`propfarm.sim.swap.SwapTable`. High-confidence predicates trip the
 kill switch on breach; uncertain predicates surface to the daily
 auto-report. See ``predicates.py`` for the full semantics.
+
+Predicate :meth:`Predicate.evaluate` returns an :class:`Event` — either a
+:class:`Violation` (rule breach; severity follows confidence) or an
+:class:`Achievement` (non-failure completion event; never trips the kill
+switch). The two-event-type design separates "is the rule interpretive?"
+from "is the event a failure?" — fixing the conflation a reviewer caught
+in the original W4a draft where ``confidence="uncertain"`` was overloaded
+to coerce ``severity="warn"`` on profit-target predicates.
 """
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from propfarm.rules.predicates import (
+    AccountState,
+    Achievement,
+    CandidateTrade,
+    Event,
+    OpenPosition,
+    Predicate,
+    Violation,
+)
+
+__all__ = [
+    "AccountState",
+    "Achievement",
+    "CandidateTrade",
+    "Event",
+    "OpenPosition",
+    "Predicate",
+    "Violation",
+]

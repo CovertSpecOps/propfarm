@@ -75,7 +75,9 @@ from typing import Literal
 
 __all__ = [
     "AccountState",
+    "Achievement",
     "CandidateTrade",
+    "Event",
     "OpenPosition",
     "Predicate",
     "Violation",
@@ -199,8 +201,44 @@ class CandidateTrade:
 
 
 @dataclass(frozen=True)
-class Violation:
-    """A rule breach (or, for completion-gate predicates, a phase transition).
+class Event:
+    """Marker base for predicate evaluation outputs.
+
+    A predicate's :meth:`Predicate.evaluate` returns ``Event | None``. The
+    runtime / state machine consumer dispatches on the concrete subclass:
+
+    * :class:`Violation` — a rule was breached. The severity field tells
+      the kill switch whether to terminate the account.
+    * :class:`Achievement` — a non-failure transition fired (e.g. profit
+      target hit, minimum trading days reached). The state machine reads
+      this as a phase transition (Challenge → Verification, Verification
+      → Funded, etc.), **not** as a failure. Never trips the kill switch.
+
+    Both subclasses share the common audit fields (``predicate_name``,
+    ``firm``, ``message``, ``tos_quote``). They differ in whether they
+    encode a failure (Violation) or a success-completion (Achievement).
+
+    This separation exists because the older shape — overloading
+    ``Violation.severity="warn"`` to mean "completion event, don't kill"
+    — conflated two unrelated facts on one field: "is this rule
+    interpretive?" and "is this event a failure?". A future agent
+    reading ``confidence="uncertain"`` on a profit-target predicate
+    would misread the rule as fuzzy when in fact the rule is
+    crystal-clear (10% of starting balance, explicitly published).
+    The reviewer-driven refactor restores ``confidence="high"`` for
+    those rules and routes the non-failure semantics through this
+    Achievement type.
+    """
+
+    predicate_name: str
+    firm: str
+    message: str
+    tos_quote: str
+
+
+@dataclass(frozen=True)
+class Violation(Event):
+    """A rule breach.
 
     The :attr:`severity` field is **derived from the source predicate's
     confidence**:
@@ -215,36 +253,45 @@ class Violation:
 
     Attributes
     ----------
-    predicate_name : str
-        Stable identifier of the source predicate, e.g.
-        ``"ftmo_daily_drawdown"``. The state machine (Task 12.1)
-        dispatches on this for completion-gate semantics — a profit-target
-        predicate emits a Violation that the state machine reads as a
-        phase transition, not a failure.
-    firm : str
-        Firm slug. Mirrors :attr:`AccountState.firm`.
     severity : Literal["kill", "warn"]
         Derived from confidence by :meth:`Predicate._violation`.
-    message : str
-        Human-readable summary including the relevant numbers (e.g.
-        ``"daily DD = -5.20% from start equity 100000.00, threshold -5.00%"``).
-        Logged verbatim; downstream UIs may surface this directly.
-    tos_quote : str
-        The exact ToS text the source predicate enforces. Used both for
-        audit logging and for the snapshot-integrity test that asserts
-        this quote appears verbatim in the on-disk markdown snapshot.
     confidence : Literal["high", "uncertain"]
         Mirrors the source predicate's confidence. Carried on the
         :class:`Violation` so a downstream report can group violations
         by confidence without re-resolving the predicate.
     """
 
-    predicate_name: str
-    firm: str
-    severity: Literal["kill", "warn"]
-    message: str
-    tos_quote: str
-    confidence: Literal["high", "uncertain"]
+    severity: Literal["kill", "warn"] = "kill"
+    confidence: Literal["high", "uncertain"] = "high"
+
+
+@dataclass(frozen=True)
+class Achievement(Event):
+    """A non-failure phase-transition event.
+
+    Emitted by completion-gate predicates (profit target, minimum trading
+    days, minimum time-in-phase) when their numeric threshold is met.
+    The state machine reads this as a phase transition and never trips
+    the kill switch on it.
+
+    No ``severity`` field — an Achievement is **not** a breach, not even
+    a soft one. No ``confidence`` field either: completion-gate predicates
+    encode unambiguous numeric thresholds (10% profit target, 4 trading
+    days minimum). If a firm ever publishes an interpretive completion
+    rule, its predicate should return a :class:`Violation` with
+    ``severity="warn"`` instead, and a follow-up ADR should decide
+    whether to extend :class:`Achievement` with a confidence field.
+
+    Attributes
+    ----------
+    achievement_kind : Literal["profit_target", "min_trading_days", "min_phase_duration"]
+        Stable identifier for the achievement type. The state machine
+        dispatches on this; new completion-gate kinds extend the Literal.
+    """
+
+    achievement_kind: Literal["profit_target", "min_trading_days", "min_phase_duration"] = (
+        "profit_target"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -299,8 +346,8 @@ class Predicate(ABC):
         self,
         state: AccountState,
         candidate: CandidateTrade | None = None,
-    ) -> Violation | None:
-        """Return a :class:`Violation` if the rule trips, else :data:`None`.
+    ) -> Event | None:
+        """Return an :class:`Event` if the predicate fires, else :data:`None`.
 
         Parameters
         ----------
@@ -311,18 +358,24 @@ class Predicate(ABC):
 
         Returns
         -------
-        Violation or None
-            On breach, a :class:`Violation` constructed via
-            :meth:`_violation` (so ``severity`` follows ``confidence``).
-            On no breach, :data:`None`. Implementations must NEVER return a
-            ``severity="kill"`` Violation from an ``"uncertain"`` predicate;
-            using :meth:`_violation` makes that mistake impossible.
+        Event or None
+            On rule breach: a :class:`Violation` constructed via
+            :meth:`_violation` (severity follows confidence).
+            On completion-gate hit: an :class:`Achievement` constructed via
+            :meth:`_achievement` (no severity; never kills).
+            On no event: :data:`None`.
+
+            Implementations MUST use the helpers — bypassing
+            :meth:`_violation` allows the severity-from-confidence
+            invariant to drift; bypassing :meth:`_achievement` allows a
+            completion-gate predicate to mistakenly emit a Violation that
+            the kill switch acts on.
         """
 
     def _violation(self, message: str) -> Violation:
         """Construct a :class:`Violation` with severity derived from confidence.
 
-        This is the **only** way subclasses should construct violations.
+        This is the **only** way subclasses should construct breach events.
         It enforces ``confidence="high" → severity="kill"`` and
         ``confidence="uncertain" → severity="warn"`` in one place, so a
         future agent cannot accidentally encode an uncertain rule as a
@@ -344,10 +397,44 @@ class Predicate(ABC):
         return Violation(
             predicate_name=self.name,
             firm=self.firm,
-            severity=severity,
             message=message,
             tos_quote=self.tos_quote,
+            severity=severity,
             confidence=self.confidence,
+        )
+
+    def _achievement(
+        self,
+        message: str,
+        *,
+        kind: Literal["profit_target", "min_trading_days", "min_phase_duration"],
+    ) -> Achievement:
+        """Construct an :class:`Achievement` for a completion-gate predicate.
+
+        This is the **only** way subclasses should construct non-failure
+        events. Using ``_violation`` for a completion event would emit a
+        Violation that the kill switch could act on; using ``_achievement``
+        routes the event through the state-machine-dispatch path instead.
+
+        Completion-gate predicates carry ``confidence="high"`` because
+        their thresholds are numeric and unambiguous; the confidence
+        field is NOT propagated onto the Achievement (an Achievement
+        without confidence is by design — see the :class:`Achievement`
+        docstring).
+
+        Parameters
+        ----------
+        message : str
+            Human-readable summary including the relevant numbers.
+        kind : Literal[...]
+            Stable identifier for the achievement type.
+        """
+        return Achievement(
+            predicate_name=self.name,
+            firm=self.firm,
+            message=message,
+            tos_quote=self.tos_quote,
+            achievement_kind=kind,
         )
 
 

@@ -59,6 +59,7 @@ from zoneinfo import ZoneInfo
 from propfarm.rules.predicates import (
     AccountState,
     CandidateTrade,
+    Event,
     Predicate,
     Violation,
 )
@@ -352,30 +353,24 @@ class FtmoMaxDrawdown(Predicate):
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class FtmoProfitTarget(Predicate):
-    """Profit-target predicate.
+    """Profit-target predicate. Completion event, not a failure.
 
-    **Semantics:** Hitting the target is a **completion event**, not a
-    failure. By design, this predicate is registered with
-    ``confidence="uncertain"`` so its emitted Violation has
-    ``severity="warn"`` — the state machine (Task 12.1) dispatches on
-    :attr:`Violation.predicate_name` to route this to a phase transition
-    rather than a kill. The "uncertain" classification here is a
-    deliberate, narrowly-documented exception to the
-    confidence-from-source-text rule: the target itself IS published
-    numerically (10% / 5%), but the **kill-vs-completion semantics** of a
-    profit target require severity="warn" so the kill switch does not
-    terminate the account when it reaches profit. See the module
-    docstring and the snapshot file for full discussion.
+    Hitting the target emits an :class:`Achievement` (not a Violation), so
+    the kill switch never trips on it and the state machine treats it as
+    a phase transition. The rule itself is high-confidence: FTMO publishes
+    the 10% one-step / 8%+5% two-step thresholds numerically and
+    unambiguously, so ``confidence="high"``.
 
-    Reviewer alternative considered: introduce a third
-    severity ``"complete"``. Rejected because the state machine would
-    then need to handle three severities everywhere, the ABC would
-    diverge from the W3 confidence pattern, and the daily auto-report
-    already surfaces "warn" entries for human review — a profit-target
-    "warn" is the **right** behavior at the kill-switch layer and the
-    state machine reads ``predicate_name`` to disambiguate.
+    Earlier draft used ``confidence="uncertain"`` to coerce
+    ``severity="warn"`` on a Violation. Reviewer correctly pushed back:
+    that overloaded two unrelated facts ("rule is interpretive" + "event
+    is non-failure") on one field. Refactored: route completion events
+    through :meth:`Predicate._achievement` instead of
+    :meth:`Predicate._violation`. The rule is high-confidence; the event
+    is non-failure; the two are now orthogonal.
 
-    Confidence ``"uncertain"``.
+    Confidence ``"high"``. Returns :class:`Achievement` (not Violation)
+    on threshold hit.
     """
 
     threshold_fraction: float = _PROFIT_TARGET_ONE_STEP_FRACTION
@@ -384,16 +379,17 @@ class FtmoProfitTarget(Predicate):
         self,
         state: AccountState,
         candidate: CandidateTrade | None = None,
-    ) -> Violation | None:
-        """Return a warn Violation if equity has reached target from starting balance."""
+    ) -> Event | None:
+        """Return an Achievement if equity has reached target from starting balance."""
         gain_usd = state.current_equity - state.account_size
         threshold_usd = state.account_size * self.threshold_fraction
         if gain_usd >= threshold_usd:
             gain_pct = (gain_usd / state.account_size) * 100.0
             threshold_pct = self.threshold_fraction * 100.0
-            return self._violation(
+            return self._achievement(
                 f"profit target reached: +{gain_pct:.2f}% from starting balance "
-                f"{state.account_size:.2f}; target +{threshold_pct:.2f}%"
+                f"{state.account_size:.2f}; target +{threshold_pct:.2f}%",
+                kind="profit_target",
             )
         return None
 
@@ -540,8 +536,13 @@ class FtmoBannedTechniques(Predicate):
         self,
         state: AccountState,
         candidate: CandidateTrade | None = None,
-    ) -> Violation | None:
-        """Return the first child Violation, or None if all clean."""
+    ) -> Event | None:
+        """Return the first child Event (Violation or Achievement), or None if all clean.
+
+        Composite predicates inherit the broader ``Event | None`` return
+        type because a future child could be a completion-gate predicate
+        emitting an Achievement; the composite must not narrow it away.
+        """
         for child in self.children:
             result = child.evaluate(state, candidate)
             if result is not None:
@@ -582,11 +583,14 @@ class FtmoNewsBlackoutWindow(Predicate):
 class FtmoMinTradingDays(Predicate):
     """Minimum 4 trading days per phase. Completion-gate, not kill.
 
-    Confidence ``"uncertain"`` — same exception as
-    :class:`FtmoProfitTarget`. The underlying rule is numeric ("4 days")
-    but the **semantics** require severity="warn" so the kill switch
-    does not terminate; the state machine reads ``predicate_name`` to
-    route to a phase-completion check at end-of-phase.
+    Confidence ``"high"`` — the 4-day minimum is published numerically.
+    Earlier draft was ``"uncertain"`` as a workaround for severity-warn
+    semantics; refactored to use :class:`Achievement` so the rule
+    confidence stays high.
+
+    No-op in Phase 0: the end-of-phase trading-day counter lives in
+    Task 12 (state machine), which will instantiate an Achievement when
+    the count reaches ``min_days`` at end-of-phase.
     """
 
     min_days: int = _MIN_TRADING_DAYS
@@ -595,7 +599,7 @@ class FtmoMinTradingDays(Predicate):
         self,
         state: AccountState,
         candidate: CandidateTrade | None = None,
-    ) -> Violation | None:
+    ) -> Event | None:
         """No-op in Phase 0; end-of-phase trading-day counter lands in Task 12."""
         return None
 
@@ -712,12 +716,13 @@ FTMO_MAX_DD: Final[FtmoMaxDrawdown] = FtmoMaxDrawdown(
 FTMO_PROFIT_TARGET_ONE_STEP: Final[FtmoProfitTarget] = FtmoProfitTarget(
     name="ftmo_profit_target_one_step",
     firm=FIRM_SLUG,
-    confidence=_UNCERTAIN,  # see class docstring re: severity="warn" semantics
+    confidence=_HIGH,  # rule is numeric; completion-event semantics via Achievement
     tos_quote=_QUOTE_PROFIT_TARGET,
     interpretation=(
         "FTMO one-step Challenge profit target: equity must reach +10% of "
-        "starting balance to complete the phase. This is a phase-transition "
-        "trigger (severity='warn'), not a kill rule."
+        "starting balance to complete the phase. On threshold hit the "
+        "predicate emits an Achievement (not a Violation) so the kill "
+        "switch is never invoked on a successful completion."
     ),
     threshold_fraction=_PROFIT_TARGET_ONE_STEP_FRACTION,
 )
@@ -726,11 +731,11 @@ FTMO_PROFIT_TARGET_ONE_STEP: Final[FtmoProfitTarget] = FtmoProfitTarget(
 FTMO_PROFIT_TARGET_TWO_STEP_CHALLENGE: Final[FtmoProfitTarget] = FtmoProfitTarget(
     name="ftmo_profit_target_two_step_challenge",
     firm=FIRM_SLUG,
-    confidence=_UNCERTAIN,  # see class docstring
+    confidence=_HIGH,
     tos_quote=_QUOTE_PROFIT_TARGET,
     interpretation=(
         "FTMO two-step Challenge phase: profit target +10% of starting "
-        "balance. Phase-transition trigger."
+        "balance. Emits Achievement on hit; kill switch never invoked."
     ),
     threshold_fraction=_PROFIT_TARGET_TWO_STEP_CHALLENGE_FRACTION,
 )
@@ -739,11 +744,11 @@ FTMO_PROFIT_TARGET_TWO_STEP_CHALLENGE: Final[FtmoProfitTarget] = FtmoProfitTarge
 FTMO_PROFIT_TARGET_TWO_STEP_VERIFICATION: Final[FtmoProfitTarget] = FtmoProfitTarget(
     name="ftmo_profit_target_two_step_verification",
     firm=FIRM_SLUG,
-    confidence=_UNCERTAIN,  # see class docstring
+    confidence=_HIGH,
     tos_quote=_QUOTE_PROFIT_TARGET,
     interpretation=(
         "FTMO two-step Verification phase: profit target +5% of starting "
-        "balance. Phase-transition trigger."
+        "balance. Emits Achievement on hit; kill switch never invoked."
     ),
     threshold_fraction=_PROFIT_TARGET_TWO_STEP_VERIFICATION_FRACTION,
 )
@@ -831,11 +836,11 @@ FTMO_NEWS_BLACKOUT: Final[FtmoNewsBlackoutWindow] = FtmoNewsBlackoutWindow(
 FTMO_MIN_TRADING_DAYS: Final[FtmoMinTradingDays] = FtmoMinTradingDays(
     name="ftmo_min_trading_days",
     firm=FIRM_SLUG,
-    confidence=_UNCERTAIN,  # completion-gate semantics, see class docstring
+    confidence=_HIGH,  # rule is numeric (4 days); completion-event via Achievement
     tos_quote=_QUOTE_MIN_TRADING_DAYS,
     interpretation=(
         "Phase completion requires trading on at least 4 distinct calendar "
-        "days. Phase-transition trigger; severity='warn'."
+        "days. End-of-phase trigger; emits Achievement, not Violation."
     ),
 )
 

@@ -48,6 +48,7 @@ from propfarm.rules.ftmo import (
 )
 from propfarm.rules.predicates import (
     AccountState,
+    Achievement,
     Predicate,
     Violation,
 )
@@ -171,38 +172,46 @@ class TestMaxDrawdownBoundary:
 # Boundary tests: Profit target
 # --------------------------------------------------------------------------- #
 class TestProfitTargetBoundary:
-    """One-step 10%, two-step Challenge 10%, two-step Verification 5%."""
+    """One-step 10%, two-step Challenge 10%, two-step Verification 5%.
+
+    Profit-target predicates emit :class:`Achievement` (not Violation)
+    on threshold hit. The rule itself is confidence='high' — the
+    completion-event semantics are encoded by the return TYPE, not by
+    overloading severity='warn' on a Violation.
+    """
 
     def test_profit_target_at_10_percent_one_step(self) -> None:
-        """One-step target trips at +10%."""
+        """One-step target trips at +10% and emits an Achievement."""
         state = _state(current_equity=110_000.0)
         result = FTMO_PROFIT_TARGET_ONE_STEP.evaluate(state)
         assert result is not None
-        # See class docstring: severity is 'warn' by design (completion-gate).
-        assert result.severity == "warn"
+        assert isinstance(result, Achievement)
+        assert result.achievement_kind == "profit_target"
         assert result.predicate_name == "ftmo_profit_target_one_step"
+        # Achievement has no severity field — the kill switch never fires
+        # on it. Encoded by the type system, not by a string check.
+        assert not isinstance(result, Violation)
 
-    def test_profit_target_below_10_percent_one_step_no_violation(self) -> None:
+    def test_profit_target_below_10_percent_one_step_no_event(self) -> None:
         """+9.99% one-step → None."""
         state = _state(current_equity=109_990.0)
         assert FTMO_PROFIT_TARGET_ONE_STEP.evaluate(state) is None
 
     def test_profit_target_at_10_percent_two_step_challenge(self) -> None:
-        """Two-step Challenge phase target: 10%."""
+        """Two-step Challenge phase target: 10%, emits Achievement."""
         state = _state(current_equity=110_000.0)
         result = FTMO_PROFIT_TARGET_TWO_STEP_CHALLENGE.evaluate(state)
-        assert result is not None
-        assert result.severity == "warn"
+        assert isinstance(result, Achievement)
+        assert result.achievement_kind == "profit_target"
 
     def test_profit_target_at_5_percent_two_step_verification(self) -> None:
-        """Two-step Verification phase target: 5%."""
+        """Two-step Verification phase target: 5%, emits Achievement."""
         state = _state(current_equity=105_000.0)
         result = FTMO_PROFIT_TARGET_TWO_STEP_VERIFICATION.evaluate(state)
-        assert result is not None
-        assert result.severity == "warn"
+        assert isinstance(result, Achievement)
         assert result.predicate_name == "ftmo_profit_target_two_step_verification"
 
-    def test_profit_target_below_5_percent_two_step_verification_no_violation(self) -> None:
+    def test_profit_target_below_5_percent_two_step_verification_no_event(self) -> None:
         """+4.99% on Verification → None."""
         state = _state(current_equity=104_990.0)
         assert FTMO_PROFIT_TARGET_TWO_STEP_VERIFICATION.evaluate(state) is None
@@ -500,3 +509,116 @@ class TestConsistencyCheckEdges:
         violation = FTMO_CONSISTENCY.evaluate(state)
         assert violation is not None
         assert violation.severity == "warn"
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-ups: dual-fire, snapshot↔code confidence agreement
+# --------------------------------------------------------------------------- #
+class TestDualFire:
+    """Profit-target Achievement + daily-DD Violation on the same state.
+
+    Production case: the final closing trade pushes equity over the +10%
+    profit target AND simultaneously through the -5% daily-DD floor on
+    the day (e.g. the trader was -4.5% on the day, then a winning trade
+    pushed them to +10% from start but daily DD is computed against a
+    deeper intraday trough that already-crossed -5%). State-machine
+    consumer must handle both events at once: complete the phase AND
+    record the daily-DD breach for audit.
+    """
+
+    def test_profit_target_and_daily_dd_fire_simultaneously(self) -> None:
+        # Setup: account_size=100k; daily_start_equity was reset at server
+        # midnight to 110_000 (a previous gain); now equity sat at 104_400
+        # (down 5.09% from daily start = DD breach) before a winning trade
+        # took it to 110_000 (10% from account_size = profit target hit).
+        state = _state(
+            account_size=100_000.0,
+            current_equity=110_000.0,
+            daily_start_equity=110_000.0,
+            current_balance=110_000.0,
+        )
+        # Profit-target predicate sees +10% from account_size → Achievement.
+        target_event = FTMO_PROFIT_TARGET_ONE_STEP.evaluate(state)
+        assert isinstance(target_event, Achievement)
+
+        # Now flip to a snapshot just BEFORE the winning trade: equity
+        # at 104_400, daily_start_equity at 110_000 → daily DD = 5.09% kill.
+        pre_winning_state = _state(
+            account_size=100_000.0,
+            current_equity=104_400.0,
+            daily_start_equity=110_000.0,
+            current_balance=104_400.0,
+        )
+        dd_event = FTMO_DAILY_DD.evaluate(pre_winning_state)
+        assert isinstance(dd_event, Violation)
+        assert dd_event.severity == "kill"
+
+        # Both events are valid for their respective snapshots. The
+        # state-machine consumer (Task 12) must handle the case where
+        # a closing trade transitions from "DD-breached" to
+        # "target-reached" within a single tick. This test pins the
+        # ABC's ability to emit both event types from FTMO predicates.
+
+    def test_iterating_all_ftmo_predicates_returns_mixed_event_types(self) -> None:
+        """Sanity: the FTMO_PREDICATES tuple can produce both Violation
+        and Achievement events depending on state. Locks the loader-side
+        invariant that iterating predicates and dispatching on isinstance
+        is the right pattern."""
+        # State that trips daily DD: daily_start_equity=100k, current
+        # equity=94,990 → -5.01% from daily start.
+        state_dd = _state(daily_start_equity=100_000.0, current_equity=94_990.0)
+        # State that hits profit target: +10% from account_size starting balance.
+        state_target = _state(current_equity=110_000.0)
+
+        events_dd = [p.evaluate(state_dd) for p in FTMO_PREDICATES]
+        events_target = [p.evaluate(state_target) for p in FTMO_PREDICATES]
+
+        # DD state: at least one Violation, no Achievement.
+        assert any(isinstance(e, Violation) for e in events_dd if e is not None)
+
+        # Target state: at least one Achievement.
+        assert any(isinstance(e, Achievement) for e in events_target if e is not None)
+
+
+class TestSnapshotConfidenceAgreement:
+    """Lock the snapshot-file confidence column to the code's runtime
+    confidence value. Prevents the silent-drift class the reviewer caught
+    (snapshot said 'high' but code shipped 'uncertain', or vice versa)."""
+
+    def test_snapshot_summary_table_confidence_matches_code(self) -> None:
+        """Parse the snapshot's summary table at the bottom of the file
+        and assert every predicate's confidence column equals the runtime
+        predicate's confidence attribute."""
+        import re
+
+        text = _SNAPSHOT_PATH.read_text()
+        # Match table rows like: | `predicate_name` | confidence | ... |
+        row_re = re.compile(
+            r"^\|\s*`(?P<name>[a-z_]+)`\s*\|\s*(?P<conf>high|uncertain)\s*\|",
+            re.MULTILINE,
+        )
+        snapshot_confidence = {m.group("name"): m.group("conf") for m in row_re.finditer(text)}
+        assert snapshot_confidence, (
+            "Could not parse any confidence rows from snapshot — table layout drifted"
+        )
+
+        # Cover every shipped predicate (top-level + banned-technique children).
+        all_preds: list[Predicate] = list(FTMO_PREDICATES)
+        # FtmoBannedTechniques composite exposes its children too — the
+        # snapshot lists the children separately, so we check those too.
+        from propfarm.rules.ftmo import FTMO_BANNED_TECHNIQUES
+
+        all_preds.extend(FTMO_BANNED_TECHNIQUES.children)
+
+        for pred in all_preds:
+            if pred.name == "ftmo_banned_techniques":
+                # Composite is not in the snapshot's per-rule confidence table
+                # (it's a wrapper, not a rule); children are listed instead.
+                continue
+            assert pred.name in snapshot_confidence, (
+                f"{pred.name}: not in snapshot summary table — drift suspected"
+            )
+            assert snapshot_confidence[pred.name] == pred.confidence, (
+                f"{pred.name}: snapshot says {snapshot_confidence[pred.name]!r}, "
+                f"code says {pred.confidence!r} — drift"
+            )

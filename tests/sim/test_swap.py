@@ -509,3 +509,27 @@ def test_close_exactly_at_rollover_instant_is_counted() -> None:
     open_ts = datetime(2024, 3, 13, 21, 0, tzinfo=UTC)  # before Wed EDT rollover
     close_ts = datetime(2024, 3, 14, 2, 0, tzinfo=UTC)  # exactly at Wed 22-EDT (= Thu 02 UTC)
     assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 3
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-up: ALL_TABLES loader-pattern symmetry with commission.
+# --------------------------------------------------------------------------- #
+def test_swap_all_tables_loader_pattern_mirrors_commission() -> None:
+    """W4 reviewer flagged that swap had no ALL_TABLES dict while commission
+    did. This test locks the symmetry so a generic loader can iterate
+    ``costs.{commission,swap}.ALL_TABLES["ftmo"]`` and read ``.confidence``
+    uniformly across both."""
+    from propfarm.sim.commission import ALL_TABLES as COMMISSION_TABLES
+    from propfarm.sim.swap import ALL_TABLES as SWAP_TABLES
+
+    # Same firm keys exposed by both registries (sanity).
+    assert set(COMMISSION_TABLES.keys()) == set(SWAP_TABLES.keys())
+
+    # Every table has a queryable .confidence attribute. Locks the W3/W4
+    # loader-pattern contract: ``.confidence`` is uniform across cost and
+    # rule registries.
+    for firm in COMMISSION_TABLES:
+        assert hasattr(COMMISSION_TABLES[firm], "confidence")
+        assert hasattr(SWAP_TABLES[firm], "confidence")
+        assert COMMISSION_TABLES[firm].confidence in ("high", "uncertain")
+        assert SWAP_TABLES[firm].confidence in ("high", "uncertain")

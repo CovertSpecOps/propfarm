@@ -111,11 +111,13 @@ help-center text.
 `ftmo_profit_target_two_step_verification`.
 
 **Semantics note:** Hitting the profit target is a **completion** event, not a
-**failure** event. The predicate returns a `Violation` with `severity="warn"`
-(see ABC convention) carrying the message "profit target reached", and the
-state machine (Task 12.1) reads this as a phase transition trigger. This is
-why the ABC's `Violation` carries both `severity` and `predicate_name` — the
-consumer dispatches on `predicate_name`, not just severity. See ABC docstring.
+**failure** event. The predicate returns an `Achievement` (NOT a `Violation`)
+with `achievement_kind="profit_target"` and the message "profit target
+reached". The kill switch ignores Achievements by type; the state machine
+(Task 12.1) reads `achievement_kind` to route to a phase transition. This
+matches the rule's high confidence: FTMO publishes the numeric thresholds
+unambiguously, so `confidence="high"` on the Predicate, and the non-failure
+semantics are encoded by the Event subtype, not by overloading `severity`.
 
 ## Rule 4 — Forbidden Trading Practices
 
@@ -264,8 +266,11 @@ indicated in support correspondence. Predicate classification:
 
 **Semantics:** Like the profit-target predicate, this is a **completion-gate**
 rule, not a kill rule. Failure to reach 4 days at end-of-phase means the
-phase cannot complete; it does not terminate the account mid-phase. Returns
-`severity="warn"` and the state machine handles the gating.
+phase cannot complete; it does not terminate the account mid-phase. On
+threshold hit the predicate emits an `Achievement` with
+`achievement_kind="min_trading_days"` (not a `Violation`), so the kill
+switch is never invoked. State machine routes the Achievement to a
+phase-completion check at end-of-phase.
 
 ## Rule 8 — Time limits (Challenge / Verification)
 

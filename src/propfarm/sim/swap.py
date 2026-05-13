@@ -503,7 +503,19 @@ FUNDINGPIPS_MT5_SWAP: Final[SwapTable] = SwapTable(
 )
 
 
+#: Symmetric loader-pattern registry: ``ALL_TABLES["ftmo"]`` returns the
+#: firm's :class:`SwapTable`. Mirrors the shape of
+#: :data:`propfarm.sim.commission.ALL_TABLES` so a generic loader that
+#: iterates costs across firms can read swap tables the same way.
+ALL_TABLES: Final[dict[str, SwapTable]] = {
+    "ftmo": FTMO_MT5_SWAP,
+    "fundednext": FUNDEDNEXT_MT5_SWAP,
+    "fundingpips": FUNDINGPIPS_MT5_SWAP,
+}
+
+
 __all__ = [
+    "ALL_TABLES",
     "FTMO_MT5_SWAP",
     "FUNDEDNEXT_MT5_SWAP",
     "FUNDINGPIPS_MT5_SWAP",
