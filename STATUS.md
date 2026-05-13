@@ -267,6 +267,35 @@ B3 has been split into B3a (validation math, 5 tasks, blocked by B2.5 fixture) a
 
 **Pre-push hook gotcha:** `pytest` runs under `language: system`, which means the active shell needs the project venv on PATH. Run pushes from a shell with `.venv` activated (`source .venv/bin/activate`), or the pre-push hook errors with `pytest: command not found`. Documented here because the symptom is non-obvious.
 
+## Vendor-convention catch pattern (reviewer playbook entry)
+
+Added 2026-05-13 after Wave 6a caught a MEDIUM bug: HistData ASCII M1 FX
+is bid-only by documentation but Dukascopy ticks were being aggregated
+to mid, producing a systemic half-spread offset on every reconciliation
+bar.
+
+**Vendor data sources have implicit conventions** (bid/ask/mid,
+GMT/local/EET, inclusive/exclusive end timestamps, dictionary encoding,
+DST handling, holiday observation). Every ingestion path MUST explicitly
+state the convention it assumes, and any cross-vendor consumer MUST
+normalize at the read. Reviewer rejection criteria:
+
+1. Module docstring identifies the vendor convention for every field
+   it reads (e.g. "HistData ASCII M1 FX = bid prices; Dukascopy ticks =
+   bid+ask; timestamps tz-aware UTC").
+2. Any cross-vendor join / comparison normalizes BEFORE the bps math.
+3. If the agent uses a default that differs from a published vendor
+   convention (e.g. mid vs bid), the choice is documented in code AND
+   testable via an explicit parameter (no silent override).
+4. Tests cover at least one boundary case that would have surfaced the
+   convention mismatch as a false positive (e.g. spread-widening minute
+   producing 5+bps offset that should NOT trip the threshold).
+
+This pattern is broader than reconciliation: spread/slippage models
+calibrating off vendor data must declare which side(s) of the book they
+read; news calendars must declare timezone; holiday calendars must
+declare observation rules (substituted Monday vs literal date).
+
 ## Source-verification protocol for predicates and tables
 
 **User-supplied expectations get the same source-verification treatment as
