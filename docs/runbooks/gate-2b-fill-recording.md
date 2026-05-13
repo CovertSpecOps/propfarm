@@ -1,0 +1,233 @@
+# Gate 2B — fill-recording protocol
+
+Goal: capture **100+ real broker fills** on the FTMO MT5 demo across 24–48h
+of session diversity, so the Gate 2B comparison (simulator predicted price
+vs. live broker fill) can run later from parquet without holding an MT5
+session open.
+
+**This runbook is operator-facing**: you execute it on the Windows VPS;
+the script does the work. The pure helpers it relies on are
+locked by `tests/scripts/test_record_fills.py` (18 tests, all green).
+
+## Why pre-record (not capture during the gate)
+
+Gate 2B compares `propfarm.sim.engine.fill()` predictions against real
+broker fills. Doing this **live during the gate** would couple gate
+execution to broker connectivity, VPS uptime, and FTMO server load.
+Pre-recording produces a fixed parquet corpus that the gate consumes
+deterministically — repeatable, network-free, and inspectable.
+
+The simulator side of Gate 2B is built and tested in pure Python; this
+recording protocol owns the live-broker side.
+
+## 0. Prerequisites (must all be ✅)
+
+- [ ] Windows VPS up (Vultr Amsterdam from the spike; or equivalent EU host).
+- [ ] MT5 terminal installed, logged into the **FTMO Free Trial demo**
+      (server starts with `FTMO-Demo`).
+- [ ] `MetaTrader5` Python package installed (`python -m pip install MetaTrader5`,
+      already present from `spike_mt5.py`).
+- [ ] `~/.propfarm-secrets.json` on the VPS with the FTMO creds (from the
+      Day-1 spike — do NOT recreate; reuse the existing file).
+- [ ] **Algo Trading enabled** in the MT5 terminal (button top-left,
+      green when on). If off, every `order_send` will fail retcode 10027.
+- [ ] The prop-farm repo is cloned (or just the `scripts/record_fills.py`
+      file is dropped onto the VPS) at a path where you can run it.
+- [ ] `polars` + `pydantic` + `pyarrow` installed on the VPS Python
+      (`python -m pip install polars pydantic pyarrow`). The recording
+      script imports these at module-load time.
+
+## 1. Start the session
+
+From PowerShell, in the directory containing the repo (so `data/raw/`
+ends up next to it):
+
+```powershell
+cd <repo-root>
+python scripts\record_fills.py --duration-hours 24 --n-samples 200
+```
+
+What this does:
+
+- Builds a deterministic 200-sample schedule covering London / NY / Tokyo
+  session opens, mid-session quiet zones, and a 70% spread across the rest
+  of the 24h window.
+- Mix: ~60% market, ~25% limit (mixed inside/outside spread), ~15% stop.
+- Symbols: EURUSD and GBPUSD by default. Override with
+  `--symbols EURUSD,GBPUSD,USDJPY` if you want a third symbol.
+- The script prints `run_id` on stdout — **copy it now** in case the
+  session crashes and you need to resume.
+
+You can preview the schedule without connecting to MT5 by adding
+`--dry-run`. That prints all 200 (timestamp, symbol, order_type, side)
+tuples and exits.
+
+### What "running" looks like
+
+For each scheduled sample, the script:
+
+1. `time.sleep`s until the target UTC instant.
+2. Snapshots `bid`/`ask` via `symbol_info_tick`.
+3. Sends the order with `mt5.order_send`.
+4. Records one row of (request_time, broker_fill_time, symbol, order_type,
+   side, requested_price, fill_price, spread_at_request_pips,
+   slippage_observed_pips, broker_latency_ms, retcode, comment).
+5. **Closes** the position immediately (market round-trip) or **cancels**
+   the pending order (limit/stop) — so positions never accumulate.
+6. Every 10 fills, flushes to disk.
+
+Expect a console line per attempt like:
+
+```
+[record_fills] idx=047 EURUSD market buy retcode=10009 fill=1.10847 slip_pips=0.30 latency_ms=152.4
+```
+
+## 2. What to expect across 24h
+
+- ~200 attempted fills.
+- Of those, roughly:
+  - 140 market orders → 130–140 filled (small reject rate when spread
+    explodes mid-NFP or the server requotes).
+  - 50 limit orders → 30 filled within their window, 20 rejected /
+    cancelled-unfilled (outside-spread limits are *meant* to reject — we
+    want the reject behaviour on record).
+  - 30 stop orders → most rest pending and are cancelled when the
+    next sample fires; the few that fire become market-like fills.
+- **You should clear the 100-filled threshold comfortably**; the 200
+  attempts are budgeted with ~30% headroom for rejects.
+
+## 3. If the session crashes mid-run
+
+The script flushes every 10 fills, so at most ~10 records are lost.
+
+To **resume** with the same `run_id`:
+
+```powershell
+python scripts\record_fills.py --duration-hours 24 --n-samples 200 --run-id <RUN_ID_FROM_FIRST_RUN>
+```
+
+Resume mode:
+
+- Builds a fresh schedule (the second run's calendar starts at "now",
+  not at the original `start_utc`).
+- Writes to **the same parquet** (`data/raw/fill_recordings/{run_id}.parquet`)
+  in append mode.
+- Rewrites the manifest at the end with the cumulative counts.
+
+If you can't find the `run_id`: it's the filename of the latest
+`*.json` under `data/raw/fill_recordings/`.
+
+### Common crash causes & fixes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `mt5.initialize failed` | terminal not running / wrong creds | restart terminal, verify login on the MT5 GUI, re-check `~/.propfarm-secrets.json` |
+| `refusing to record on server=...` | connected to a non-demo server | log out, log back into FTMO-Demo, restart script |
+| retcode 10027 on every order | Algo Trading disabled | toggle the Algo Trading button in the terminal |
+| retcode 10030 on every order | unsupported filling mode | edit `type_filling` in the template from `ORDER_FILLING_IOC` to `ORDER_FILLING_FOK` |
+| `position cap reached; session aborted` | something failed to close 5 positions | inspect MT5 Trade tab, close manually, re-run |
+| retcode 10018 (Market closed) on weekends | FX closes Fri 22:00 UTC | wait for Sun 22:00 UTC; expected on weekends |
+
+## 4. Where the data lands
+
+- Parquet: `data/raw/fill_recordings/{run_id}.parquet` — one row per attempt.
+- Manifest: `data/raw/fill_recordings/{run_id}.json` — summary + schema
+  version.
+
+The parquet is **gitignored** (per the repo `.gitignore`'s
+`data/raw/` rule); the manifest is small enough that you can paste its
+contents into a STATUS.md update.
+
+### Parquet schema (v1.0)
+
+| Column | Type | Notes |
+|---|---|---|
+| `run_id` | utf8 | identical across every row from one recording session |
+| `request_time_utc` | timestamp (tz=UTC) | when `order_send` was called |
+| `broker_fill_time_utc` | timestamp (tz=UTC) | from `result.time`, or `after_send` if zero |
+| `symbol` | utf8 | EURUSD / GBPUSD / USDJPY / etc |
+| `order_type` | utf8 | `market` / `limit` / `stop` |
+| `side` | utf8 | `buy` / `sell` |
+| `volume_lots` | float64 | always 0.01 |
+| `requested_price` | float64 | price field of the request |
+| `fill_price` | float64 | `result.price` if filled; NaN if rejected |
+| `spread_at_request_pips` | float64 | `(ask - bid) / pip` from the tick at request |
+| `slippage_observed_pips` | float64 | signed adverse — positive = bad for trader |
+| `broker_latency_ms` | float64 | `(after_send - request_time) * 1000` |
+| `retcode` | int64 | MT5 retcode; 10009 = `TRADE_RETCODE_DONE` |
+| `comment` | utf8 | `result.comment` if any |
+
+## 5. Safety checklist (the script enforces these; verify on first launch)
+
+- [ ] **Server name starts with `FTMO-Demo`** — script bails with
+      `refusing to record on server=...` if not. This is the single most
+      important safety belt.
+- [ ] **Volume is 0.01 lot** every time (the smallest size FTMO accepts;
+      `LOT_SIZE` constant in the script).
+- [ ] **Max 5 simultaneous open positions** — if reached, the script
+      sweep-closes everything and aborts the session with a clear log.
+- [ ] **48h hard wall-clock cap** regardless of `--duration-hours`.
+      Useful if you forget the script is running.
+- [ ] **No SL/TP on recording orders** — keeps slippage attribution clean
+      (stops introduce their own fill behaviour that's orthogonal to
+      Gate 2B's question).
+- [ ] **Credentials and VPS IPs are never written** into the parquet or
+      manifest. Manifest has `vps_host_redacted: true` as a constant
+      reminder.
+
+## 6. End of session — what to paste back
+
+After 24h, the script exits cleanly. Paste this into the chat:
+
+```
+record_fills.py result: PASS|FAIL
+run_id: <hex>
+manifest:
+<contents of data/raw/fill_recordings/{run_id}.json>
+```
+
+The manifest content is safe to paste — no creds, no IPs. Example:
+
+```json
+{
+  "run_id": "8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+  "start_utc": "2026-05-13T07:00:00+00:00",
+  "end_utc": "2026-05-14T07:00:00+00:00",
+  "n_attempted": 200,
+  "n_filled": 167,
+  "n_rejected": 33,
+  "schema_version": "1.0",
+  "vps_host_redacted": true
+}
+```
+
+`n_filled >= 100` is the success condition. If `n_filled < 100`, do not
+proceed to Gate 2B — investigate the rejection codes in the parquet
+first, fix, and re-record.
+
+## 7. Cleanup before walking away
+
+Before disconnecting RDP:
+
+1. In the MT5 terminal, **Trade** tab: confirm **zero open positions**.
+   The script's round-trip-close should leave the account flat, but
+   verify visually.
+2. **Pending orders** tab: confirm zero pending limits/stops. The
+   script's cancel-pending step should have cleaned these too; if any
+   remain, right-click → Delete.
+3. (Optional) capture the FTMO terminal **History** tab as a screenshot
+   for your own audit trail — the broker's record of every deal is the
+   ground truth if the parquet is ever questioned.
+4. Disconnect RDP. The script is already finished; nothing is still
+   running on the VPS.
+
+## Cross-references
+
+- Schema validated by `scripts/record_fills.py::FillRecord`
+  (pydantic, frozen).
+- Pure helpers locked by `tests/scripts/test_record_fills.py` (18 tests).
+- Day-1 spike infrastructure (VPS + FTMO demo + secrets file) is
+  documented in `docs/runbooks/mt5-spike-runbook.md`; do not duplicate
+  that here — this runbook assumes the spike host is intact.
+- Gate 2B comparison itself (parquet → divergence analysis) is
+  Task 14.3 of the Phase 0 plan.
