@@ -795,8 +795,13 @@ FUNDINGPIPS_NEWS_BLACKOUT: Final[FundingPipsNewsBlackoutWindow] = FundingPipsNew
     tos_quote=_QUOTE_NEWS,
     interpretation=(
         "Master (funded) stage only: 5 minutes pre / 5 minutes post high-impact "
-        "news event triggers profit forfeiture on the affected trade. Time window "
-        "is numerically published; news-list integration delegated to the caller."
+        "news event window is numerically published. The runtime CONSEQUENCE of "
+        "a window-violating trade is delegated to the caller; FundingPips ToS as "
+        "snapshot does NOT explicitly state profit forfeiture for the affected "
+        "trade (cf. FundedNext, whose ToS does cite '40% of the profit counted "
+        "toward balance'). Phase-0 predicate is a no-op; the Task-12 runtime is "
+        "expected to read the Master-stage consequence article and route "
+        "accordingly. News-list integration delegated to the caller."
     ),
 )
 

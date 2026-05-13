@@ -324,6 +324,29 @@ enforce.
 **Confidence: uncertain.**
 **Predicate name:** `fundednext_martingale_check`.
 
+## Rule 9 — 1% risk-per-trade (excluded for Phase 0)
+
+**Source:** help.fundednext.com/en/articles/10256545-what-is-the-1-risk-limit-rule-who-and-when-will-it-be-implemented
+
+FundedNext publishes a "1% risk per trade" rule. Important: the article
+itself frames this as **post-warning and not unconditionally enforced**
+— it applies after the trader receives a specific warning, not as a
+default account-level rule. The page does not specify when the warning
+is issued, nor whether it is reversible, nor how the 1% is computed
+(stop-loss distance × position size, or notional exposure).
+
+**Phase-0 decision:** no predicate. The rule is conditional on an
+internal warning state that does not currently surface through any
+public account-state field, and encoding it as `confidence="high"`
+would unconditionally kill accounts that never received a warning.
+Encoding it as `confidence="uncertain"` would surface a constant
+soft-warn on every trade that touches > 1%. Both are wrong.
+
+**Revisit when:** the FundedNext warning state becomes observable (e.g.
+via a Master Account API field, or per-account flag in the help-center),
+at which point a stateful predicate with `confidence="high"` (gated on
+the warning flag) becomes implementable.
+
 ## Summary classification table
 
 | Predicate | Confidence | Rule type |

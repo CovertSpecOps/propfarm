@@ -245,11 +245,15 @@ delegated to the caller (out of W4b scope).
 
 **Predicate name:** `fundingpips_news_blackout_window`.
 
-**Note:** On 1-Step / 2-Step / 2-Step Pro at the Master (funded) stage,
-violation forfeits profit on the affected trade — not account termination.
-Phase 0 predicate is no-op; runtime (Task 12) will route the event.
-FundingPips Zero is **out of scope** for this predicate (stricter 10/10 rule
-not encoded here).
+**Note:** The Master (funded) stage applies. The ToS quote does NOT
+explicitly state the consequence of a window-violating trade (unlike
+FundedNext, whose ToS cites "40% of the profit counted toward balance").
+Common industry treatment is profit forfeiture on the affected trade,
+but FundingPips's published article does not say so verbatim. Phase-0
+predicate is a no-op; the Task-12 runtime is expected to consult the
+Master-stage consequence documentation and route accordingly.
+FundingPips Zero is **out of scope** for this predicate (stricter 10/10
+rule not encoded here).
 
 ## Rule 8 — Banned Trading Practices
 
