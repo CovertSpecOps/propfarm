@@ -235,6 +235,25 @@ B3 has been split into B3a (validation math, 5 tasks, blocked by B2.5 fixture) a
 
 **Pre-push hook gotcha:** `pytest` runs under `language: system`, which means the active shell needs the project venv on PATH. Run pushes from a shell with `.venv` activated (`source .venv/bin/activate`), or the pre-push hook errors with `pytest: command not found`. Documented here because the symptom is non-obvious.
 
+## Source-verification protocol for predicates and tables
+
+**User-supplied expectations get the same source-verification treatment as
+agent-drafted ones — neither side gets a free pass.** Origin of W4b: the
+user expected FundedNext's consistency rule to be `confidence="high"`;
+the impl agent shipped `uncertain` and the fresh-snapshot review
+confirmed FundedNext eliminated the numeric single-day-profit-share
+threshold in its 2024 product consolidation. The reviewer's job is not
+to ratify either party's prior belief — it's to trace the predicate
+end-to-end (snapshot file → tos_quote → confidence flag → test) and
+flag whichever side is out of step with the current published source.
+
+Practical effect on reviewer prompts: when the user's dispatch brief
+specifies an expected `confidence` value, the reviewer is still
+obligated to verify against a fresh-pulled snapshot. If the snapshot
+disagrees with the user's expectation, the reviewer reports back with
+the snapshot citation and lets the user decide whether to update the
+expectation or pull a different source.
+
 ## Per-task review protocol (every batch)
 
 1. Implementation agent (fresh) executes the task per the plan.
