@@ -441,3 +441,71 @@ def test_swaptable_validates_keys() -> None:
             swap_short_points={"GBPUSD": +1.0},  # different symbol set
             point_value_usd={"EURUSD": 1.0},
         )
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-ups: confidence field + DST-crossing triple-Wed +
+# Wed-rollover boundary tests.
+# --------------------------------------------------------------------------- #
+def test_all_shipped_swap_tables_are_marked_uncertain() -> None:
+    """Every shipped swap table was seeded from community references — the
+    canonical source is the MT5 Symbol Specification dialog which is not
+    reachable from this implementation host. Until live-account recalibration,
+    the runtime model must advertise the uncertainty."""
+    for table in (FTMO_MT5_SWAP, FUNDEDNEXT_MT5_SWAP, FUNDINGPIPS_MT5_SWAP):
+        assert table.confidence == "uncertain", (
+            f"{table.firm}: confidence={table.confidence!r}; should be 'uncertain' "
+            "until live-broker calibration"
+        )
+
+
+def test_wed_rollover_boundary_zero_nights_no_crossing_edt() -> None:
+    """Open Wed 21:30 UTC, close Wed 22:30 UTC (both before the EDT 02:00 UTC
+    rollover that happens at Thu 02:00 UTC) → 0 nights, no Wed-triple."""
+    open_ts = datetime(2024, 3, 13, 21, 30, tzinfo=UTC)  # Wed 17:30 EDT
+    close_ts = datetime(2024, 3, 13, 22, 30, tzinfo=UTC)  # Wed 18:30 EDT
+    assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 0
+
+
+def test_wed_rollover_boundary_triple_when_crossing_edt() -> None:
+    """Open Wed 21:30 UTC, close Thu 02:30 UTC (crosses Thu 02:00 UTC = Wed
+    22:00 EDT, the triple rollover) → 3 nights."""
+    open_ts = datetime(2024, 3, 13, 21, 30, tzinfo=UTC)  # Wed 17:30 EDT
+    close_ts = datetime(2024, 3, 14, 2, 30, tzinfo=UTC)  # Thu 22:30 EDT (next day local)
+    assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 3
+
+
+def test_wed_rollover_boundary_triple_when_crossing_est() -> None:
+    """EST equivalent: open Wed 22:30 UTC, close Thu 03:30 UTC (crosses
+    Thu 03:00 UTC = Wed 22:00 EST, the triple rollover) → 3 nights."""
+    open_ts = datetime(2024, 11, 13, 22, 30, tzinfo=UTC)  # Wed 17:30 EST
+    close_ts = datetime(2024, 11, 14, 3, 30, tzinfo=UTC)  # Thu 22:30 EST (next day local)
+    assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 3
+
+
+def test_dst_crossing_triple_wed_hold() -> None:
+    """Hold a position spanning US DST spring-forward (Sun 2024-03-10
+    02:00 EST → 03:00 EDT). Open Fri 2024-03-08 21:00 UTC, close Thu
+    2024-03-14 03:00 UTC.
+
+    Expected nights:
+    - Fri 22-ET rollover (weekend, not charged) -> 0
+    - Sat, Sun, Mon NY-local weekdays: only Mon 22-ET is a chargeable
+      weekday rollover -> 1
+    - Tue 22-ET (NY) -> 1
+    - Wed 22-ET (NY) -> 3 (triple)
+    Total: 5. EDT begins Sun 2024-03-10; module must handle the
+    DST transition without crashing or miscounting.
+    """
+    open_ts = datetime(2024, 3, 8, 21, 0, tzinfo=UTC)
+    close_ts = datetime(2024, 3, 14, 3, 0, tzinfo=UTC)  # Thu 03:00 UTC > Wed 22-EDT rollover
+    assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 5
+
+
+def test_close_exactly_at_rollover_instant_is_counted() -> None:
+    """The half-open window convention `open_ts < T_roll <= close_ts`
+    means: closing exactly at the rollover counts the night. Locks the
+    boundary semantics so a refactor can't silently flip it."""
+    open_ts = datetime(2024, 3, 13, 21, 0, tzinfo=UTC)  # before Wed EDT rollover
+    close_ts = datetime(2024, 3, 14, 2, 0, tzinfo=UTC)  # exactly at Wed 22-EDT (= Thu 02 UTC)
+    assert nights_held(open_ts_utc=open_ts, close_ts_utc=close_ts) == 3

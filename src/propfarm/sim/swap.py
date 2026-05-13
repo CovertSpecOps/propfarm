@@ -97,7 +97,7 @@ Public API
 from __future__ import annotations
 
 from datetime import UTC, date, datetime, time, timedelta
-from typing import Final
+from typing import Final, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -165,6 +165,15 @@ class SwapTable(BaseModel):
         swap into a USD cost. For the FTMO/FundedNext/FundingPips MT5
         feeds at the snapshot date this is approximately 1.00 across the
         six supported symbols; documented per-firm in the snapshot files.
+    confidence : Literal["high", "uncertain"]
+        Runtime marker for whether the table's numbers came from a primary,
+        verified source (``"high"``) or from secondary / cross-referenced /
+        community-archived sources (``"uncertain"``). Downstream consumers
+        — especially the Day-13 placebo gate and any funded-deploy
+        certification — must check this field. A table marked ``"uncertain"``
+        is acceptable for early Phase-0 development and for placebo gate
+        sanity-checks, but **must not** drive any live-account sizing
+        decision until recalibrated against the live MT5 terminal.
 
     Invariants
     ----------
@@ -182,6 +191,7 @@ class SwapTable(BaseModel):
     swap_long_points: dict[str, float]
     swap_short_points: dict[str, float]
     point_value_usd: dict[str, float]
+    confidence: Literal["high", "uncertain"] = "uncertain"
 
     @model_validator(mode="after")
     def _check_symbol_keys_match(self) -> SwapTable:
@@ -433,6 +443,7 @@ FTMO_MT5_SWAP: Final[SwapTable] = SwapTable(
         "US100": -0.90,
     },
     point_value_usd={s: 1.0 for s in SUPPORTED_SYMBOLS},
+    confidence="uncertain",
 )
 
 #: FundedNext MT5 (non-swap-free) swap-rate snapshot.
@@ -460,6 +471,7 @@ FUNDEDNEXT_MT5_SWAP: Final[SwapTable] = SwapTable(
         "US100": -0.80,
     },
     point_value_usd={s: 1.0 for s in SUPPORTED_SYMBOLS},
+    confidence="uncertain",
 )
 
 #: FundingPips MT5 (non-swap-free) swap-rate snapshot.
@@ -487,6 +499,7 @@ FUNDINGPIPS_MT5_SWAP: Final[SwapTable] = SwapTable(
         "US100": -1.00,
     },
     point_value_usd={s: 1.0 for s in SUPPORTED_SYMBOLS},
+    confidence="uncertain",
 )
 
 

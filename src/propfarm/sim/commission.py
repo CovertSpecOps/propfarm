@@ -77,7 +77,7 @@ Constraints
 from __future__ import annotations
 
 from datetime import date
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -104,6 +104,15 @@ class CommissionTable(BaseModel):
     per_round_trip_usd : dict[str, float]
         Mapping ``symbol -> USD commission for one round trip of 1 lot``.
         Keys must cover every symbol the system trades for that firm.
+    confidence : Literal["high", "uncertain"]
+        Runtime marker for whether the table's numbers came from a primary,
+        verified source (``"high"``) or from secondary / cross-referenced /
+        image-rendered sources we couldn't OCR (``"uncertain"``). Downstream
+        consumers — especially the Day-13 placebo gate and any funded-deploy
+        certification — must check this field. A table marked ``"uncertain"``
+        is acceptable for early Phase-0 development and for placebo gate
+        sanity-checks, but **must not** be the basis of any live-account
+        sizing decision until recalibrated against the live MT5 terminal.
 
     Frozen-ness
     -----------
@@ -120,6 +129,7 @@ class CommissionTable(BaseModel):
     account_type: str
     snapshot_date: date
     snapshot_source: str
+    confidence: Literal["high", "uncertain"] = "uncertain"
     per_round_trip_usd: dict[str, float]
 
 
@@ -212,6 +222,10 @@ FTMO_MT5_COMMISSION: Final[CommissionTable] = CommissionTable(
         "GER40": 0.00,
         "US100": 0.00,
     },
+    # Primary ToS page returned 404; values seeded from FTMO's own blog
+    # plus secondary review-house corroboration. Recalibrate against the
+    # live FTMO account before any funded-deploy decision.
+    confidence="uncertain",
 )
 
 
@@ -239,6 +253,11 @@ FUNDEDNEXT_MT5_COMMISSION: Final[CommissionTable] = CommissionTable(
         "GER40": 0.00,
         "US100": 0.00,
     },
+    # The Stellar 2-Step forex rate is image-rendered in FundedNext's
+    # help-center table; not text-extractable. Numbers above are derived
+    # by cross-referencing Stellar Lite / Stellar Instant tiers. Forward-
+    # dated 2026-12-01 schedule risk also flagged by reviewer.
+    confidence="uncertain",
 )
 
 
@@ -262,6 +281,10 @@ FUNDINGPIPS_MT5_COMMISSION: Final[CommissionTable] = CommissionTable(
         "GER40": 0.00,
         "US100": 0.00,
     },
+    # Primary ToS page returned 403 (Cloudflare); values corroborated
+    # across three independent secondary review-house sources but not
+    # primary-verified.
+    confidence="uncertain",
 )
 
 

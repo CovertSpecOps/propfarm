@@ -37,11 +37,17 @@ From the FundedNext help-center article on Stellar/FundedNext commissions
 From cross-referenced search of the Stellar Instant help-center article and
 FundedNext's per-account-tier breakdowns (latest figures observed late 2025):
 
-> Stellar 1-Step: $5/lot commission (round-trip) on forex + commodities.
-> Stellar 2-Step: $7/lot commission (round-trip) on forex + commodities.
-> Stellar Lite:   $7/lot commission (round-trip).
-> Stellar Instant: $7/lot commission (round-trip).
-> Indices and Oil: $0 commission (no per-symbol charge).
+**Reconstructed from secondary sources (NOT verbatim from FundedNext's own
+help-center). The help-center per-tier table is rendered as an image and
+could not be text-extracted on the retrieval date. The Stellar 2-Step
+forex row in particular is derived by cross-referencing the Stellar Lite
+and Stellar Instant tiers, which are published in plain text:**
+
+- Stellar 1-Step: $5/lot commission (round-trip) on forex + commodities.
+- Stellar 2-Step: $7/lot commission (round-trip) on forex + commodities. _(reconstructed)_
+- Stellar Lite:   $7/lot commission (round-trip).
+- Stellar Instant: $7/lot commission (round-trip).
+- Indices and Oil: $0 commission (no per-symbol charge).
 
 ## Per-symbol commission table (USD per round-trip per lot)
 

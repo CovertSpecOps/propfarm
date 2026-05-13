@@ -232,3 +232,49 @@ def test_snapshot_dates_are_today_2026_05_12() -> None:
         assert table.snapshot_date == target, (
             f"{table.firm}: snapshot_date {table.snapshot_date} != expected {target}"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-ups: confidence field + snapshot↔code integrity.
+# --------------------------------------------------------------------------- #
+def test_all_shipped_tables_are_marked_uncertain() -> None:
+    """Every shipped table was seeded from secondary sources (primary ToS
+    pages returned 404/403 on retrieval). Until the live FTMO account is
+    used to recalibrate, the runtime model must broadcast that uncertainty
+    so the placebo gate / deploy certifier doesn't treat these as ground
+    truth."""
+    for table in (FTMO_MT5_COMMISSION, FUNDEDNEXT_MT5_COMMISSION, FUNDINGPIPS_MT5_COMMISSION):
+        assert table.confidence == "uncertain", (
+            f"{table.firm}: shipped with confidence={table.confidence!r}; "
+            "should be 'uncertain' until live-account calibration"
+        )
+
+
+def test_snapshot_markdown_numbers_match_code_table() -> None:
+    """Round-trip integrity: every per-symbol number in a snapshot's table
+    section must equal the corresponding value in the code's dict. Catches
+    silent drift where one is edited without the other."""
+    import re
+
+    repo_root = Path(__file__).resolve().parents[2]
+    row_re = re.compile(
+        r"^\|\s*(?P<symbol>[A-Z0-9]{4,6})\s*\|"  # symbol cell
+        r"[^|]*\|"  # class cell (e.g. Forex / Metals / Indices)
+        r"[^|]*\|"  # source/formula cell
+        r"\s*\$?(?P<amount>[0-9.]+)\s*\|",
+        re.MULTILINE,
+    )
+    for table in (FTMO_MT5_COMMISSION, FUNDEDNEXT_MT5_COMMISSION, FUNDINGPIPS_MT5_COMMISSION):
+        snapshot_text = (repo_root / table.snapshot_source).read_text()
+        matches = {
+            m.group("symbol"): float(m.group("amount")) for m in row_re.finditer(snapshot_text)
+        }
+        for symbol, code_value in table.per_round_trip_usd.items():
+            assert symbol in matches, (
+                f"{table.firm} snapshot missing row for {symbol}; "
+                "snapshot table layout drifted from regex"
+            )
+            assert matches[symbol] == code_value, (
+                f"{table.firm} drift: snapshot says {symbol}={matches[symbol]:.2f} "
+                f"but code says {code_value:.2f}"
+            )
