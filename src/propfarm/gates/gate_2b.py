@@ -86,10 +86,11 @@ import hashlib
 import importlib.util
 import math
 import sys
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, cast
 
 import numpy as np
 import polars as pl
@@ -416,7 +417,12 @@ def reconstruct_market_state(
     * ``realized_vol_5m`` → ``COMPUTED`` from rolling stdev of recent
       same-symbol ``requested_price`` series when ≥
       :data:`_REALIZED_VOL_WINDOW_ROWS` rows are available; falls back to
-      ``DEFAULTED`` per-symbol typical vol otherwise.
+      ``DEFAULTED`` to the single global :data:`_TYPICAL_REALIZED_VOL_FALLBACK`
+      (= 0.10 annualized, matching slippage module's own None-fallback).
+      This is deliberately a single global, not per-symbol — review of
+      this trade-off is in the deferred ledger (see STATUS.md). For
+      typical-vol differences across symbols (XAUUSD ~3x FX, US100 ~2x FX),
+      a future per-symbol dict can replace the global without API change.
     * ``news_window``, ``stress_mode`` → ``DEFAULTED`` to False. Operator
       must manually flag rows that fell inside news / stress windows.
 
@@ -897,22 +903,16 @@ def run_gate_2b(
 
             execution_latency_ms = float(DEFAULT_EXECUTION_LATENCY_MS)
 
-    # Run row 0 first to capture the canonical audit trail. The actual
-    # `reconstruct_market_state` per-row audit changes its `realized_vol_5m`
-    # entry over the iteration (COMPUTED vs DEFAULTED), but the structure
-    # is constant — five entries — so the report-level audit is captured
-    # off the first row.
-    first_row = df.row(0, named=True)
-    _, canonical_audit = reconstruct_market_state(first_row, prior_same_symbol_prices=None)
-
-    # Cross-check: every MarketState field has exactly one audit entry.
+    # Iterate every row, collect per-row audit, and tally per-field source
+    # distribution. Prior implementation snapshotted row-0's audit only —
+    # misleading because row 0 always falls back to DEFAULTED for
+    # realized_vol_5m (no prior history at idx=0). The report now shows
+    # the actual source distribution (e.g. "COMPUTED in 195/200 rows,
+    # DEFAULTED in 5/200 rows"), so the operator can audit how often each
+    # fallback fired.
     expected_fields = {"symbol", "ts_utc", "realized_vol_5m", "news_window", "stress_mode"}
-    audited_fields = {rec.field_name for rec in canonical_audit}
-    if audited_fields != expected_fields:  # pragma: no cover — invariant
-        raise RuntimeError(
-            f"MarketState audit trail mismatch: expected {sorted(expected_fields)}, "
-            f"got {sorted(audited_fields)}"
-        )
+    per_field_source_counts: dict[str, Counter[str]] = {f: Counter() for f in expected_fields}
+    per_field_first_detail: dict[str, dict[str, str]] = {f: {} for f in expected_fields}
 
     residual_rows: list[ResidualRow] = []
     same_symbol_prices: dict[str, list[float]] = {}
@@ -921,18 +921,29 @@ def run_gate_2b(
     for idx in range(df.height):
         row = df.row(idx, named=True)
         symbol = str(row["symbol"])
-        run_ids.add(str(row["run_id"]))
+        run_id_str = str(row["run_id"])
+        run_ids.add(run_id_str)
 
         prior_prices = list(same_symbol_prices.get(symbol, []))
         request = reconstruct_fill_request(row)
-        market_state, _ = reconstruct_market_state(
+        market_state, row_audit = reconstruct_market_state(
             row,
             prior_same_symbol_prices=prior_prices,
         )
 
-        # Per-row deterministic rng. Seeded from row index so the report
-        # is bit-identical across runs of the same capture.
-        rng = np.random.default_rng(seed=int(idx))
+        # Tally per-field source distribution across rows.
+        for rec in row_audit:
+            per_field_source_counts[rec.field_name][rec.source] += 1
+            # Capture one canonical detail string per (field, source) pair,
+            # so the report can cite the actual phrasing the helper produced.
+            per_field_first_detail[rec.field_name].setdefault(rec.source, rec.source_detail)
+
+        # Per-row deterministic rng. Seed from (run_id, idx) so two captures
+        # with overlapping row indices don't accidentally share rng state.
+        # SHA256 pin in the report still binds determinism to the parquet
+        # bytes; this is hardening, not a correctness fix.
+        row_seed = hash((run_id_str, idx)) & 0xFFFFFFFF
+        rng = np.random.default_rng(seed=row_seed)
         sim = simulate_fill(
             request,
             market_state,
@@ -945,8 +956,60 @@ def run_gate_2b(
         # only strictly-prior prices (no leak from current row).
         same_symbol_prices.setdefault(symbol, []).append(float(row["requested_price"]))
 
+    # Cross-check: every MarketState field has been audited at least once.
+    audited_fields = {f for f, c in per_field_source_counts.items() if sum(c.values()) > 0}
+    if audited_fields != expected_fields:  # pragma: no cover — invariant
+        raise RuntimeError(
+            f"MarketState audit trail mismatch: expected {sorted(expected_fields)}, "
+            f"got {sorted(audited_fields)}"
+        )
+
+    # Build the canonical audit: one MarketStateReconstruction per field,
+    # with `source` = dominant source, and `source_detail` enriched with
+    # the per-row distribution counts. Operator can see at a glance
+    # whether fallbacks fired often, never, or always.
+    n_rows = df.height
+    canonical_audit_list: list[MarketStateReconstruction] = []
+    for field_name in (
+        "symbol",
+        "ts_utc",
+        "realized_vol_5m",
+        "news_window",
+        "stress_mode",
+    ):
+        counter = per_field_source_counts[field_name]
+        dominant_source, _ = counter.most_common(1)[0]
+        details_used = per_field_first_detail[field_name]
+        # Distribution string: e.g. "COMPUTED in 195/200, DEFAULTED in 5/200".
+        dist_parts = [f"{src} in {n}/{n_rows}" for src, n in counter.most_common()]
+        dist_str = "; ".join(dist_parts)
+        # Compose final detail: dominant-source's helper text + the distribution.
+        helper_text = details_used.get(dominant_source, "")
+        if helper_text:
+            combined_detail = f"{helper_text} | distribution: {dist_str}"
+        else:
+            combined_detail = f"distribution: {dist_str}"
+        canonical_audit_list.append(
+            MarketStateReconstruction(
+                field_name=field_name,
+                source=cast("Literal['FROM_FILLRECORD', 'COMPUTED', 'DEFAULTED']", dominant_source),
+                source_detail=combined_detail,
+            )
+        )
+    canonical_audit = tuple(canonical_audit_list)
+
     # Filter for distribution computation. A row contributes iff retcode
     # matched AND the residual is finite (no NaN).
+    #
+    # Reviewer issue 6: this inclusion rule (retcode_match AND finite) is
+    # *narrower* than what counts toward the verdict's failure_reasons.
+    # Specifically, `n_rows_compared` and bias-test denominators here only
+    # include rows where the sim agreed on retcode with the live capture,
+    # while the verdict's "retcode mismatch ratio" check below (see
+    # `_evaluate_verdict`) operates over ALL non-skipped rows. This divergence
+    # is intentional: residual *quantiles* are only meaningful where both
+    # paths produced a comparable fill, but a high retcode-mismatch ratio is
+    # itself a failure signal regardless of where mismatches landed.
     def _clean(values: list[float], rows: list[ResidualRow]) -> np.ndarray:
         return np.asarray(
             [v for v, r in zip(values, rows, strict=True) if r.retcode_match and math.isfinite(v)],

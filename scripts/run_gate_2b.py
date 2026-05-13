@@ -67,7 +67,9 @@ def _print_report(report: Gate2BReport) -> None:
         bias = "BIAS" if dist.has_systematic_bias else "ok"
         lines.append(
             f"  {field_name:14s} n={dist.n:4d} "
-            f"p50={dist.p50:+.6f} p95={dist.p95:+.6f} p99={dist.p99:+.6f} "
+            # p50/p95/p99 come from abs(residual) in _residual_distribution
+            # and are always non-negative, so don't print a misleading "+".
+            f"p50={dist.p50:.6f} p95={dist.p95:.6f} p99={dist.p99:.6f} "
             f"mean={dist.mean:+.6f} t={dist.t_stat:+.3f} p={dist.p_value:.4f} [{bias}]"
         )
     if report.failure_reasons:

@@ -337,3 +337,137 @@ def test_run_gate_2b_is_deterministic(tmp_path: Path) -> None:
         assert d1.t_stat == d2.t_stat if math.isfinite(d1.t_stat) else math.isnan(d2.t_stat)
     assert r1.verdict == r2.verdict
     assert r1.failure_reasons == r2.failure_reasons
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-ups (Gate 2B fresh-review pass)
+# --------------------------------------------------------------------------- #
+def test_required_columns_match_fill_record_fields() -> None:
+    """Schema parity: `_REQUIRED_COLUMNS` must mirror `FillRecord.model_fields`.
+
+    Reviewer flagged: `_REQUIRED_COLUMNS` is a hardcoded literal tuple.
+    If `scripts/record_fills.FillRecord` ever gains a field, the gate's
+    schema lock silently misses it. This test compares the two at test
+    time so the drift is caught loudly without import-time runtime cost.
+    """
+    from propfarm.gates.gate_2b import _REQUIRED_COLUMNS, _load_fill_record_class
+
+    fill_record_cls = _load_fill_record_class()
+    fill_record_fields = set(fill_record_cls.model_fields.keys())
+    required_set = set(_REQUIRED_COLUMNS)
+    assert required_set == fill_record_fields, (
+        f"_REQUIRED_COLUMNS drifted from FillRecord. "
+        f"Only in code: {sorted(required_set - fill_record_fields)}, "
+        f"only in FillRecord: {sorted(fill_record_fields - required_set)}"
+    )
+
+
+def test_audit_table_reports_per_field_source_distribution(tmp_path: Path) -> None:
+    """The canonical audit must reflect per-row source counts, not just row 0.
+
+    Reviewer flagged: previously the canonical audit was snapshotted off
+    row 0, which always defaults `realized_vol_5m` (no prior history at
+    idx=0). The operator would conclude every row defaulted — false when
+    rows 5+ used COMPUTED. Fix: aggregate per-row audits, report dominant
+    source + distribution counts in `source_detail`.
+    """
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    # _write_capture is the helper defined at top of this module.
+    # Build a 20-row EURUSD capture so realized_vol_5m goes from DEFAULTED
+    # (idx 0-4, insufficient history) to COMPUTED (idx 5+, has 5+ prior).
+    rows = []
+    base_ts = datetime(2024, 6, 3, 10, 0, tzinfo=UTC)
+    for i in range(20):
+        rows.append(
+            {
+                "run_id": "run_audit_dist",
+                "request_time_utc": base_ts + timedelta(minutes=i),
+                "broker_fill_time_utc": base_ts + timedelta(minutes=i, milliseconds=150),
+                "symbol": "EURUSD",
+                "order_type": "market",
+                "side": "buy",
+                "volume_lots": 0.01,
+                "requested_price": 1.10000 + i * 0.00001,
+                "fill_price": 1.10000 + i * 0.00001 + 0.00003,
+                "spread_at_request_pips": 0.3,
+                "slippage_observed_pips": 0.3,
+                "broker_latency_ms": 150.0,
+                "retcode": 10009,
+                "comment": "",
+            }
+        )
+    capture_path = tmp_path / "audit_dist.parquet"
+    _write_capture(rows, capture_path)
+    report = run_gate_2b(capture_path)
+
+    # Find realized_vol_5m's audit entry.
+    realized_vol_audit = next(
+        rec for rec in report.market_state_reconstruction if rec.field_name == "realized_vol_5m"
+    )
+    # Distribution string should mention BOTH COMPUTED and DEFAULTED with counts.
+    assert "COMPUTED" in realized_vol_audit.source_detail
+    assert "DEFAULTED" in realized_vol_audit.source_detail
+    assert "/20" in realized_vol_audit.source_detail
+    # Dominant source should be COMPUTED (15 of 20 rows = 75%).
+    assert realized_vol_audit.source == "COMPUTED"
+
+
+def test_strict_biased_capture_produces_fail_with_both_failure_reasons(tmp_path: Path) -> None:
+    """Stricter version of the biased-capture test.
+
+    A 20-row EURUSD capture with live fill_price systematically +1.5 pips
+    above sim must produce verdict='fail' (not 'investigate') AND both
+    `fill_price_p95_exceeded` and `systematic_bias` in failure_reasons.
+
+    Reviewer flagged the existing biased-synthetic test as permissive
+    (accepts fail OR investigate, and accepts either failure reason).
+    This test pins both surfaces together so a regression that disables
+    one is caught immediately.
+    """
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    # _write_capture is the helper defined at top of this module.
+    rows = []
+    base_ts = datetime(2024, 6, 3, 10, 0, tzinfo=UTC)
+    pip = 0.0001
+    for i in range(20):
+        ts = base_ts + timedelta(minutes=i * 3)
+        requested = 1.10000 + i * 0.00001
+        # The "live" fill is systematically 1.5 pips worse than the sim
+        # would predict. Sim slippage on EURUSD market is ~0.3 pips; live
+        # records 0.3 + 1.5 = 1.8 pips. Resulting fill_price residual ≈
+        # 1.5 pips, well over the 0.5 pip threshold.
+        rows.append(
+            {
+                "run_id": "run_strict_bias",
+                "request_time_utc": ts,
+                "broker_fill_time_utc": ts + timedelta(milliseconds=150),
+                "symbol": "EURUSD",
+                "order_type": "market",
+                "side": "buy",
+                "volume_lots": 0.01,
+                "requested_price": requested,
+                "fill_price": requested + 1.8 * pip,  # live ≈ +1.8 pip slip
+                "spread_at_request_pips": 0.3,
+                "slippage_observed_pips": 1.8,
+                "broker_latency_ms": 150.0,
+                "retcode": 10009,
+                "comment": "",
+            }
+        )
+    capture_path = tmp_path / "strict_bias.parquet"
+    _write_capture(rows, capture_path)
+    report = run_gate_2b(capture_path)
+
+    assert report.verdict == "fail", (
+        f"Expected verdict='fail' on +1.5 pip systematic bias; got {report.verdict!r} "
+        f"with reasons {report.failure_reasons!r}"
+    )
+    reasons_blob = " | ".join(report.failure_reasons)
+    assert "fill_price_p95_exceeded" in reasons_blob, (
+        f"Expected fill_price_p95_exceeded in failure_reasons; got {report.failure_reasons!r}"
+    )
+    assert "systematic_bias" in reasons_blob, (
+        f"Expected systematic_bias in failure_reasons; got {report.failure_reasons!r}"
+    )
