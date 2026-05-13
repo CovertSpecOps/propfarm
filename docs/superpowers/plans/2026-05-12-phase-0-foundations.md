@@ -409,7 +409,7 @@ mt5.shutdown()
 - Create: `prop-farm/src/propfarm/validation/dsr.py`
 - Create: `prop-farm/tests/validation/test_dsr.py`
 
-- [ ] **Step 1 (TDD):** Following Bailey & López de Prado (2014). Test against published example: `SR=2.5, T=120, N_trials=10, skew=-0.3, kurt=5 → DSR ≈ 0.91` (verify against AFML reference output).
+- [ ] **Step 1 (TDD):** Following Bailey & López de Prado (2014). Test the canonical formula with realistic Phase-1 strategy inputs: `SR=2.5 (per-period), T=120, N_trials=10, skew=-0.3, kurt=5 → DSR ≈ 1.0` (z ≈ 9.085 → Φ(z) ≈ 1.0000). The original W5 reference draft quoted DSR≈0.91 for these inputs; W5 reviewer traced the math end-to-end against Wikipedia, Marti's blog, and the López-de-Prado-blessed `rubenbriones/Probabilistic-Sharpe-Ratio` reference impl and confirmed `≈1.0` is the canonical answer. SR=2.5 / N=10 is in the realistic range for Phase 1 strategy outputs. A separate boundary test that constructs an input producing DSR≈0.95 (at the deploy-gate threshold) is tracked in the deferred ledger and will land before Phase 1 dispatches.
 - [ ] **Step 2:** Implement, commit.
 
 ### Task 9.2: Probability of Backtest Overfitting

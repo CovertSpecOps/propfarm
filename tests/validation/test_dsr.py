@@ -220,12 +220,13 @@ def test_dsr_fat_tail_penalty() -> None:
 # Reference example from the W5 plan
 # --------------------------------------------------------------------------- #
 def test_dsr_against_published_example() -> None:
-    """The W5 plan quotes a reference DSR of approximately 0.91 for
-    ``SR=2.5, T=120, N_trials=10, skew=-0.3, kurt=5``. The plan flags
-    this as approximate and asks the implementer to verify by hand.
+    """Plan §Test 4 canonical reference: ``SR=2.5, T=120, N_trials=10,
+    skew=-0.3, kurt=5`` → ``DSR ≈ 1.0``. SR=2.5 / N=10 is in the realistic
+    range for Phase 1 strategy outputs; the strategy is overwhelmingly
+    significant even after deflation for ten trial backtests.
 
-    Computing under the canonical Bailey-LdP formula
-    (per-period SR=2.5; absolute Pearson kurt=5):
+    Hand-traced under the canonical Bailey-LdP formula (per-period SR=2.5;
+    absolute Pearson kurt=5):
 
         E[max stdnormal | N=10] = (1-gamma) * Phi^-1(0.9)
                                 + gamma * Phi^-1(1 - 1/(10e))
@@ -237,20 +238,21 @@ def test_dsr_against_published_example() -> None:
         z = (2.5 * sqrt(119) - 1.5746) / 2.8284
           = (27.275 - 1.5746) / 2.8284 ~= 9.085
 
-        DSR = Phi(9.085) ~= 1.0   (NOT 0.91)
+        DSR = Phi(9.085) ~= 1.0
 
-    The plan-quoted ~0.91 is internally inconsistent with the formula
-    it spells out; we pin the canonical answer here so future drifts
-    are caught. The plan explicitly allows this deviation as long as
-    it is documented (see the module docstring).
+    (An earlier draft of the plan quoted DSR≈0.91 for these inputs; the
+    W5 reviewer traced against Wikipedia, Marti's blog, and the
+    López-de-Prado-blessed rubenbriones reference impl and confirmed
+    ~1.0 is correct. Plan amended 2026-05-12 to option (b): keep
+    SR=2.5 inputs as realistic Phase-1 values, fix the expected.)
+
+    A boundary test constructing an input that lands DSR ≈ 0.95
+    (at the deploy-gate threshold) is tracked in the deferred ledger
+    and will land before Phase 1 dispatches.
     """
-    # Synthesize a series with exactly mean/std producing SR_period=2.5
-    # and (skew, kurt_excess) ~= (-0.3, 2.0) so kurt_absolute ~= 5.0.
-    # Easier: call the pure-math core directly via a tiny scratch series
-    # that pins moments by construction is fragile; instead we re-derive
-    # the closed-form DSR from the inputs and compare to the formula.
-    # That keeps the test purely about formula correctness, not about
-    # finite-sample moment recovery.
+    # Synthesize via the pure-math core to avoid finite-sample moment
+    # recovery noise. The test pins formula correctness, not estimator
+    # accuracy on a small sample.
     from propfarm.validation.dsr import _dsr_from_moments
 
     dsr, e_max = _dsr_from_moments(
@@ -260,14 +262,15 @@ def test_dsr_against_published_example() -> None:
         kurtosis_absolute=5.0,
         n_trials=10,
     )
-    # Hand-traced values (see docstring above).
+    # Hand-traced canonical values.
     assert e_max == pytest.approx(1.5746, abs=1e-3)
-    # The canonical formula gives DSR essentially 1; the plan-quoted
-    # 0.91 is documented as inconsistent. We allow >= 0.99 here as a
-    # tight pin that locks the canonical answer.
+    # Tight pin on DSR ≈ 1.0. Per user-approved plan amendment (option b),
+    # the >= 0.99 band is the canonical answer; a future contributor
+    # attempting to "fix" the math toward 0.91 will fail here.
     assert dsr >= 0.99, (
         f"DSR={dsr:.4f} for the reference inputs disagrees with the "
-        "Bailey-LdP formula; expected >= 0.99 (NOT 0.91, see module docstring)."
+        "canonical Bailey-LdP formula; expected >= 0.99. "
+        "See module docstring for hand-trace."
     )
 
 

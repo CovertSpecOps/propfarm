@@ -54,17 +54,23 @@ units so they are directly comparable to the headline Sharpe a human
 reader sees on a tearsheet. The internal math is done at the native
 per-period frequency.
 
-Deviation from the spec's quoted reference example
---------------------------------------------------
-The Phase-0 plan quotes a reference DSR of approximately ``0.91`` for
+Reference example (per the plan, amended 2026-05-12 after W5 review)
+--------------------------------------------------------------------
+The plan §Task 9.1 §Test 4 pins the canonical Bailey-LdP example at
 ``SR_hat = 2.5, T = 120, N_trials = 10, skew = -0.3, kurt = 5``. Under
-the canonical Bailey-LdP formula above with ``SR_hat`` treated as a
-per-period Sharpe (the only interpretation under which the formula is
-self-consistent), the true value is ``Phi(~7.5) approx= 1.0`` — i.e.
-the strategy is overwhelmingly significant even after deflation.
-The plan author flags this caveat and we resolve it by trusting the
-formula. See :func:`_dsr_from_moments` for the closed-form reproducer
-that downstream tests pin.
+the canonical formula with ``SR_hat`` as a per-period Sharpe, the
+deflated value is ``Phi(z ~= 9.085) approx= 1.0`` — i.e. the strategy is
+overwhelmingly significant even after deflation. SR=2.5 / N=10 is in
+the realistic range for Phase 1 strategy outputs.
+
+An earlier W5 draft of the plan quoted ``DSR ~= 0.91`` for these inputs;
+the W5 reviewer traced the math against three canonical references
+(Wikipedia, Marti's blog, the López-de-Prado-blessed
+`rubenbriones/Probabilistic-Sharpe-Ratio` impl) and confirmed the
+correct answer is ``~1.0``. Plan amended 2026-05-12. A separate
+boundary test that constructs an input producing DSR ≈ 0.95 (at the
+Phase-3 deploy-gate threshold) is tracked in the deferred ledger and
+will land before Phase 1 dispatches.
 
 Public API
 ----------
