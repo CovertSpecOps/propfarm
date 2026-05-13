@@ -67,6 +67,16 @@ Wave 6b shipped spread (6.1), slippage (7.1), and Gate-2B fill-recording prep. W
 
 Wave 6c proved the fill engine is structurally correct against the schema; **Gate 2B proves it numerically against live broker reality.** Gate 2B is now unblocked: the user can run `scripts/record_fills.py` on the VPS for 24-48h via Task Scheduler (1A) or Start-Process (1B) per the runbook. Once `data/fills_capture_001.parquet` lands in the repo, the Gate 2B comparison harness can be built — drives each recorded `(request, market_state)` through `simulate_fill`, computes the residual (`live - sim`) per field, and reports p50/p95/p99 of the residual distribution. **Wave 6d (10.2 stress replay) is GATED on both Wave 6c AND Gate 2B passing** — the user explicitly: "Do not dispatch 6d until the fill engine is proven against recorded reality."
 
+### Gate 1 ruling — option (c) accepted (2026-05-13)
+
+The Gate 1 (Task 13.1) implementation agent shipped a **residual bootstrap** ε derivation rather than the plan-specified cost-only bootstrap. Reviewer demonstrated the cost-only path is mathematically infeasible (drift and ε both scale 1/√N, ratio constant) and that residual bootstrap correctly catches the alpha-leak class of bug. User ruled **option (c)**: ship the residual gate as-is, document its boundaries, and add a deterministic cost-reconciliation sister test to close the cost-arithmetic class of bug.
+
+> **Gate 1 (residual bootstrap) is NECESSARY but NOT SUFFICIENT for cost-pipeline correctness.** It detects alpha leaking into the simulator. It does NOT detect systematic cost miscalibration where modeled costs equal applied costs but both are wrong vs. live. That class of bug is detected by Gate 2B (sim/live fill comparison) and the cost-reconciliation sister test below.
+
+**Cost-reconciliation sister test (Task 13.1b)** — deterministic. Generates `N=10,000` synthetic trades with KNOWN spread/commission/swap costs at fixed parameters; runs the full cost pipeline (`simulate_fill` + `commission_for_trade` + `swap_for_position`); asserts aggregate applied cost == aggregate known cost to a tolerance of **0.01 bps** (floating-point noise). **No RNG, no bootstrap** — drift and ε do not apply because there is no sampling. Reviewer rejects any implementation that uses random sampling. This catches the class of bug where a refactor drops a multiplier, fences a round-trip on the wrong leg, or mishandles a `nights_held` boundary at the triple-Wednesday rollover.
+
+**Phase 0 gate review prerequisite pair**: Gate 1 (residual) **AND** cost-reconciliation sister BOTH pass → necessary-and-sufficient for cost-pipeline correctness. Document both as paired prerequisites at the Phase 0 gate review.
+
 ## User decision needed — DSR §Test 4 plan amendment
 
 Reviewer for W5 9.1 (DSR) traced the plan's reference example end-to-end against 3 canonical implementations (Wikipedia, Marti blog, López-de-Prado-blessed `rubenbriones/Probabilistic-Sharpe-Ratio`):
@@ -393,8 +403,10 @@ broker behavior. Active from W1 dispatch through 2026-05-12 ADR closure.
 | ADR-0003 bridge choice | ✅ ACCEPTED 2026-05-12 | Direct MetaTrader5 pkg adopted. ZMQ fallback CLOSED-NOT-PURSUED but design preserved at `scripts/spike_mt5_fallback_zmq.md` |
 | Gate 2 part A: MT5 hello-world | ✅ PASSED 2026-05-12 | Run-2 stdout: `send rtt_ms=167.5 retcode=10009` open + close. See `docs/runbooks/mt5-spike-result.md` |
 | Gate 2 part B: sim/live fill comparison ≤ 1 pip | ⬜ pending | Needs Task 7.2 fill engine + Task 14.3 nautilus integration + a 10-cycle live distribution |
-| Gate 1: Placebo (alpha-leak detector) | ⬜ pending | Needs the full pipeline: 4.2 ingest, 6.1/7.1 sim calibration, 7.2 fill engine |
-| Phase 0 gate review | ⬜ pending | Needs everything above |
+| Gate 1: Placebo residual bootstrap (alpha-leak detector) | 🟨 SHIPPED 2026-05-13, deviation accepted (option c) | Residual bootstrap PASS on canonical choppy fixture. Paired with cost-reconciliation sister test for cost-arithmetic correctness. **Necessary but NOT sufficient** alone — see "Gate 1 ruling" section. Commit `d88f6b5` |
+| Cost-reconciliation sister test (Task 13.1b, deterministic) | ⬜ pending | Sister to Gate 1. N=10,000 synthetic trades, full cost pipeline, aggregate applied vs known within 0.01 bps. NO RNG, NO bootstrap. Closes the cost-arithmetic class Gate 1 cannot detect |
+| Gate 2B: sim/live fill comparison (harness ready, awaiting capture) | 🟨 harness built 2026-05-13 | Harness commits `987e5f5` + `a2b56d4`. VPS capture in progress (started 2026-05-13 18:00 UTC, ends ~2026-05-14 18:00 UTC). On capture commit, run `python scripts/run_gate_2b.py --capture-parquet ...` |
+| Phase 0 gate review | ⬜ pending | Needs everything above AND cost-reconciliation sister PASS (paired prerequisite with Gate 1) |
 
 ## User-side blockers (cannot be done by agents)
 
