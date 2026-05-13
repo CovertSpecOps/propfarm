@@ -64,6 +64,39 @@ Order-type routing
   documented in the Phase-0 plan and explicitly tested in
   ``test_stop_order_treated_as_market``.
 
+Per-request semantics (Wave 6c adversarial review)
+--------------------------------------------------
+This module is a **single-order, per-request model**: one :class:`FillRequest`
+plus one :class:`MarketState` snapshot produces exactly one :class:`FillResult`.
+The engine intentionally does NOT model:
+
+* **Partial fills.** A 1-lot request books entirely at the spread/slippage
+  evaluated at ``request_time_utc``; there is no split across a price move.
+  The Wave 6c adversarial reviewer asked which side of a mid-request spread
+  spike applies — the answer is "whichever side ``request_time_utc`` lands on".
+* **SL/TP race resolution on the same bar.** If a strategy has both an SL
+  and a TP that wick through inside one bar, the caller (strategy /
+  backtester) decides which fires; the engine fills whichever it is told to.
+* **Multi-order atomicity.** The caller serializes submissions. Two requests
+  with the same ``request_time_utc`` are processed independently and do not
+  share liquidity; Phase-1 strategies that need atomic multi-order semantics
+  must implement them above this layer.
+* **Whipsaw / phantom stop detection.** The engine cannot distinguish a
+  real stop trigger from a single-tick spike that immediately reverses,
+  because :class:`MarketState` carries no OHLC/tick stream. Whipsaw filtering
+  is a Phase-1 strategy concern; the engine accepts whatever the caller
+  asserts via the ``stop`` request.
+* **Gap-fill price differentiation.** For a stop crossing a market-closed
+  boundary (e.g. Friday 22:00 UTC → Sunday 22:00 UTC reopen), the caller
+  must pass the post-reopen quote as ``requested_price`` to keep Gate 2B's
+  residual-fill analysis accurate. The engine fills at ``requested_price +
+  slippage``; it does not look up the gap-open from a bar stream.
+
+This per-request framing is what makes the engine deterministic and what
+makes the schema-locked :class:`FillResult` sufficient (no extra fields
+needed for partial-fill ledgers, race-resolution metadata, or order-book
+state).
+
 Sign convention (mirrors ``scripts/record_fills.parse_fill_into_record``)
 ------------------------------------------------------------------------
 ``slippage_observed_pips`` is **adverse-positive**:
