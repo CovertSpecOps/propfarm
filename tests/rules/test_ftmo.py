@@ -27,7 +27,6 @@ from pathlib import Path
 import pytest
 
 from propfarm.rules.ftmo import (
-    ALL_FIRM_PREDICATES,
     FTMO_BANNED_TECHNIQUES,
     FTMO_CONSISTENCY,
     FTMO_COPY_TRADING,
@@ -52,6 +51,7 @@ from propfarm.rules.predicates import (
     Predicate,
     Violation,
 )
+from propfarm.rules.registry import ALL_FIRM_PREDICATES
 
 # --------------------------------------------------------------------------- #
 # Snapshot file path (used by drift-check test and by every test that builds

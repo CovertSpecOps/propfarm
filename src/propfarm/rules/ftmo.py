@@ -65,7 +65,6 @@ from propfarm.rules.predicates import (
 )
 
 __all__ = [
-    "ALL_FIRM_PREDICATES",
     "FTMO_BANNED_TECHNIQUES",
     "FTMO_CONSISTENCY",
     "FTMO_COPY_TRADING",
@@ -908,17 +907,11 @@ FTMO_PREDICATES: Final[tuple[Predicate, ...]] = (
 )
 
 
-#: Per-firm predicate registry. Loader pattern mirrors
-#: :data:`propfarm.sim.commission.ALL_TABLES`: a consumer iterates the
-#: tuple/dict and reads ``.confidence`` per element. W4b adds the
-#: ``"fundednext"`` and ``"fundingpips"`` entries; the dict layout is
-#: stable.
-ALL_FIRM_PREDICATES: Final[dict[str, tuple[Predicate, ...]]] = {
-    FIRM_SLUG: FTMO_PREDICATES,
-    # "fundednext": FUNDEDNEXT_PREDICATES,  # W4b
-    # "fundingpips": FUNDINGPIPS_PREDICATES,  # W4b
-}
-
+# The cross-firm predicate registry (formerly ``ALL_FIRM_PREDICATES`` in
+# this module) was promoted to its own module during W4b — see
+# ``propfarm.rules.registry``. Importing FundedNext / FundingPips predicates
+# into ``ftmo`` would have been a layering inversion (this module should not
+# know about other firms). The registry module is now the canonical home.
 
 # `field` re-export guard so subclasses can `from .ftmo import field` if a
 # private factory is needed; not part of the public API.

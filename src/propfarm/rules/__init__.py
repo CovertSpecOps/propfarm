@@ -33,8 +33,11 @@ from propfarm.rules.predicates import (
     Predicate,
     Violation,
 )
+from propfarm.rules.registry import ALL_FIRM_PREDICATES, ALL_MODEL_PREDICATES
 
 __all__ = [
+    "ALL_FIRM_PREDICATES",
+    "ALL_MODEL_PREDICATES",
     "AccountState",
     "Achievement",
     "CandidateTrade",
