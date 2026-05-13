@@ -39,6 +39,29 @@ W2 added `propfarm.data.quality` (holiday/DST/session predicates) and `propfarm.
 
 W4 added `propfarm.rules.{predicates, ftmo, fundednext, fundingpips, registry}`. W5 (validation math: CPCV, walk-forward, DSR, PBO, Monte Carlo block bootstrap) consumes **none** of this directly — pure statistical math operating on returns arrays. The W4→W5 contract is therefore minimal. **However**: every W5 agent MUST consume the pinned B2.5 fixture `fixtures/synthetic_returns.parquet` (sha256=`f937ab719140ddd4f14d29be876de225c44df069bf4038a877e1987b9b226ff9`) and MUST NOT regenerate its own returns. Reviewer rejects any W5 agent that hand-rolls a NumPy generator. The fixture's 4 regimes (trending, mean_reverting, choppy, fat_tailed) are designed specifically to exercise the validation-math implementations against known-property data.
 
+- **2026-05-12 #11** — W5 dispatched. 5 parallel impl agents (CPCV / walk-forward / DSR / PBO / MC bootstrap), then 5 parallel fresh reviewers. Largest single fan-out batch of Phase 0. All 5 modules: uniform `evaluate(returns, **kwargs) -> ResultDict` contract, fixture SHA256 pinned, 4-regime coverage. **Two reviewer-caught items applied inline**: walk-forward's Pydantic invariant was too weak (counted pair count but not Cartesian product — buggy `evaluate()` could double-count fold 0); PBO's anti-correlated-construction docstring asserted "PBO=1.0 unreachable" which is mathematically false (reviewer built counterexamples). Both fixed. **One reviewer-caught item escalated to user**: DSR §Test 4 plan reference example is wrong — `SR=2.5, T=120, N=10, skew=-0.3, kurt=5` gives DSR≈1.0 not 0.91 (reviewer verified vs Wikipedia, Marti blog, López-de-Prado-blessed `rubenbriones` impl). Commits: `c425bc8`, `18b79ac`, `e79b60d`, `5eef192`, `b20bc17`, `142c813`.
+
+### W5 → next-batch drift check
+
+W5 added `propfarm.validation.{cpcv, walkforward, dsr, pbo, monte_carlo}`. Next batch is the remaining sim-cost stack — **4.2 ingest** (raw Dukascopy → snapshot), **5.3 vendor reconciliation**, **6.1 spread model**, **7.1 slippage model**, **7.2 fill engine** — plus **10.2 stress replay** and **12.1 state machine**. None of these consume W5 directly; W5 is consumed at Phase 1 strategy-gate time when strategies are scored. **However**: when the fill engine + cost model are ready, the placebo Gate 1 will use W5's MC bootstrap to size the cost-floor band, so MC's deterministic-seed contract becomes load-bearing then. Reviewer for the sim-cost stack will check that calls into W5 do not regenerate returns.
+
+## User decision needed — DSR §Test 4 plan amendment
+
+Reviewer for W5 9.1 (DSR) traced the plan's reference example end-to-end against 3 canonical implementations (Wikipedia, Marti blog, López-de-Prado-blessed `rubenbriones/Probabilistic-Sharpe-Ratio`):
+
+- Plan §Test 4: "SR=2.5, T=120, N=10, skew=-0.3, kurt=5 → DSR ≈ 0.91 ± 0.05".
+- Canonical computation: `z = (2.5 × √119 − 1.5746) / √(1 + 0.75 + 6.25) ≈ 9.085`, giving DSR ≈ Φ(9.085) ≈ **1.0000**.
+- Solving backwards: for `T=120, N=10, skew=-0.3, kurt=5`, the SR that produces DSR=0.91 is **~0.277** (i.e., the plan's `2.5` is off by ~9×).
+
+The agent shipped `assert dsr >= 0.99` with a documented "Deviation from spec" docstring. The reviewer recommends amending the plan rather than patching the math — the math is right against three independent references.
+
+**Two options for the user:**
+
+1. **Amend plan §Test 4 inputs**: swap `SR=2.5` for `SR=0.28` (approximate). Test asserts DSR ≈ 0.91 as originally intended.
+2. **Amend plan §Test 4 expected value**: keep `SR=2.5` but change expected to `DSR ≈ 1.0`. Test asserts `dsr ≥ 0.99`.
+
+Either is correct. Awaiting user decision before either touching the plan or tightening the tripwire.
+
 ### Between-wave drift check — W3 → W4
 
 W3 added `propfarm.sim.commission` and `propfarm.sim.swap` plus ToS snapshots under `docs/firm-tos-snapshots/`. W4 (rules-as-code: FTMO/FundedNext/FundingPips predicates) will need its own ToS snapshots covering the firms' **rule predicates** (daily DD %, max DD %, profit target %, banned techniques, etc.) — NOT the commission/swap tables. **The two snapshot sets serve different purposes** and the W3 snapshots are NOT a substitute. W4 should follow the same pattern: fetch primary URL, snapshot verbatim, fall back to secondary on 404/403 with prominent UNCERTAIN flags, propagate `confidence` into the runtime predicate model. Reviewer will flag if W4 reuses the commission snapshot files or skips the snapshot step. **W2's `is_market_open` is the canonical session predicate** — W4's trading-hours rules must consume it, not reinvent.
@@ -203,7 +226,7 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 | **W3** | ✅ done 2026-05-12 | 6.2, 6.3 | Commission tables + swap/financing. ToS pages 404/403; values seeded from secondary sources. All 6 tables marked `confidence="uncertain"`. Snapshot↔code integrity test added (6.2). DST-crossing + Wed-boundary swap tests added (6.3) |
 | **W4a** | ✅ done 2026-05-12 | 11.1 | Predicate ABC + FTMO predicates. Reviewer-driven refactor: introduced `Event` ABC with `Violation` / `Achievement` subclasses to separate "rule confidence" from "event-is-failure" concerns. Profit-target predicates now emit Achievement (not Violation), confidence restored to `"high"` on numeric rules |
 | **W4b** | ✅ done 2026-05-12 | 11.2 | FundedNext + FundingPips predicates inheriting W4a ABC unmodified. Registry restructured to `propfarm.rules.registry` (cleaner home for `ALL_FIRM_PREDICATES` and `ALL_MODEL_PREDICATES`). Multi-model selector pattern (FundedNext: stellar_2step/1step/lite, FundingPips: 1step/2step/2step_pro). Stellar Instant excluded (no help-center rule article). FundedNext consistency rule shipped `uncertain` — verified against current ToS: FundedNext eliminated the numeric threshold in 2024 consolidation |
-| **W5** | next | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV, walkforward, DSR, PBO, Monte Carlo). All 5 agents consume the pinned B2.5 fixture sha256=`f937ab7191...`. Reviewer rejects any agent that regenerates returns |
+| **W5** | ✅ done 2026-05-12 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV, walkforward, DSR, PBO, Monte Carlo). 5 impl agents in parallel + 5 fresh reviewers in parallel. All 5 modules consume pinned B2.5 fixture sha256=`f937ab7191...`. **Reviewer flagged plan defect**: DSR §Test 4 spec example (`SR=2.5, T=120, N=10, skew=-0.3, kurt=5 → DSR≈0.91`) is mathematically wrong (verified vs 3 canonical impls; correct answer is DSR≈1.0). User decision needed |
 | **B3a** | after B2.5 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV/walkforward/DSR/PBO/MC). All consume the fixture |
 | **B3b** | after B1 (parallel with B2.5) | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 11.1, 11.2 | Data DLs + snapshot + quality + linter + cost components + rules predicates |
 | **B4** | after 3.1+3.2 | 3.3 | Background fetch (long-running, single agent) |
@@ -308,6 +331,7 @@ broker behavior. Active from W1 dispatch through 2026-05-12 ADR closure.
 | W3 sim costs (6.2, 6.3) | ✅ PASSED 2026-05-12 | 62 sim tests green (23 commission + 39 swap); snapshot↔code integrity test landed; all 6 firm tables `confidence="uncertain"` pending live recalibration; commits `ca26c3a`, `122a38a`, `6bf31ec` |
 | W4a rules ABC + FTMO (11.1) | ✅ PASSED 2026-05-12 | 46 rules tests green; Event/Violation/Achievement split; snapshot↔code confidence-agreement + dual-fire tests added; commits `52ad598`, `305293a` |
 | W4b rules FundedNext + FundingPips (11.2) | ✅ PASSED 2026-05-12 | 164 rules tests green (60 fundednext + 58 fundingpips + 46 ftmo); ABC unchanged; multi-model selector pattern; registry restructured; commits `7ac4972`, `f24970c` |
+| W5 validation math (8.1, 8.2, 9.1, 9.2, 10.1) | ✅ PASSED 2026-05-12 | 99 validation tests green (16 CPCV + 23 walkforward + 19 DSR + 21 PBO + 22 MC; total 437 in repo); fixture SHA256 pinned across all 5 modules; uniform `evaluate()` contract; Politis-White auto block length confirmed load-bearing in MC; commits `c425bc8`, `18b79ac`, `e79b60d`, `5eef192`, `b20bc17`, `142c813` |
 | ADR-0002 stack-lock | ✅ ACCEPTED 2026-05-12 | vectorbt + nautilus-trader + MetaTrader5 pkg locked. Spike Run-2 PASS cited. 150–170 ms RTT band |
 | ADR-0003 bridge choice | ✅ ACCEPTED 2026-05-12 | Direct MetaTrader5 pkg adopted. ZMQ fallback CLOSED-NOT-PURSUED but design preserved at `scripts/spike_mt5_fallback_zmq.md` |
 | Gate 2 part A: MT5 hello-world | ✅ PASSED 2026-05-12 | Run-2 stdout: `send rtt_ms=167.5 retcode=10009` open + close. See `docs/runbooks/mt5-spike-result.md` |
@@ -370,3 +394,9 @@ Reviewer-flagged items that did NOT block the current task but should not be sil
 | W4b: FundedNext 1% risk-per-trade rule (article 10256545) — gated on observable warning state | rules / fundednext | Revisit when warning state becomes API-observable (Phase 4) |
 | W4b: martingale predicates (FundedNext + FundingPips) carried for cross-firm symmetry but neither firm's ToS lists martingale | rules | Move the symmetry rationale from docstring into the `interpretation` field so it surfaces in any UI |
 | W4b: cross-firm helper (`_HigherOfReferenceDailyDrawdown`) candidate if a fourth firm with same DD shape lands | rules/_shared | Premature now; revisit if/when a Phase-4 firm matches the pattern |
+| W5 CPCV: 6 iterator-level ValueError raises not exercised by tests (lines 287, 289, 291, 295, 300, 302 of cpcv.py) | validation/cpcv | Trivial `pytest.raises` micro-tests to close the validation-contract gap |
+| W5 walk-forward: `_apply_param` test should use a negative-weight grid to actually exercise differentiation (Sharpe is scale-invariant on positive weights) | validation/walkforward | Tighten the param-grid test or add a scale-invariance assertion |
+| W5 DSR: tighten `test_dsr_against_published_example` tripwire from `>= 0.99` to `pytest.approx(1.0000, abs=1e-4)` + add `e_max ≈ 1.5746` and `z ≥ 9.0` triple-tripwire | validation/dsr | Locks the exact value against future "fix toward 0.91" silent edits |
+| W5 PBO: lookback grid `(5, 10, 20, 50, 100, 200)` hardcoded inline in tests; move to module-level constant | validation/pbo | Documentation hygiene; no behavior change |
+| W5 MC: `McReport.block_size_source` Literal includes `"default"` but no code path produces it | validation/monte_carlo | One-line Literal cleanup |
+| W5 MC: path-level fat-tail-→-left-tail safety property no longer asserted (replaced with marginal kurtosis check due to fixture realized drift dominating) | validation/monte_carlo + fixtures | Restore when fixture is regenerated with zero-drift fat_tailed (post-Phase-0; would be a fixture version bump) |
