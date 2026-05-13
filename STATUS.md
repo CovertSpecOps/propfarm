@@ -29,6 +29,11 @@ W2 added `propfarm.data.quality` (holiday/DST/session predicates) and `propfarm.
 
 - **2026-05-12 #6** — MT5 spike Run-1 result reported: partial PASS (open OK at 151.4 ms, close failed with retcode 10016 INVALID_STOPS due to SL/TP inheritance through `{**req, ...}` spread). Bug fixed: `_build_close_req` helper rebuilds the close request from scratch with explicit `sl=0.0`/`tp=0.0`. Added 5 regression tests at `tests/scripts/test_spike_mt5.py`. Runbook widened to Python 3.11+ (cp314 wheels confirmed working). Commit `36ca2a6`.
 - **2026-05-12 #7** — Spike Run-2 reported: **clean PASS** (open + close both retcode 10009, RTT 167.5 ms). ADR-0002 (stack-lock) and ADR-0003 (bridge choice) both written and Accepted. MT5-stack-assumption block policy LIFTED. Phase 0 Gate 2 Part A (MT5 hello-world) marked GREEN; Gate 2 Part B (sim/live fill comparison) and Gate 1 (placebo) remain pending — they require the simulator + cost model + ingest, which is W3/W4/W5 plus the sim-cost stack (4.2, 5.3, 6.1, 7.1, 7.2).
+- **2026-05-12 #8** — W3 dispatched (6.2 commission + 6.3 swap, parallel). Two impl agents reported, two fresh reviewers ran in parallel. **Important finding by both reviewers**: UNCERTAIN flag lived only in snapshot prose, not the runtime model — placebo gate could silently treat a $7 EURUSD commission guess as ground truth. Fixed: added `confidence: Literal["high", "uncertain"]` to both `CommissionTable` and `SwapTable`; all 6 shipped tables marked uncertain. Snapshot↔code integrity test added (commission). Swap module gained 5 boundary tests (DST-crossing triple-Wed, Wed-rollover edges, close-exactly-at-rollover). Six W3 follow-ups added to deferred ledger (chief among them: live broker recalibration of all commission + swap numbers). Commits: `ca26c3a` (6.2), `122a38a` (6.3), `6bf31ec` (fix-ups).
+
+### Between-wave drift check — W3 → W4
+
+W3 added `propfarm.sim.commission` and `propfarm.sim.swap` plus ToS snapshots under `docs/firm-tos-snapshots/`. W4 (rules-as-code: FTMO/FundedNext/FundingPips predicates) will need its own ToS snapshots covering the firms' **rule predicates** (daily DD %, max DD %, profit target %, banned techniques, etc.) — NOT the commission/swap tables. **The two snapshot sets serve different purposes** and the W3 snapshots are NOT a substitute. W4 should follow the same pattern: fetch primary URL, snapshot verbatim, fall back to secondary on 404/403 with prominent UNCERTAIN flags, propagate `confidence` into the runtime predicate model. Reviewer will flag if W4 reuses the commission snapshot files or skips the snapshot step. **W2's `is_market_open` is the canonical session predicate** — W4's trading-hours rules must consume it, not reinvent.
 
 ---
 
@@ -187,7 +192,8 @@ Both branches converge at 15.1. Wall-clock is bounded by **max(data branch, MT5 
 | **B2.5** | ✅ done 2026-05-12 | synthetic returns fixture | Canonical fixture sha256=`f937ab719140...` — pins regenerated with seed 20260514 |
 | **W1** | ✅ done 2026-05-12 | 3.1, 3.2, 4.1 | Dukascopy DL + HistData DL + snapshot writer. Real bug caught by 4.1 reviewer: path traversal in `_snapshot_path` (fixed) |
 | **W2** | ✅ done 2026-05-12 | 5.1, 5.4 | Holiday/DST + lookahead linter. Critical bug caught by 5.1 reviewer: US100/GER40 session hours hardcoded UTC (off by 1h for ~8 months/year). Fixed via DST-aware zoneinfo |
-| **W3** | next | 6.2, 6.3 | Commission tables + swap/financing (independent, both fetch firm ToS snapshots) |
+| **W3** | ✅ done 2026-05-12 | 6.2, 6.3 | Commission tables + swap/financing. ToS pages 404/403; values seeded from secondary sources. All 6 tables marked `confidence="uncertain"`. Snapshot↔code integrity test added (6.2). DST-crossing + Wed-boundary swap tests added (6.3) |
+| **W4** | next (W4a → W4b sequential) | 11.1, then 11.2 | Predicate ABC + FTMO predicates first; then FundedNext + FundingPips. Reviewer rejects 11.2 if it diverges from 11.1's ABC. Both must consume W2's `is_market_open` for trading-hours predicates |
 | **B3a** | after B2.5 | 8.1, 8.2, 9.1, 9.2, 10.1 | Validation math (CPCV/walkforward/DSR/PBO/MC). All consume the fixture |
 | **B3b** | after B1 (parallel with B2.5) | 3.1, 3.2, 4.1, 5.1, 5.4, 6.2, 6.3, 11.1, 11.2 | Data DLs + snapshot + quality + linter + cost components + rules predicates |
 | **B4** | after 3.1+3.2 | 3.3 | Background fetch (long-running, single agent) |
@@ -270,6 +276,7 @@ broker behavior. Active from W1 dispatch through 2026-05-12 ADR closure.
 | Canonical fixture (B2.5) | ✅ PASSED 2026-05-12 | sha256=`f937ab719140ddd4f14d29be876de225c44df069bf4038a877e1987b9b226ff9`; 13 property tests pass; commit `9c49812` |
 | W1 data layer (3.1, 3.2, 4.1) | ✅ PASSED 2026-05-12 | All offline unit tests green; integration tests deferred behind `pytest -m integration`; commits `82921bc`, `76dbb61`, `7d640eb`, `63d511b` |
 | W2 quality + linter (5.1, 5.4) | ✅ PASSED 2026-05-12 | 29 quality tests + 24 lookahead linter tests green; DST regressions land; commits `adb2660`, `40b0039`, `d38430d` |
+| W3 sim costs (6.2, 6.3) | ✅ PASSED 2026-05-12 | 62 sim tests green (23 commission + 39 swap); snapshot↔code integrity test landed; all 6 firm tables `confidence="uncertain"` pending live recalibration; commits `ca26c3a`, `122a38a`, `6bf31ec` |
 | ADR-0002 stack-lock | ✅ ACCEPTED 2026-05-12 | vectorbt + nautilus-trader + MetaTrader5 pkg locked. Spike Run-2 PASS cited. 150–170 ms RTT band |
 | ADR-0003 bridge choice | ✅ ACCEPTED 2026-05-12 | Direct MetaTrader5 pkg adopted. ZMQ fallback CLOSED-NOT-PURSUED but design preserved at `scripts/spike_mt5_fallback_zmq.md` |
 | Gate 2 part A: MT5 hello-world | ✅ PASSED 2026-05-12 | Run-2 stdout: `send rtt_ms=167.5 retcode=10009` open + close. See `docs/runbooks/mt5-spike-result.md` |
@@ -319,3 +326,9 @@ Reviewer-flagged items that did NOT block the current task but should not be sil
 | Quality: Xetra half-days (Dec 24, Dec 31) for GER40 not handled | data-layer / quality | Optional, low-impact for Phase-0 spread calibration |
 | Quality: optional `pandas-market-calendars` cross-check test marked `@pytest.mark.network` (cheap insurance against silent calendar drift) | data-layer / quality | Wire into nightly CI when CI exists |
 | Lookahead linter: scan `src/propfarm/sim/` and `src/propfarm/validation/` (sim engine can leak future bars) | data-layer / linter | Revisit when 7.2 fill engine lands — needs a non-`@strategy` marker pattern |
+| W3: live FTMO/FundedNext/FundingPips commission+swap calibration (all 6 shipped tables flagged `confidence="uncertain"`) | sim/cost | Run when user can authenticate to each firm's MT5 terminal and dump per-symbol Symbol Specification dialogs. Gates funded-deploy certification, NOT placebo gate |
+| W3: FundedNext fee schedule is forward-dated 2026-12-01 — current-effective values not extractable from secondary sources | sim/cost | Re-derive current values during live recalibration; add `effective_from` to CommissionTable when we do |
+| W3: USDJPY `point_value_usd` hardcoded to 1.0 (true ~0.66 at JPY=150) | sim/cost | Recalibrate per live broker feed; impacts USDJPY swap magnitudes by ~50% |
+| W3: Metals priced from flat-USD peg, not `(percent, peg, contract_size)` formula | sim/cost | Formalize before live indices/metals trading in Phase 1 |
+| W3: per-symbol `uncertain_symbols: frozenset[str]` (whole-table `confidence` is minimum-viable) | sim/cost | Add finer granularity when a partially-confident table needs to ship |
+| W3: `nights_held` does NOT suppress full-market holidays (Jan 1 / Dec 25 / Dec 26) | sim/swap | Small magnitude (≤2 nights/year); Phase-1 follow-up |
