@@ -338,3 +338,46 @@ def test_window_pydantic_frozen() -> None:
     )
     with pytest.raises((ValueError, TypeError)):
         w.fold_id = 99
+
+
+# --------------------------------------------------------------------------- #
+# Reviewer follow-up: WalkForwardResult model_validator must enforce that the
+# (fold_id, param_key) set covers the full Cartesian product, not just the
+# pair COUNT. A buggy evaluate() could double-count fold 0 and skip fold 2
+# with the correct total count and pass the original length-only check.
+# --------------------------------------------------------------------------- #
+def test_walkforward_result_validator_rejects_duplicate_fold_param_tuples() -> None:
+    """Constructing WalkForwardResult with the correct pair COUNT but
+    duplicated (fold_id, param_key) tuples must raise."""
+    duplicated_pairs = (
+        SharpePair(fold_id=0, param_key="{}", is_sharpe=1.0, oos_sharpe=0.5),
+        SharpePair(fold_id=0, param_key="{}", is_sharpe=1.1, oos_sharpe=0.6),
+        # n_folds=2 by n_params=1 = 2 expected pairs; both are fold_id=0.
+    )
+    with pytest.raises(ValueError, match="pair-set mismatch"):
+        WalkForwardResult(
+            n_folds=2,
+            n_params=1,
+            pairs=duplicated_pairs,
+            gate_passed=False,
+            gate_threshold=0.5,
+            gate_oos_min=0.8,
+        )
+
+
+def test_walkforward_result_validator_accepts_full_cartesian() -> None:
+    """Sanity: when the (fold_id, param_key) set DOES cover the Cartesian
+    product, the validator passes."""
+    pairs = (
+        SharpePair(fold_id=0, param_key="{}", is_sharpe=1.0, oos_sharpe=0.5),
+        SharpePair(fold_id=1, param_key="{}", is_sharpe=1.1, oos_sharpe=0.6),
+    )
+    result = WalkForwardResult(
+        n_folds=2,
+        n_params=1,
+        pairs=pairs,
+        gate_passed=False,
+        gate_threshold=0.5,
+        gate_oos_min=0.8,
+    )
+    assert len(result.pairs) == 2

@@ -162,6 +162,18 @@ class WalkForwardResult(BaseModel):
                 f"pair-count mismatch: n_folds={self.n_folds} * n_params={self.n_params} "
                 f"= {expected}, got {len(self.pairs)} pairs"
             )
+        # Reviewer-required: the (fold_id, param_key) set must cover the full
+        # Cartesian product. The bare length check is insufficient — a buggy
+        # `evaluate()` could double-count fold 0 and skip fold 2 while keeping
+        # the pair count correct, producing wrong PBO/DSR inputs downstream.
+        distinct = {(p.fold_id, p.param_key) for p in self.pairs}
+        if len(distinct) != expected:
+            raise ValueError(
+                f"pair-set mismatch: expected {expected} distinct "
+                f"(fold_id, param_key) tuples covering the Cartesian product, "
+                f"got {len(distinct)} distinct out of {len(self.pairs)} pairs "
+                f"(duplicate or missing combinations)"
+            )
         return self
 
 

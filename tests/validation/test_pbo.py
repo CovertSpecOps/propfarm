@@ -140,19 +140,25 @@ def test_pbo_one_when_is_anti_correlated() -> None:
     # complementary combination (IS = second half, OOS = first half)
     # also produces rank 0 for its IS-best.
     #
-    # Combinatorial accounting: of the 12,870 splits, those with ``k``
-    # positive IS rows and ``8 - k`` negative IS rows number
-    # ``C(8, k) * C(8, 8 - k)``. For ``k != 4`` (7970 of 12,870 ≈
-    # 62%), IS-best is the column whose score sign dominates and OOS
-    # reverses it exactly — PBO contribution = 1.0. For ``k = 4``
-    # (4900 of 12,870 ≈ 38%), the IS-positive and IS-negative
-    # contributions cancel and jitter alone drives the rank; on the
-    # observed seed, those splits land below the OOS median ~28% of
-    # the time, giving an aggregate empirical PBO ≈ 0.726. We assert
-    # ``> 0.65`` to stay well above the noise floor (PBO ≈ 0.5) but
-    # below the unreachable theoretical maximum (1.0 is mathematically
-    # impossible for a single fixed matrix under CSCV — every split's
-    # OOS_mean is constrained by the same row-totals).
+    # Reviewer-corrected explanation (the original "row-totals constraint"
+    # rationale was wrong — PBO=1.0 IS reachable under CSCV; counterexamples
+    # exist for non-degenerate-tie matrices):
+    #
+    # The actual reason this jittered construction lands at ≈0.726 rather
+    # than at 1.0 is the **jitter dissolving degenerate-tie splits**.
+    # In the noiseless version of this construction (where column 2 is
+    # literally zero), the 4900 of 12,870 splits with k=4 positive and
+    # k=4 negative IS rows have ZERO IS variance — every column ties.
+    # Those splits get NaN-skipped in the PBO mean by the implementation's
+    # logit guard, and the remaining 7970 ``k≠4`` splits all produce
+    # logit < 0 → exact PBO = 1.0.
+    #
+    # With ``scale=1e-6`` jitter, those k=4 splits become non-degenerate:
+    # rank is dominated by the tiny jitter, IS-best is essentially random,
+    # OOS rank lands at ~50/50, dragging the mean from 1.0 down to ~0.73.
+    # The 0.73 figure is therefore an artifact of *this specific jitter
+    # level*, not a theoretical PBO ceiling. We assert ``> 0.65`` to stay
+    # well above the noise floor (PBO ≈ 0.5).
     assert result.pbo > 0.65, (
         f"anti-correlated construction should give PBO ≫ 0.5; got {result.pbo:.3f}"
     )
