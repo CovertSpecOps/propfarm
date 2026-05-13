@@ -39,15 +39,113 @@ recording protocol owns the live-broker side.
 
 ## 1. Start the session
 
-From PowerShell, in the directory containing the repo (so `data/raw/`
-ends up next to it):
+**You must NOT need to keep an RDP session open for 24-48 hours.**
+PowerShell processes are tied to your interactive session and die when
+RDP disconnects (default Windows Server behavior on disconnect). The two
+supported ways to run the script through a disconnect:
+
+### 1A. Recommended: Windows Task Scheduler
+
+Creates a true detached process owned by the system, survives logout
+and disconnect, restarts automatically if Windows reboots.
+
+From an Administrator PowerShell on the VPS:
+
+```powershell
+$action = New-ScheduledTaskAction `
+    -Execute "C:\Python311\python.exe" `
+    -Argument "C:\propfarm\scripts\record_fills.py --duration-hours 24 --n-samples 200" `
+    -WorkingDirectory "C:\propfarm"
+
+$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
+
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit (New-TimeSpan -Hours 49) `
+    -RestartCount 0
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "Administrator" `
+    -LogonType S4U `
+    -RunLevel Highest
+
+Register-ScheduledTask `
+    -TaskName "PropfarmFillRecording" `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -Principal $principal `
+    -Description "Gate 2B fill recording (24h window)"
+```
+
+Adjust `C:\Python311\python.exe` and `C:\propfarm` to match your install
+paths. The task fires in 1 minute; if you change `--duration-hours`,
+bump `ExecutionTimeLimit` by at least 1h so Windows doesn't kill it on
+the hard cap. Logs go to the script's own stdout — redirect inside the
+script invocation if you want a file (`*>> C:\propfarm\record.log`).
+
+After registering, you can RDP disconnect (or even logout) and the
+task keeps running. Reconnect later and check progress:
+
+```powershell
+Get-ScheduledTask -TaskName "PropfarmFillRecording" | Get-ScheduledTaskInfo
+Get-Process python | Select-Object Id, StartTime, CPU
+```
+
+Stop early if you need to:
+
+```powershell
+Stop-ScheduledTask -TaskName "PropfarmFillRecording"
+```
+
+Cleanup after the session completes:
+
+```powershell
+Unregister-ScheduledTask -TaskName "PropfarmFillRecording" -Confirm:$false
+```
+
+### 1B. Alternative: `Start-Process -WindowStyle Hidden`
+
+Lighter-weight than Task Scheduler but tied to your user session.
+**Survives RDP disconnect** (the disconnect does NOT terminate user
+processes by default; only an explicit *logout* does). If you only
+plan to disconnect-and-reconnect, this is the simpler path.
 
 ```powershell
 cd <repo-root>
+Start-Process `
+    -FilePath "python.exe" `
+    -ArgumentList "scripts\record_fills.py","--duration-hours","24","--n-samples","200" `
+    -WindowStyle Hidden `
+    -RedirectStandardOutput "record.log" `
+    -RedirectStandardError "record.err.log"
+```
+
+The process is now backgrounded. Tail the log to follow progress:
+
+```powershell
+Get-Content -Path "record.log" -Wait -Tail 20
+```
+
+Find/kill the process if needed:
+
+```powershell
+Get-Process python | Where-Object { $_.MainWindowTitle -eq "" }
+Stop-Process -Id <pid>
+```
+
+### 1C. NOT recommended: foreground PowerShell
+
+```powershell
 python scripts\record_fills.py --duration-hours 24 --n-samples 200
 ```
 
-What this does:
+Works only if you keep RDP connected for the full 24-48h. Dies on RDP
+disconnect if your Windows Server session policy is the default. Use
+this only for `--dry-run` schedule previews or short test runs.
+
+### What every path does
 
 - Builds a deterministic 200-sample schedule covering London / NY / Tokyo
   session opens, mid-session quiet zones, and a 70% spread across the rest
