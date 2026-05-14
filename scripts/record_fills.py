@@ -328,6 +328,29 @@ HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS: Final[int] = 5
 #: continued; the reviewer follow-up promoted it to hard-fail).
 SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS: Final[int] = 12 * 3600
 
+#: 2026-05-14 fix v6 — MT5 account margin-mode constants. Mirrored from
+#: the MetaTrader5 Python package's ``ACCOUNT_MARGIN_MODE_*`` symbols so
+#: the helper can branch on hedging-vs-netting without importing MT5 at
+#: module load time (the import stays inside ``main()``). The integer
+#: values match the MetaQuotes documented constants:
+#:
+#: * ``ACCOUNT_MARGIN_MODE_RETAIL_NETTING = 0`` — netting accounts
+#:   aggregate positions per symbol; ``OrderSendResult.deal`` and
+#:   ``.position`` are typically populated and the existing paths 1-3
+#:   (history_deals_get by ticket / position / date-range) work.
+#: * ``ACCOUNT_MARGIN_MODE_EXCHANGE = 1`` — exchange accounts
+#:   (futures-style); paths 1-3 also work on these per the docs.
+#: * ``ACCOUNT_MARGIN_MODE_RETAIL_HEDGING = 2`` — hedging accounts
+#:   (FTMO's default for Free Trial demo; per the MT5 title bar:
+#:   "Demo Account - Hedge"). Each order creates its OWN position
+#:   whose ticket equals the order ticket; ``OrderSendResult.deal``
+#:   and ``.position`` are NOT populated on MT5 Python build 5.0.5735.
+#:   Paths 1-3 are structurally inert; path 0 (the new
+#:   ``positions_get(symbol)`` lookup) is the only working path.
+ACCOUNT_MARGIN_MODE_RETAIL_NETTING: Final[int] = 0
+ACCOUNT_MARGIN_MODE_EXCHANGE: Final[int] = 1
+ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: Final[int] = 2
+
 #: 2026-05-14 fix v4 (diagnostic-only) — emit a structured probe block when
 #: a ``market_lookup_failure`` is about to fire so the operator can capture
 #: which ``history_deals_get`` call form the live broker actually accepts.
@@ -1007,6 +1030,13 @@ _LOG_PREFIX_HISTORY_SELECT_AVAILABLE: Final[str] = "[record_fills:history_select
 #: skipped) and the "result.order vs result.position" hypothesis
 #: (path 2 querying the wrong ticket type).
 _LOG_PREFIX_ORDER_SEND_RESULT_FIELDS: Final[str] = "[record_fills:order_send_result_fields]"
+#: 2026-05-14 fix v6 — session-start diagnostic emitted after
+#: ``mt5.initialize()`` + offset detection. Names the
+#: ``account_info().margin_mode`` value so the operator can verify the
+#: code is taking path 0 (hedging) vs paths 1-3 (netting / exchange).
+#: FTMO Free Trial demo is hedging; funded / Phase B accounts are also
+#: hedging per the FTMO defaults.
+_LOG_PREFIX_ACCOUNT_MARGIN_MODE: Final[str] = "[record_fills:account_margin_mode]"
 
 
 def detect_server_time_offset_seconds(
@@ -1161,6 +1191,7 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     idx: int | None = None,
     claimed_deal_tickets: set[int] | None = None,
     server_time_offset_seconds: int = 0,
+    account_margin_mode: int = ACCOUNT_MARGIN_MODE_RETAIL_NETTING,
 ) -> tuple[float | None, datetime | None]:
     """Resolve the deal-record fill price + time for a successful order.
 
@@ -1251,6 +1282,48 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     """
     if int(order_send_result.retcode) != success_retcode:
         return (None, None)
+
+    # 2026-05-14 fix v6 — Path 0 (hedging accounts): query the active
+    # positions list directly. The v5 probe data (run after commit
+    # 822af4a) showed the FTMO Free Trial demo returns
+    # ``OrderSendResult.deal == 0`` AND ``.position == 0`` with only
+    # ``.order`` populated — and all six path-3 history-range probes
+    # returned 0 across ±24h windows. The MT5 title bar confirmed
+    # "Demo Account - Hedge - FTMO Global Markets Ltd" — a hedging
+    # account.
+    #
+    # On hedging accounts each order creates its own position whose
+    # ticket equals the order ticket; the fill price is queryable via
+    # ``mt5.positions_get(symbol=...)`` during the brief window between
+    # ``order_send`` returning and the script's round-trip close. The
+    # MT5 Python build 5.0.5735 simply doesn't populate the deal /
+    # position fields on the ``OrderSendResult`` for hedging accounts,
+    # so paths 1-3 are structurally inert. Path 0 fires FIRST on
+    # hedging accounts; paths 1-3 stay as the netting-account fallback.
+    if account_margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
+        order_ticket_p0 = int(getattr(order_send_result, "order", 0) or 0)
+        if order_ticket_p0:
+            positions = mt5.positions_get(symbol=symbol) or ()
+            for pos in positions:
+                if int(getattr(pos, "ticket", 0) or 0) != order_ticket_p0:
+                    continue
+                price_open = float(getattr(pos, "price_open", 0.0) or 0.0)
+                if price_open == 0.0:
+                    # Position exists but no price yet (race vs broker write);
+                    # fall through to paths 1-3.
+                    break
+                time_unix_server = int(getattr(pos, "time", 0) or 0)
+                if time_unix_server:
+                    return (
+                        price_open,
+                        datetime.fromtimestamp(
+                            time_unix_server - int(server_time_offset_seconds),
+                            tz=UTC,
+                        ),
+                    )
+                # Position has price but no time — record price + signal
+                # caller to use wallclock fallback for the timestamp.
+                return (price_open, None)
 
     # Build the time-range window once; used both by the optional
     # ``history_select`` precondition and the time-range fallback below.
@@ -2193,6 +2266,34 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             file=sys.stderr,
         )
 
+        # 2026-05-14 fix v6 — detect the account margin mode so the
+        # helper can choose between path 0 (positions_get, hedging) and
+        # paths 1-3 (history_deals_get, netting / exchange). FTMO Free
+        # Trial demo is hedging per the MT5 title bar ("Demo Account -
+        # Hedge"). Funded / Phase B accounts at FTMO are also hedging.
+        # Falls back to netting on any detection error so existing
+        # non-hedging code paths stay live.
+        account_margin_mode = ACCOUNT_MARGIN_MODE_RETAIL_NETTING
+        try:
+            margin_mode_raw = int(getattr(account, "margin_mode", 0) or 0)
+            account_margin_mode = margin_mode_raw
+        except Exception as exc:  # pragma: no cover — defensive on broker quirks
+            print(
+                f"[record_fills:account_margin_mode_detection_failed] "
+                f"exc_type={type(exc).__name__} exc_msg={exc!r} — "
+                f"defaulting to RETAIL_NETTING (paths 1-3 only)",
+                file=sys.stderr,
+            )
+        _mode_label = {
+            ACCOUNT_MARGIN_MODE_RETAIL_NETTING: "retail_netting",
+            ACCOUNT_MARGIN_MODE_EXCHANGE: "exchange",
+            ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: "retail_hedging",
+        }.get(account_margin_mode, f"unknown_{account_margin_mode}")
+        print(
+            f"{_LOG_PREFIX_ACCOUNT_MARGIN_MODE}={account_margin_mode} ({_mode_label})",
+            file=sys.stderr,
+        )
+
         constants = {
             "TRADE_ACTION_DEAL": mt5.TRADE_ACTION_DEAL,
             "TRADE_ACTION_PENDING": mt5.TRADE_ACTION_PENDING,
@@ -2336,6 +2437,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                     side=side,
                     idx=idx,
                     claimed_deal_tickets=claimed_deal_tickets,
+                    account_margin_mode=account_margin_mode,
                     server_time_offset_seconds=server_time_offset_seconds,
                 )
 

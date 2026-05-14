@@ -848,6 +848,9 @@ class _MockMt5:
         server_time_offset_seconds: int = 0,
         tick_bid: float = 1.10000,
         tick_ask: float = 1.10003,
+        # 2026-05-14 fix v6 — account-mode + active-positions surface.
+        positions_by_symbol: dict[str, tuple[Any, ...]] | None = None,
+        account_margin_mode: int = 0,  # 0 = retail_netting (the default)
     ) -> None:
         self._deal_by_ticket = deal_by_ticket or {}
         self._deals_by_position = deals_by_position or {}
@@ -864,6 +867,13 @@ class _MockMt5:
         self.server_time_offset_seconds = int(server_time_offset_seconds)
         self._tick_bid = float(tick_bid)
         self._tick_ask = float(tick_ask)
+        # 2026-05-14 fix v6 — hedging account surface. Tests configure
+        # ``positions_by_symbol`` to stage active positions; the path-0
+        # branch in ``_resolve_fill_from_deal`` calls
+        # ``self.positions_get(symbol=...)`` to look them up.
+        self._positions_by_symbol = positions_by_symbol or {}
+        self._account_margin_mode = int(account_margin_mode)
+        self.positions_get_calls: list[dict[str, Any]] = []
 
         if self._mode != "absent":
             # Bind the method only if the mode says it should exist.
@@ -884,6 +894,37 @@ class _MockMt5:
         if isinstance(date_param, datetime):
             return int(date_param.timestamp())
         return int(date_param)
+
+    def positions_get(self, symbol: str | None = None) -> tuple[Any, ...]:
+        """Return active positions for the given symbol (fix v6 path 0).
+
+        On hedging accounts each order creates its own position whose
+        ticket equals the order ticket; ``mt5.positions_get(symbol=...)``
+        is the canonical lookup path for the fill price during the brief
+        window between ``order_send`` returning and the round-trip
+        close. Tests stage positions via ``positions_by_symbol``; the
+        helper's path-0 branch matches by ``ticket == order_ticket``.
+        """
+        self.positions_get_calls.append({"symbol": symbol})
+        if symbol is None:
+            # Return every staged position across all symbols.
+            return tuple(p for ps in self._positions_by_symbol.values() for p in ps)
+        return tuple(self._positions_by_symbol.get(symbol, ()))
+
+    def account_info(self) -> SimpleNamespace:
+        """Return a mock account_info with the configured margin_mode.
+
+        2026-05-14 fix v6 — the helper branches on
+        ``account_info().margin_mode``. Tests inject the mode via
+        ``account_margin_mode`` on the mock; main() reads the field
+        once at session start and threads it into the helper as a
+        keyword arg.
+        """
+        return SimpleNamespace(
+            margin_mode=self._account_margin_mode,
+            server="FTMO-Demo-Mock",
+            login=1234567,
+        )
 
     def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
         """Return a tick whose ``time`` reflects the configured offset.
@@ -999,6 +1040,8 @@ def _make_mock_mt5(
     deal_type_buy: int = 0,
     deal_type_sell: int = 1,
     server_time_offset_seconds: int = 0,
+    positions_by_symbol: dict[str, tuple[Any, ...]] | None = None,
+    account_margin_mode: int = 0,
 ) -> _MockMt5:
     """Thin factory for :class:`_MockMt5` — preserves the call site shape."""
     return _MockMt5(
@@ -1010,6 +1053,8 @@ def _make_mock_mt5(
         deal_type_buy=deal_type_buy,
         deal_type_sell=deal_type_sell,
         server_time_offset_seconds=server_time_offset_seconds,
+        positions_by_symbol=positions_by_symbol,
+        account_margin_mode=account_margin_mode,
     )
 
 
@@ -1858,6 +1903,206 @@ def test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_mar
     assert "[record_fills:market_lookup_failure]" in captured.err
     assert "idx=2" in captured.err
     assert "symbol=EURUSD" in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_hedging_uses_positions_get(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Path 0 (fix v6, hedging accounts): positions_get returns the fill price.
+
+    On FTMO Free Trial (hedging) MT5 Python build 5.0.5735 leaves
+    ``OrderSendResult.deal == 0`` and ``.position == 0`` — only
+    ``.order`` is populated. Paths 1-3 are structurally inert in this
+    case (the v5 probe data showed all 11 probes returning 0 or
+    SKIPPED). Path 0 looks up the order ticket directly in the active
+    positions list, where the freshly-filled hedging position lives
+    briefly before the round-trip-close removes it.
+
+    This test stages exactly that scenario via the mock: hedging
+    margin_mode + an active position with ``ticket == result.order``
+    and a real ``price_open``. The helper must return ``(price_open,
+    fill_time_utc)`` from path 0 without ever consulting
+    history_deals_get.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    server_offset = 10800
+    # Stage one active hedging position whose ticket == result.order.
+    # ``price_open`` is the broker's actual fill price; ``time`` is
+    # server-time Unix (the broker convention path 0 must translate
+    # back to UTC, matching path-1/2/3's deal.time handling).
+    fill_price = 1.17089
+    fill_time_server_unix = int(request_time.timestamp()) + server_offset
+    position = SimpleNamespace(
+        ticket=449043873,
+        symbol="EURUSD",
+        price_open=fill_price,
+        time=fill_time_server_unix,
+        volume=0.01,
+        type=0,  # POSITION_TYPE_BUY
+    )
+    mock_mt5 = _make_mock_mt5(
+        # Empty history surface so we KNOW path 0 — not 1/2/3 — returned the price.
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (position,)},
+        server_time_offset_seconds=server_offset,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    # OSR matches the live v5 probe data: deal=0, position=0, order=N, retcode=10009.
+    result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=server_offset,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="market",
+            side="buy",
+            idx=2,
+        ),
+    )
+    assert price == fill_price, (
+        f"path 0 must return the position's price_open ({fill_price}); got {price!r}"
+    )
+    assert fill_time is not None
+    # deal.time was server-time Unix; the helper subtracts the offset
+    # to reconstruct UTC, matching path 1/2/3's convention.
+    assert fill_time == request_time, (
+        f"path 0 must reconstruct UTC fill_time from server-time deal.time minus offset; "
+        f"got {fill_time} vs expected {request_time}"
+    )
+    # The mock's positions_get was called with the correct symbol.
+    assert mock_mt5.positions_get_calls == [{"symbol": "EURUSD"}], (
+        f"path 0 must call positions_get(symbol='EURUSD'); got {mock_mt5.positions_get_calls}"
+    )
+    # No probe block fired — path 0 succeeded, so the market_lookup_failure
+    # diagnostic is not reached.
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_args_passed]" not in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_netting_does_not_engage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Path 0 must NOT run on netting accounts (back-compat with existing tests).
+
+    On netting accounts the existing paths 1-3 (history_deals_get by
+    ticket / position / date-range) are the correct lookup surface.
+    Path 0 (positions_get) must stay out of their way — otherwise an
+    aggregated-position record on a netting account could return the
+    wrong fill price (the netted position's price_open ≠ the new
+    order's actual fill price).
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    # Same position fixture as the hedging test — but ON A NETTING ACCOUNT.
+    position = SimpleNamespace(
+        ticket=449043873,
+        symbol="EURUSD",
+        price_open=1.17089,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (position,)},
+        server_time_offset_seconds=10800,
+        # Netting margin mode — the default; path 0 must skip.
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_NETTING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_NETTING,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="market",
+            side="buy",
+            idx=2,
+        ),
+    )
+    # Path 0 did NOT engage; paths 1-3 returned empty → soft-fail.
+    assert price is None
+    assert fill_time is None
+    # positions_get was never called on this netting flow.
+    assert mock_mt5.positions_get_calls == [], (
+        f"path 0 must not call positions_get on netting accounts; "
+        f"got {mock_mt5.positions_get_calls}"
+    )
+    # Probe block fires because paths 1-3 all returned empty.
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_args_passed]" in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_falls_through_on_no_match(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Path 0 falls through to paths 1-3 when no position ticket matches.
+
+    A hedging-account session where positions_get returns positions for
+    other concurrent orders but NOT the one we just sent (e.g., the
+    matching position hasn't been registered yet, or the order ticket
+    differs from the position ticket somehow). Path 0 walks the list
+    looking for ``ticket == order_ticket`` and falls through if no
+    match. The helper then tries paths 1-3 as a safety net.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    # Position fixture for a DIFFERENT order — ticket doesn't match.
+    unrelated_position = SimpleNamespace(
+        ticket=999999999,  # ≠ our order ticket
+        symbol="EURUSD",
+        price_open=1.17089,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (unrelated_position,)},
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="market",
+            side="buy",
+            idx=2,
+        ),
+    )
+    # Path 0 didn't match; paths 1-3 also empty; soft-fail.
+    assert price is None
+    assert fill_time is None
+    # Path 0 was tried (positions_get called) but found no match.
+    assert mock_mt5.positions_get_calls == [{"symbol": "EURUSD"}]
+    # Probe block fires because paths 1-3 all returned empty.
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_args_passed]" in captured.err
 
 
 def test_resolve_fill_from_deal_emits_probes_when_called_directly_on_market_failure(
