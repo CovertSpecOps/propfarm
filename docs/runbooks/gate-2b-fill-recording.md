@@ -689,7 +689,7 @@ re-check the doc reading).
 
 ### Cross-links
 
-* Fix v3 commit: `<TBD>` (this commit).
+* Fix v3 commit: `1fa8013` (this commit).
 * Failed short-test session: run_id `ef34a234bf1649418d3735c3b930ca8c`
   (no parquet flushed; stdout transcript only).
 * Playbook addendum: STATUS.md "Pathological-vendor-response catch
