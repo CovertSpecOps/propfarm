@@ -328,6 +328,40 @@ HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS: Final[int] = 5
 #: continued; the reviewer follow-up promoted it to hard-fail).
 SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS: Final[int] = 12 * 3600
 
+#: 2026-05-14 fix v4 (diagnostic-only) — emit a structured probe block when
+#: a ``market_lookup_failure`` is about to fire so the operator can capture
+#: which ``history_deals_get`` call form the live broker actually accepts.
+#: After three speculative fixes (v1 = result.price=0, v2 = history_select
+#: precondition, v3 = server-time offset) all "passed mocks" but failed the
+#: live broker, the right move is instrumentation that produces concrete
+#: evidence rather than another guess.
+#:
+#: Each market_lookup_failure path-3-returned-empty triggers SIX stderr
+#: lines BEFORE the existing ``[record_fills:market_lookup_failure]`` log:
+#:
+#: * ``[record_fills:lookup_probe_args_passed]`` — the actual int kwargs
+#:   that path 3 just passed (server-time + UTC variants + offset).
+#: * ``[record_fills:lookup_probe_a]`` — int_kwargs_server (re-runs the
+#:   exact same call that just failed; sanity check, should also be 0).
+#: * ``[record_fills:lookup_probe_b]`` — datetime_naive_server (naive
+#:   datetime carries server-local time, since the int was server-time-Unix).
+#: * ``[record_fills:lookup_probe_c]`` — datetime_utc_aware (UTC-aware
+#:   datetimes; what the v2 datetime-only call form passed).
+#: * ``[record_fills:lookup_probe_d]`` — int_kwargs_utc (the v2 ints in
+#:   UTC Unix seconds; reproduces the v2 bug condition).
+#: * ``[record_fills:lookup_probe_e]`` — int_kwargs_server_widewindow
+#:   (same as probe_a but ±24h; isolates "call form wrong" from "window
+#:   too narrow").
+#: * ``[record_fills:lookup_probe_f]`` — datetime_naive_server_widewindow
+#:   (same as probe_b but ±24h; determines whether the datetime form
+#:   works at all on the live broker).
+#:
+#: Default ``True`` for the diagnostic capture pass; flip to ``False``
+#: once fix v4 lands and the production call form is settled. Unit tests
+#: flip to ``False`` to suppress probe noise where it would otherwise
+#: dominate the captured stderr.
+EMIT_MARKET_LOOKUP_FAILURE_PROBES: Final[bool] = True
+
 # Session anchor minutes-of-day in UTC. London 07:00, NY am 12:00 (DST safety
 # captured in distribution; we keep a single canonical UTC anchor since FX
 # trades 24/5 and the session-open spread spike is what we care about), NY pm
@@ -931,6 +965,18 @@ _LOG_PREFIX_SERVER_TIME_OFFSET: Final[str] = "[record_fills:server_time_offset_s
 _LOG_PREFIX_NON_HOURLY_SERVER_OFFSET: Final[str] = (
     "[record_fills:non_hourly_server_offset_detected]"
 )
+#: 2026-05-14 fix v4 (diagnostic-only) — emitted BEFORE market_lookup_failure
+#: so the operator can paste back the probe block to the user. The
+#: ``args_passed`` line names what path 3 just passed; the probe_{a..f}
+#: lines re-issue ``history_deals_get`` with different call forms so the
+#: non-zero ``returned=K`` count tells us which form the live broker accepts.
+_LOG_PREFIX_LOOKUP_PROBE_ARGS_PASSED: Final[str] = "[record_fills:lookup_probe_args_passed]"
+_LOG_PREFIX_LOOKUP_PROBE_A: Final[str] = "[record_fills:lookup_probe_a]"
+_LOG_PREFIX_LOOKUP_PROBE_B: Final[str] = "[record_fills:lookup_probe_b]"
+_LOG_PREFIX_LOOKUP_PROBE_C: Final[str] = "[record_fills:lookup_probe_c]"
+_LOG_PREFIX_LOOKUP_PROBE_D: Final[str] = "[record_fills:lookup_probe_d]"
+_LOG_PREFIX_LOOKUP_PROBE_E: Final[str] = "[record_fills:lookup_probe_e]"
+_LOG_PREFIX_LOOKUP_PROBE_F: Final[str] = "[record_fills:lookup_probe_f]"
 
 
 def detect_server_time_offset_seconds(
@@ -1475,6 +1521,205 @@ def emit_market_lookup_failure_log(
     )
 
 
+def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
+    mt5: Any,
+    *,
+    request_time_utc: datetime,
+    now_utc: datetime,
+    server_time_offset_seconds: int,
+) -> None:
+    """Emit a structured probe block for a market_lookup_failure event.
+
+    2026-05-14 fix v4 — DIAGNOSTIC-ONLY. After three speculative fixes
+    (v1 = result.price=0, v2 = history_select precondition, v3 =
+    server-time offset) all "passed mocks" and failed the live broker,
+    this function re-issues ``mt5.history_deals_get`` with six different
+    call forms so the operator can see — by reading the ``returned=K``
+    counts on stderr — which form the live broker actually accepts.
+
+    The six probes (one args line + six call probes) are emitted in
+    a fixed order BEFORE the existing
+    ``[record_fills:market_lookup_failure]`` log so they appear together
+    in stderr and the operator can paste them back as a block. Each
+    probe is wrapped in its own ``try / except`` so a single failing
+    probe never suppresses the other five.
+
+    Probe definitions
+    -----------------
+
+    * **probe_a** ``int_kwargs_server`` — re-issues the SAME call that
+      just failed (server-time int Unix). Sanity check: should also be 0.
+    * **probe_b** ``datetime_naive_server`` — naive datetimes carrying
+      server-local time. MT5's MQL5 heritage may require this form.
+    * **probe_c** ``datetime_utc_aware`` — UTC-aware datetimes (the v2
+      datetime-only call form).
+    * **probe_d** ``int_kwargs_utc`` — ints in UTC Unix seconds (the
+      v2 bug condition; should still be empty).
+    * **probe_e** ``int_kwargs_server_widewindow`` — same as probe_a
+      but ±24h. If this returns > 0, the issue is the narrow ±6s
+      window; if it returns 0, the call form is wrong.
+    * **probe_f** ``datetime_naive_server_widewindow`` — same as
+      probe_b but ±24h. Determines whether the datetime form works at
+      all on the live broker.
+
+    Parameters
+    ----------
+    mt5
+        The imported ``MetaTrader5`` module (or a mock in tests). Only
+        ``mt5.history_deals_get`` is called.
+    request_time_utc
+        The UTC datetime captured just before ``mt5.order_send``.
+    now_utc
+        The UTC datetime snapshotted at the time of the failure (used
+        as the right edge of the lookup window, matching path 3's
+        ``max(now_utc, request_time_utc)`` rule).
+    server_time_offset_seconds
+        The detected MT5 server-time offset (per fix v3). Applied to
+        the server-time probe variants and the args_passed line.
+
+    Notes
+    -----
+    Gated by the module-level toggle :data:`EMIT_MARKET_LOOKUP_FAILURE_PROBES`.
+    Callers MUST check the toggle before invoking this function; the
+    helper itself does NOT gate so the test surface stays simple.
+    The caller in ``main()`` is the gate; tests can either flip the
+    toggle (see ``EMIT_MARKET_LOOKUP_FAILURE_PROBES = False`` cases)
+    or invoke this function directly with ``True``-default behavior.
+    """
+    # Reproduce the exact int args path 3 just passed.
+    date_from_unix_server = (
+        int(request_time_utc.timestamp())
+        - HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS
+        + int(server_time_offset_seconds)
+    )
+    date_to_unix_server = (
+        int(max(now_utc, request_time_utc).timestamp())
+        + HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS
+        + int(server_time_offset_seconds)
+    )
+
+    # The UTC-Unix-int counterparts (subtract the offset back out so
+    # the operator can sanity-check that the path-3 ints were the
+    # server-time variants, not silently UTC).
+    date_from_unix_utc = date_from_unix_server - int(server_time_offset_seconds)
+    date_to_unix_utc = date_to_unix_server - int(server_time_offset_seconds)
+
+    # Args-passed line: names the EXACT ints path 3 used, so the operator
+    # can verify they match the server-time + UTC variants documented
+    # in the dispatch brief.
+    print(
+        f"{_LOG_PREFIX_LOOKUP_PROBE_ARGS_PASSED} int_kwargs "
+        f"window_server_unix=[{date_from_unix_server},{date_to_unix_server}] "
+        f"window_utc_unix=[{date_from_unix_utc},{date_to_unix_utc}] "
+        f"offset_seconds={int(server_time_offset_seconds)}",
+        file=sys.stderr,
+    )
+
+    def _run_probe(prefix: str, label: str, kwargs_repr: str, call: Any) -> None:
+        """Run one probe call; log ``returned=K`` or ``returned=ERROR`` on exception.
+
+        The ``try/except Exception`` is intentionally broad — we do not
+        want one probe's failure to suppress the other five. A typical
+        failure shape on the live broker would be a ``TypeError`` from
+        a build that rejects one of the date-param overloads (e.g.
+        positional vs keyword), or a build-specific quirk.
+        """
+        try:
+            res = call()
+            count = len(res) if res is not None else 0
+            print(
+                f"{prefix} {label} {kwargs_repr} returned={count}",
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(
+                f"{prefix} {label} {kwargs_repr} "
+                f"returned=ERROR exc_type={type(exc).__name__} exc_msg={exc!r}",
+                file=sys.stderr,
+            )
+
+    # ±24h widening for probes e + f. ``86400 = 24 * 3600`` — chosen so
+    # the probe answers "is the window itself too narrow?" independent
+    # of "is the call form wrong?".
+    wide_pad = 86400
+
+    # probe_a — int_kwargs_server (the same call that just failed).
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_A,
+        "int_kwargs_server",
+        f"window=[{date_from_unix_server},{date_to_unix_server}]",
+        lambda: mt5.history_deals_get(
+            date_from=date_from_unix_server,
+            date_to=date_to_unix_server,
+        ),
+    )
+
+    # probe_b — datetime_naive_server (naive datetime carrying server-time).
+    df_naive_server = datetime.fromtimestamp(date_from_unix_server)
+    dt_naive_server = datetime.fromtimestamp(date_to_unix_server)
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_B,
+        "datetime_naive_server",
+        f"window=[{df_naive_server.isoformat()},{dt_naive_server.isoformat()}]",
+        lambda: mt5.history_deals_get(
+            date_from=df_naive_server,
+            date_to=dt_naive_server,
+        ),
+    )
+
+    # probe_c — datetime_utc_aware (the v2 datetime-only call form).
+    df_utc_aware = request_time_utc - timedelta(seconds=HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS)
+    dt_utc_aware = max(now_utc, request_time_utc) + timedelta(
+        seconds=HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS
+    )
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_C,
+        "datetime_utc_aware",
+        f"window=[{df_utc_aware.isoformat()},{dt_utc_aware.isoformat()}]",
+        lambda: mt5.history_deals_get(
+            date_from=df_utc_aware,
+            date_to=dt_utc_aware,
+        ),
+    )
+
+    # probe_d — int_kwargs_utc (the v2 bug condition; should still be empty).
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_D,
+        "int_kwargs_utc",
+        f"window=[{date_from_unix_utc},{date_to_unix_utc}]",
+        lambda: mt5.history_deals_get(
+            date_from=date_from_unix_utc,
+            date_to=date_to_unix_utc,
+        ),
+    )
+
+    # probe_e — int_kwargs_server_widewindow (probe_a ±24h).
+    wide_from_server = date_from_unix_server - wide_pad
+    wide_to_server = date_to_unix_server + wide_pad
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_E,
+        "int_kwargs_server_widewindow",
+        f"window=[{wide_from_server},{wide_to_server}]",
+        lambda: mt5.history_deals_get(
+            date_from=wide_from_server,
+            date_to=wide_to_server,
+        ),
+    )
+
+    # probe_f — datetime_naive_server_widewindow (probe_b ±24h).
+    wide_df_naive = datetime.fromtimestamp(wide_from_server)
+    wide_dt_naive = datetime.fromtimestamp(wide_to_server)
+    _run_probe(
+        _LOG_PREFIX_LOOKUP_PROBE_F,
+        "datetime_naive_server_widewindow",
+        f"window=[{wide_df_naive.isoformat()},{wide_dt_naive.isoformat()}]",
+        lambda: mt5.history_deals_get(
+            date_from=wide_df_naive,
+            date_to=wide_dt_naive,
+        ),
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Parquet / manifest IO. Importable from tests, no MT5 dependency.
 # --------------------------------------------------------------------------- #
@@ -1842,10 +2087,23 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                     and actual_fill_price is None
                 ):
                     n_market_lookup_failures += 1
+                    _now_at_failure = datetime.now(tz=UTC)
                     _window_from = request_time - HISTORY_LOOKUP_WINDOW_PAD_BEFORE
                     _window_to = (
-                        max(datetime.now(tz=UTC), request_time) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
+                        max(_now_at_failure, request_time) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
                     )
+                    # 2026-05-14 fix v4 (diagnostic-only) — emit the six
+                    # probe lines BEFORE the loud market_lookup_failure
+                    # log so they appear together in stderr and the
+                    # operator can paste them back as a block. Gated on
+                    # the module-level toggle so tests can disable it.
+                    if EMIT_MARKET_LOOKUP_FAILURE_PROBES:
+                        emit_market_lookup_failure_probes(
+                            mt5,
+                            request_time_utc=request_time,
+                            now_utc=_now_at_failure,
+                            server_time_offset_seconds=server_time_offset_seconds,
+                        )
                     emit_market_lookup_failure_log(
                         idx=idx,
                         symbol=symbol,

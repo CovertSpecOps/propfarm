@@ -2327,3 +2327,409 @@ def test_main_except_clauses_match_documented_crash_hardening_contract() -> None
     assert "Exception" in type_names, (
         "main() has no `except Exception` handler — per-iteration crash-hardening regressed"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Fix v4 (DIAGNOSTIC-ONLY) — market_lookup_failure probe block. The probes
+# do NOT change the production call form; they re-issue history_deals_get
+# with six different call forms so the operator can capture which one the
+# live broker actually accepts. The user pastes the probe block back; fix
+# v4 will switch the production call form to the one that returned > 0.
+# --------------------------------------------------------------------------- #
+class _ProbeMockMt5:
+    """Minimal MT5 mock that records every ``history_deals_get`` call.
+
+    Used to verify that the probe block emits exactly six call forms in
+    the documented order. The returned tuple length is the
+    ``returned=K`` count the probe logs to stderr; setting it per-call
+    lets a test simulate "probe_e returns 1; the others return 0" and
+    confirm that we'd see the load-bearing evidence in stderr.
+
+    A list of ``Exception`` instances may be supplied via ``raise_for``
+    to simulate per-probe failures — the probe block must continue past
+    a single failing probe and emit the remaining lines.
+    """
+
+    def __init__(
+        self,
+        *,
+        return_counts: dict[str, int] | None = None,
+        raise_for: dict[str, Exception] | None = None,
+    ) -> None:
+        self._return_counts = return_counts or {}
+        self._raise_for = raise_for or {}
+        self.calls: list[dict[str, Any]] = []
+
+    def history_deals_get(
+        self,
+        ticket: int | None = None,
+        position: int | None = None,
+        date_from: Any | None = None,
+        date_to: Any | None = None,
+        group: str | None = None,
+    ) -> tuple[Any, ...]:
+        # Classify the call shape by inspecting date_from's Python type
+        # and tz-awareness so the mock can stage the right return per
+        # probe without needing to track call order.
+        if date_from is None:
+            return ()
+        if isinstance(date_from, datetime):
+            shape = "datetime_naive" if date_from.tzinfo is None else "datetime_aware"
+        else:
+            shape = "int"
+        self.calls.append(
+            {
+                "date_from": date_from,
+                "date_to": date_to,
+                "shape": shape,
+            }
+        )
+        # Key the mock's return / raise behavior on date_from's repr +
+        # shape so a test can stage different counts for, say, narrow
+        # vs wide windows of the same shape.
+        key = f"{shape}:{date_from!r}"
+        if key in self._raise_for:
+            raise self._raise_for[key]
+        # Shape-level default for tests that don't need per-call control.
+        if shape in self._raise_for:
+            raise self._raise_for[shape]
+        count = self._return_counts.get(key, self._return_counts.get(shape, 0))
+        return tuple(SimpleNamespace(ticket=i) for i in range(count))
+
+
+def test_emit_market_lookup_failure_probes_emits_six_lines_plus_args(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Probe block emits 1 args-passed line + 6 probe lines on a failure."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, 809311, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 18, 56, 35, 0, tzinfo=UTC)
+    mock_mt5 = _ProbeMockMt5(return_counts={})  # all probes return 0
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+    )
+    captured = capsys.readouterr()
+    # The 1 args line + 6 probe lines.
+    assert "[record_fills:lookup_probe_args_passed]" in captured.err
+    assert "[record_fills:lookup_probe_a]" in captured.err
+    assert "[record_fills:lookup_probe_b]" in captured.err
+    assert "[record_fills:lookup_probe_c]" in captured.err
+    assert "[record_fills:lookup_probe_d]" in captured.err
+    assert "[record_fills:lookup_probe_e]" in captured.err
+    assert "[record_fills:lookup_probe_f]" in captured.err
+    # All probes returned 0 — the count is what the broker actually
+    # returns on the live VPS; the test confirms the format.
+    assert captured.err.count("returned=0") == 6
+    # The args-passed line names the int windows + offset.
+    assert "offset_seconds=10800" in captured.err
+    assert "window_server_unix=" in captured.err
+    assert "window_utc_unix=" in captured.err
+    # Documented call labels (the operator greps for these).
+    assert "int_kwargs_server" in captured.err
+    assert "datetime_naive_server" in captured.err
+    assert "datetime_utc_aware" in captured.err
+    assert "int_kwargs_utc" in captured.err
+    assert "int_kwargs_server_widewindow" in captured.err
+    assert "datetime_naive_server_widewindow" in captured.err
+
+
+def test_emit_market_lookup_failure_probes_logs_args_match_path_3_call_form() -> None:
+    """The args_passed line names the EXACT ints path 3 just passed.
+
+    Computes the expected ints from the same formula path 3 uses
+    (``int(request_time_utc.timestamp()) - 1 + offset``) and asserts
+    the logged values match — so the probe block can't silently drift
+    away from path 3's actual call.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, 809311, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 18, 56, 36, 976748, tzinfo=UTC)
+    offset = 10800
+    # Re-derive what path 3 would pass (must match record_fills.py constants).
+    df_server = int(request_time.timestamp()) - 1 + offset
+    dt_server = int(max(now, request_time).timestamp()) + 5 + offset
+    df_utc = df_server - offset
+    dt_utc = dt_server - offset
+
+    mock_mt5 = _ProbeMockMt5()
+    import io
+
+    buf = io.StringIO()
+    import sys as _sys
+
+    saved = _sys.stderr
+    _sys.stderr = buf
+    try:
+        rf.emit_market_lookup_failure_probes(
+            mock_mt5,
+            request_time_utc=request_time,
+            now_utc=now,
+            server_time_offset_seconds=offset,
+        )
+    finally:
+        _sys.stderr = saved
+    text = buf.getvalue()
+
+    assert f"window_server_unix=[{df_server},{dt_server}]" in text
+    assert f"window_utc_unix=[{df_utc},{dt_utc}]" in text
+
+
+def test_emit_market_lookup_failure_probes_continues_past_per_probe_exception(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """One probe raising must not suppress the other five — try/except per probe.
+
+    The contract: each probe's call is wrapped in a try/except Exception,
+    and an exception logs ``returned=ERROR exc_type=<T> exc_msg=<repr>``
+    on its own line. Five remaining probes still log their counts.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 12, 0, 5, tzinfo=UTC)
+    # Stage probe_a (int_kwargs_server shape) to raise; the others stay
+    # silent (return 0).
+    mock_mt5 = _ProbeMockMt5(
+        return_counts={"int": 0, "datetime_naive": 0, "datetime_aware": 0},
+        raise_for={"int": RuntimeError("simulated broker quirk")},
+    )
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+    )
+    captured = capsys.readouterr()
+    # The args line still fires.
+    assert "[record_fills:lookup_probe_args_passed]" in captured.err
+    # probe_a raised; probe_b through probe_f still emitted.
+    assert "returned=ERROR" in captured.err
+    assert "exc_type=RuntimeError" in captured.err
+    assert "simulated broker quirk" in captured.err
+    # All six probe-prefix lines must appear, regardless of whether
+    # they raised or returned a count.
+    for pfx in (
+        "[record_fills:lookup_probe_a]",
+        "[record_fills:lookup_probe_b]",
+        "[record_fills:lookup_probe_c]",
+        "[record_fills:lookup_probe_d]",
+        "[record_fills:lookup_probe_e]",
+        "[record_fills:lookup_probe_f]",
+    ):
+        assert pfx in captured.err, f"missing probe line: {pfx}"
+
+
+def test_emit_market_lookup_failure_probes_widewindow_distinguishes_form_from_window() -> None:
+    """probe_e + probe_f use ±24h windows so the operator can isolate
+    "call form wrong" from "window too narrow".
+
+    If probe_a (narrow server-time int) returns 0 and probe_e (wide
+    server-time int) returns > 0, the bug is the window, not the call
+    form. If both return 0, the call form is wrong. The test pins the
+    ±86400-second widening by reading back the windows logged on
+    stderr against the path-3 ints.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 12, 0, 5, tzinfo=UTC)
+    offset = 10800
+    # Path 3's actual ints.
+    df_server = int(request_time.timestamp()) - 1 + offset
+    dt_server = int(max(now, request_time).timestamp()) + 5 + offset
+    mock_mt5 = _ProbeMockMt5()
+    import io
+    import sys as _sys
+
+    buf = io.StringIO()
+    saved = _sys.stderr
+    _sys.stderr = buf
+    try:
+        rf.emit_market_lookup_failure_probes(
+            mock_mt5,
+            request_time_utc=request_time,
+            now_utc=now,
+            server_time_offset_seconds=offset,
+        )
+    finally:
+        _sys.stderr = saved
+    text = buf.getvalue()
+    # probe_a uses the narrow server-time window.
+    assert f"int_kwargs_server window=[{df_server},{dt_server}]" in text
+    # probe_e uses the same window widened by ±86400 (24h).
+    assert f"int_kwargs_server_widewindow window=[{df_server - 86400},{dt_server + 86400}]" in text
+
+
+def test_main_does_not_emit_probes_when_order_type_not_market(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Probe block does NOT fire when order_type != "market".
+
+    The probe block is gated inside the SAME ``if order_type == "market"
+    and retcode == success_retcode and actual_fill_price is None`` branch
+    that fires ``emit_market_lookup_failure_log``. A limit / stop pending
+    order with no fill is expected (no deal exists yet); emitting a
+    six-line probe block on every pending order would drown stderr.
+
+    Verified at the call-site level: a direct call to the probe helper
+    fires on any input (the helper is unconditional). The gating logic
+    sits in main(). This test pins the gating contract — if a future
+    refactor moves the helper inside an unconditional branch, the gating
+    logic at the AST level would visibly regress.
+    """
+    import ast
+
+    script_path = _SCRIPT_PATH
+    tree = ast.parse(script_path.read_text())
+    main_fn = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main"),
+        None,
+    )
+    assert main_fn is not None
+
+    # Find the call to emit_market_lookup_failure_probes inside main().
+    probe_calls: list[ast.Call] = []
+    for node in ast.walk(main_fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "emit_market_lookup_failure_probes"
+        ):
+            probe_calls.append(node)
+    assert len(probe_calls) == 1, (
+        "expected exactly one call to emit_market_lookup_failure_probes in main(); "
+        f"found {len(probe_calls)}"
+    )
+    # Walk up the AST to find the enclosing ``If`` and verify its test
+    # contains an ``order_type == "market"`` comparison.
+    probe_call = probe_calls[0]
+    enclosing_if: ast.If | None = None
+    for if_node in ast.walk(main_fn):
+        if not isinstance(if_node, ast.If):
+            continue
+        for desc in ast.walk(if_node):
+            if desc is probe_call:
+                enclosing_if = if_node
+                break
+        if enclosing_if is not None:
+            break
+    assert enclosing_if is not None, (
+        "emit_market_lookup_failure_probes call has no enclosing `if` — "
+        "the probe block would fire on every order, not just market failures"
+    )
+    # The test must literally compare order_type to "market".
+    test_src = ast.unparse(enclosing_if.test)
+    assert 'order_type == "market"' in test_src or "order_type == 'market'" in test_src, (
+        "the `if` guarding the probe call must include `order_type == 'market'`; "
+        f"got test: {test_src}"
+    )
+    # Silence the captured stream (the AST test never wrote anything).
+    _ = capsys.readouterr()
+
+
+def test_main_probe_call_is_gated_on_emit_toggle() -> None:
+    """The probe call in main() must be guarded by the module toggle.
+
+    Tests can set ``EMIT_MARKET_LOOKUP_FAILURE_PROBES = False`` to
+    suppress probe noise; the production capture pass sets it to
+    ``True`` (default). The gating must be at the call site, not
+    inside the helper — keeping the helper unconditional makes the
+    unit tests above straightforward.
+    """
+    import ast
+
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    main_fn = next(
+        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main"),
+        None,
+    )
+    assert main_fn is not None
+
+    probe_calls: list[ast.Call] = []
+    for node in ast.walk(main_fn):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "emit_market_lookup_failure_probes"
+        ):
+            probe_calls.append(node)
+    assert probe_calls, "no emit_market_lookup_failure_probes call in main()"
+
+    # Walk all `If` nodes and find the innermost one enclosing the call.
+    probe_call = probe_calls[0]
+    enclosing_ifs: list[ast.If] = []
+    for if_node in ast.walk(main_fn):
+        if not isinstance(if_node, ast.If):
+            continue
+        for desc in ast.walk(if_node):
+            if desc is probe_call:
+                enclosing_ifs.append(if_node)
+                break
+    assert enclosing_ifs, "no enclosing `if` for the probe call"
+    # Check that AT LEAST ONE enclosing `if` references the toggle by name.
+    toggle_seen = False
+    for if_node in enclosing_ifs:
+        for desc in ast.walk(if_node.test):
+            if isinstance(desc, ast.Name) and desc.id == "EMIT_MARKET_LOOKUP_FAILURE_PROBES":
+                toggle_seen = True
+                break
+        if toggle_seen:
+            break
+    assert toggle_seen, (
+        "probe call must be gated on `EMIT_MARKET_LOOKUP_FAILURE_PROBES`; "
+        "no `if` in the enclosing stack references the toggle"
+    )
+
+
+def test_emit_market_lookup_failure_probes_toggle_default_is_true() -> None:
+    """The diagnostic toggle defaults to True for the fix-v4 capture pass.
+
+    Once fix v4 lands (the production call form switches to the one
+    the live broker accepts), this default flips back to False so the
+    six-line probe block doesn't dominate a normal 24h capture's
+    stderr. The default is the operational contract — pin it.
+    """
+    rf = _load_module()
+    assert rf.EMIT_MARKET_LOOKUP_FAILURE_PROBES is True
+
+
+def test_emit_market_lookup_failure_probes_returns_count_when_call_returns_nonzero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """If a probe returns a non-empty tuple, the count is logged verbatim.
+
+    The load-bearing assertion of this whole instrumentation pass:
+    when the live broker returns > 0 deals for some probe form, the
+    operator must see ``returned=K`` in stderr so they can paste it
+    back. The user reads the non-zero count and we now know which
+    call form to switch to in fix v4.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 12, 0, 5, tzinfo=UTC)
+    # Stage the datetime_naive shape to return 3 deals — i.e. simulate
+    # the live broker accepting the datetime form.
+    mock_mt5 = _ProbeMockMt5(
+        return_counts={
+            "int": 0,
+            "datetime_naive": 3,
+            "datetime_aware": 0,
+        }
+    )
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+    )
+    captured = capsys.readouterr()
+    # probe_b is the narrow datetime_naive shape, probe_f is the wide
+    # datetime_naive shape — both should report `returned=3`.
+    assert "datetime_naive_server " in captured.err
+    assert "datetime_naive_server_widewindow " in captured.err
+    # The count of "returned=3" lines should be exactly 2 (probe_b + probe_f).
+    assert captured.err.count("returned=3") == 2
+    # The int and datetime_aware probes still report returned=0.
+    assert "int_kwargs_server " in captured.err
+    assert "int_kwargs_utc" in captured.err

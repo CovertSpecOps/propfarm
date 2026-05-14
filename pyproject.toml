@@ -42,6 +42,7 @@ addopts = "-q --strict-markers --cov=src/propfarm --cov-report=term-missing -m '
 testpaths = ["tests"]
 markers = [
   "integration: live-network or external-resource tests; skipped by default (run with `pytest -m integration`).",
+  "live_broker_validation: live FTMO MT5 demo broker tests; gated on PROPFARM_LIVE_TEST=1 (run on the Windows VPS only — MT5 Python pkg is Windows-only).",
 ]
 
 [tool.setuptools.packages.find]

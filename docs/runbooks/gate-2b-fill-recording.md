@@ -727,3 +727,148 @@ re-check the doc reading).
 * Playbook addendum: STATUS.md "Pathological-vendor-response catch
   pattern → 2026-05-14 addendum #3" — three cumulative learnings
   verbatim.
+
+## 2026-05-14 fix-up #4 — diagnostic probe pass (NOT a fix)
+
+The fix-v3 short-test capture (2026-05-14, run_id discarded — user
+Ctrl-C'd before any flush) **still triggered**
+`[record_fills:market_lookup_failure]` on every market row, despite
+the server-time offset detection working perfectly
+(`[record_fills:server_time_offset_seconds=10800] server_tz_offset_hours=+3`,
+correct for FTMO EEST). The integer args path 3 passed to
+`history_deals_get(date_from=int, date_to=int)` decode back to server
+wall-clock `21:56:30..21:56:36` — the same window the MT5 History tab
+shows the deal lives in (server-time `21:56:31.976`). The math is
+correct; the broker returns empty anyway. **This is a fourth API
+contract gotcha** after v1 (`result.price=0`), v2 (`history_select`
+precondition), and v3 (server-time semantics).
+
+### Why we are NOT shipping another speculative fix
+
+Three speculative fixes in a row all "passed mocks" and failed the
+live broker. The strategic learning is that the mock contract has
+not been independently verified against the real MT5 API for
+`history_deals_get` / `history_select`. **The right move is
+instrumentation that produces concrete evidence**, not another guess.
+
+The reviewer playbook adds a new entry on this cycle: *"If a
+fix-cycle has hit the same class of bug ≥ 2 times, halt speculative
+fixing and add instrumentation to gather live-broker evidence before
+the next attempt."* See `STATUS.md` "Pathological-vendor-response
+catch pattern → 2026-05-14 addendum #4."
+
+### What this fix-up changes
+
+* `scripts/record_fills.py` gains
+  `emit_market_lookup_failure_probes(...)` plus a module-level
+  toggle `EMIT_MARKET_LOOKUP_FAILURE_PROBES: Final[bool] = True`
+  (default ON for this diagnostic pass; flip to `False` once fix v4
+  lands).
+* `main()` invokes the probe block BEFORE
+  `emit_market_lookup_failure_log` on every market_lookup_failure
+  event. The probe block re-issues `history_deals_get` six different
+  ways and logs each return count to stderr; whichever form returns
+  `> 0` tells us how the live broker wants to be called.
+* The production call form (path 3 in `_resolve_fill_from_deal`) is
+  **UNCHANGED**. This pass is GATHER, not ACT.
+* `tests/scripts/test_live_broker_validation.py` ships the
+  Task-#53 live-broker test (gated on `PROPFARM_LIVE_TEST=1`; refuses
+  to run unless `mt5.account_info().server` starts with `FTMO-Demo`).
+  The marker `live_broker_validation` is registered in
+  `pyproject.toml`.
+
+### Stderr probe block (operator grep cheat sheet)
+
+When a market_lookup_failure fires, the operator sees this block on
+stderr **before** the existing `[record_fills:market_lookup_failure]`
+line:
+
+```
+[record_fills:lookup_probe_args_passed] int_kwargs window_server_unix=[N,M] window_utc_unix=[N-offset,M-offset] offset_seconds=S
+[record_fills:lookup_probe_a] int_kwargs_server window=[N,M] returned=K
+[record_fills:lookup_probe_b] datetime_naive_server window=[<iso>,<iso>] returned=K
+[record_fills:lookup_probe_c] datetime_utc_aware window=[<iso>,<iso>] returned=K
+[record_fills:lookup_probe_d] int_kwargs_utc window=[N-offset,M-offset] returned=K
+[record_fills:lookup_probe_e] int_kwargs_server_widewindow window=[N-86400,M+86400] returned=K
+[record_fills:lookup_probe_f] datetime_naive_server_widewindow window=[<iso>,<iso>] returned=K
+[record_fills:market_lookup_failure] idx=N symbol=S order=M side=D request_time=T window=[F,T]
+```
+
+| Prefix | What it tests | Expected on live broker |
+|---|---|---|
+| `[record_fills:lookup_probe_args_passed]` | Sanity-prints the EXACT int args path 3 used + offset, so the operator can confirm the values match path 3's actual call. | Always present. |
+| `[record_fills:lookup_probe_a]` (`int_kwargs_server`) | Re-issues the SAME call that just failed. | Should match path 3's behavior (returned=0). |
+| `[record_fills:lookup_probe_b]` (`datetime_naive_server`) | Naive datetimes carrying server-local time. MT5's MQL5 heritage may require this form. | **If `returned > 0`, this is the form fix v4 should switch to.** |
+| `[record_fills:lookup_probe_c]` (`datetime_utc_aware`) | UTC-aware datetimes (the v2 call form). | Likely 0 (this is what v2 did). |
+| `[record_fills:lookup_probe_d]` (`int_kwargs_utc`) | Ints in UTC Unix seconds (the v2 bug condition). | Should be 0. |
+| `[record_fills:lookup_probe_e]` (`int_kwargs_server_widewindow`) | Same as probe_a but ±24h. | **If `returned > 0`, the bug is the narrow ±6s window, not the call form.** |
+| `[record_fills:lookup_probe_f]` (`datetime_naive_server_widewindow`) | Same as probe_b but ±24h. | Tells us whether the datetime form works at all. |
+
+A probe call that raises an exception logs
+`returned=ERROR exc_type=<T> exc_msg=<repr>` on its own line; the
+remaining five probes still log their counts (per-probe `try/except`).
+
+### Updated short-test gate
+
+After re-running the short test
+(`python scripts/record_fills.py --duration-hours 1 --n-samples 10`),
+the user must paste back **FOUR** items now (the fourth is the new
+probe block):
+
+1. The full `[record_fills:server_time_offset_seconds=N]` line from
+   stderr.
+2. The first 5 **non-zero** `fill_price` values from
+   `data/raw/fill_recordings/{run_id}.parquet`.
+3. The `n_market_lookup_failures` value from the sibling JSON
+   manifest. **Expected `> 0`** for this diagnostic pass (the
+   probe block fires when this counter increments).
+4. **The full probe block** (one
+   `[record_fills:lookup_probe_args_passed]` line + the six
+   `[record_fills:lookup_probe_*]` lines + the immediately-following
+   `[record_fills:market_lookup_failure]` line) from stderr.
+
+The probe block is the load-bearing diagnostic. Whichever probe's
+`returned=K` is greater than zero tells us which `history_deals_get`
+call form the live broker accepts. Fix v4 will switch the production
+call form to that one.
+
+### Live-broker validation test (Task #53)
+
+The companion deliverable: a pytest-marked test that runs against the
+real FTMO MT5 demo on the Windows VPS. **Invocation**:
+
+```
+PROPFARM_LIVE_TEST=1 pytest tests/scripts/test_live_broker_validation.py
+```
+
+The test:
+
+* Refuses to run unless `PROPFARM_LIVE_TEST=1` (skipped by default).
+* Refuses to run unless `mt5.account_info().server` starts with
+  `FTMO-Demo` (matches the production safety guard).
+* Places ONE 0.01-lot EURUSD market buy.
+* Drives the result through `_resolve_fill_from_deal` (production
+  call site, not a re-implementation).
+* Asserts the fill resolves to a real (`> 0`) price within 100 pips
+  of the request-time mid.
+* Closes the position immediately afterwards so the demo account
+  does not accumulate stray trades across repeated runs.
+
+Run this on the VPS only — the MetaTrader5 Python package is
+Windows-only. The dev-machine `pytest` deselects the test by default
+(both `PROPFARM_LIVE_TEST` unset AND the marker is registered so
+`--strict-markers` does not warn).
+
+### Cross-links
+
+* Fix v4 diagnostic commit: see STATUS.md 2026-05-14 #4 session-log
+  entry for the hash.
+* Probe block implementation: `scripts/record_fills.py` ->
+  `emit_market_lookup_failure_probes(...)` +
+  `EMIT_MARKET_LOOKUP_FAILURE_PROBES` toggle.
+* Probe tests: `tests/scripts/test_record_fills.py` ->
+  the `test_emit_market_lookup_failure_probes_*` and
+  `test_main_*_probe*` group.
+* Playbook addendum: STATUS.md "Pathological-vendor-response catch
+  pattern -> 2026-05-14 addendum #4" — the
+  "halt-speculative-fixing-at-2-hits" rule.
