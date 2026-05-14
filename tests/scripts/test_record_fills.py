@@ -2520,6 +2520,119 @@ class _ProbeMockMt5:
         return tuple(SimpleNamespace(ticket=i) for i in range(count))
 
 
+def test_emit_market_lookup_failure_probes_v5_emits_path12_probes_and_result_fields(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v5 diagnostic expansion: paths 1+2 probes + result_fields line.
+
+    2026-05-14 fix v5 — after the v4 probe data (run ``3c7208c9``)
+    showed all six path-3 variants returning 0 across ±24h windows in
+    both server-time and UTC interpretations, the dark spots are
+    paths 1 (``ticket=result.deal``) and 2 (``position=...``). Five
+    new probes (g / h / h_in / i / i_in) exercise both candidate
+    position-ticket fields (``result.order`` — current — and
+    ``result.position`` — candidate fix). Plus one ``result_fields``
+    line so the operator can correlate the SKIPPED-vs-returned
+    decisions back to which OSR fields the broker populated.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, 809311, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 18, 56, 35, 0, tzinfo=UTC)
+
+    # Stage non-zero OSR fields for ALL three (so probes g/h/i all
+    # actually run instead of hitting SKIPPED).
+    osr = SimpleNamespace(deal=111, order=222, position=333, retcode=10009)
+    # _ProbeMockMt5.history_deals_get returns () when date_from is None
+    # (ticket / position lookups). That's what the live broker also
+    # appears to do per the v4 probe data — perfect for the test.
+    mock_mt5 = _ProbeMockMt5()
+
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+        order_send_result=osr,
+    )
+    captured = capsys.readouterr()
+
+    # result_fields line carries the OSR ticket integers verbatim so
+    # the operator can grep for "deal=N" / "order=N" / "position=N".
+    assert "[record_fills:lookup_probe_result_fields]" in captured.err
+    assert "deal=111" in captured.err
+    assert "order=222" in captured.err
+    assert "position=333" in captured.err
+    assert "retcode=10009" in captured.err
+
+    # All five v5 path-1+2 probes fired (not SKIPPED) because every
+    # OSR field is non-zero.
+    assert "[record_fills:lookup_probe_g] path1_ticket ticket=111" in captured.err
+    assert "[record_fills:lookup_probe_h] path2_position_eq_order position=222" in captured.err
+    assert (
+        "[record_fills:lookup_probe_h_in] path2_position_eq_order_entry_in position=222"
+        in captured.err
+    )
+    assert "[record_fills:lookup_probe_i] path2_position_eq_position position=333" in captured.err
+    assert (
+        "[record_fills:lookup_probe_i_in] path2_position_eq_position_entry_in "
+        "position=333" in captured.err
+    )
+
+
+def test_emit_market_lookup_failure_probes_v5_skips_when_osr_field_zero(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v5 probes emit SKIPPED when the corresponding OSR field is 0.
+
+    Distinguishes "probe ran and returned empty" from "probe didn't
+    even run because the field was 0." The latter is informative: if
+    ``result.deal`` is 0 the live broker isn't populating that field
+    on this build / order type, and path 1 is structurally inert.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, 809311, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 18, 56, 35, 0, tzinfo=UTC)
+    # OSR with deal=0 / order=222 / position=0.
+    osr = SimpleNamespace(deal=0, order=222, position=0, retcode=10009)
+    mock_mt5 = _ProbeMockMt5()
+
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+        order_send_result=osr,
+    )
+    captured = capsys.readouterr()
+
+    # probe_g SKIPPED (deal=0). probe_h ran (order=222). probe_i SKIPPED (position=0).
+    assert "lookup_probe_g] path1_ticket ticket=0 returned=SKIPPED" in captured.err
+    assert "lookup_probe_h] path2_position_eq_order position=222" in captured.err
+    assert "lookup_probe_i] path2_position_eq_position position=0 returned=SKIPPED" in captured.err
+
+
+def test_emit_market_lookup_failure_probes_back_compat_no_osr() -> None:
+    """v5 probe helper preserves back-compat with v4 test call sites.
+
+    Existing v4 tests invoke the probe helper without ``order_send_result``
+    (the new kwarg defaults to ``None``). When ``order_send_result``
+    is None, all OSR fields are treated as 0 → probes g/h/i emit
+    SKIPPED. The path-3 probes (a-f) fire as before. No exceptions
+    raised; existing v4 tests continue to pass.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, 809311, tzinfo=UTC)
+    now = datetime(2026, 5, 14, 18, 56, 35, 0, tzinfo=UTC)
+    mock_mt5 = _ProbeMockMt5()
+    # No raise; this is the call-form back-compat smoke test.
+    rf.emit_market_lookup_failure_probes(
+        mock_mt5,
+        request_time_utc=request_time,
+        now_utc=now,
+        server_time_offset_seconds=10800,
+    )
+
+
 def test_emit_market_lookup_failure_probes_emits_six_lines_plus_args(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

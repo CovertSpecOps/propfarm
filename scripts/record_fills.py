@@ -971,12 +971,42 @@ _LOG_PREFIX_NON_HOURLY_SERVER_OFFSET: Final[str] = (
 #: lines re-issue ``history_deals_get`` with different call forms so the
 #: non-zero ``returned=K`` count tells us which form the live broker accepts.
 _LOG_PREFIX_LOOKUP_PROBE_ARGS_PASSED: Final[str] = "[record_fills:lookup_probe_args_passed]"
+_LOG_PREFIX_LOOKUP_PROBE_RESULT_FIELDS: Final[str] = "[record_fills:lookup_probe_result_fields]"
+#: 2026-05-14 fix v5 (diagnostic expansion) — paths 1 + 2 probes. After
+#: the v4 probe data (run 3c7208c9) showed all six path-3 variants
+#: returning 0 across ±24h windows in both server-time and UTC, the
+#: dark spots are paths 1 and 2: probe_g exercises path 1 directly;
+#: probes h / h_in / i / i_in exercise path 2 with both candidate
+#: position-ticket fields (``result.order`` — current behavior — and
+#: ``result.position`` — the candidate fix per MQL5 convention),
+#: raw + DEAL_ENTRY_IN-filtered for each.
+_LOG_PREFIX_LOOKUP_PROBE_G: Final[str] = "[record_fills:lookup_probe_g]"
+_LOG_PREFIX_LOOKUP_PROBE_H: Final[str] = "[record_fills:lookup_probe_h]"
+_LOG_PREFIX_LOOKUP_PROBE_H_IN: Final[str] = "[record_fills:lookup_probe_h_in]"
+_LOG_PREFIX_LOOKUP_PROBE_I: Final[str] = "[record_fills:lookup_probe_i]"
+_LOG_PREFIX_LOOKUP_PROBE_I_IN: Final[str] = "[record_fills:lookup_probe_i_in]"
 _LOG_PREFIX_LOOKUP_PROBE_A: Final[str] = "[record_fills:lookup_probe_a]"
 _LOG_PREFIX_LOOKUP_PROBE_B: Final[str] = "[record_fills:lookup_probe_b]"
 _LOG_PREFIX_LOOKUP_PROBE_C: Final[str] = "[record_fills:lookup_probe_c]"
 _LOG_PREFIX_LOOKUP_PROBE_D: Final[str] = "[record_fills:lookup_probe_d]"
 _LOG_PREFIX_LOOKUP_PROBE_E: Final[str] = "[record_fills:lookup_probe_e]"
 _LOG_PREFIX_LOOKUP_PROBE_F: Final[str] = "[record_fills:lookup_probe_f]"
+#: 2026-05-14 fix v5 — session-start diagnostic emitted after
+#: ``mt5.initialize()``. Tells the operator whether ``mt5.history_select``
+#: is callable on this MT5 build; absent on Python 5.0.5735 per the
+#: MetaQuotes docs (the precondition is no-op'd via ``hasattr`` in
+#: ``_resolve_fill_from_deal``). If absent + path 3 returns empty in
+#: every probe, the deal-history cache is not being populated and the
+#: lookups have nothing to query.
+_LOG_PREFIX_HISTORY_SELECT_AVAILABLE: Final[str] = "[record_fills:history_select_available]"
+#: 2026-05-14 fix v5 — per-order-send OSR fields. Logged AFTER each
+#: ``mt5.order_send(req)`` so the operator can see the actual broker
+#: response shape (``deal`` / ``order`` / ``position`` may all be
+#: populated, only some, or none — build-dependent). Critical for
+#: discriminating between the "result.deal == 0" hypothesis (path 1
+#: skipped) and the "result.order vs result.position" hypothesis
+#: (path 2 querying the wrong ticket type).
+_LOG_PREFIX_ORDER_SEND_RESULT_FIELDS: Final[str] = "[record_fills:order_send_result_fields]"
 
 
 def detect_server_time_offset_seconds(
@@ -1384,6 +1414,7 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
                 request_time_utc=request_time_utc,
                 now_utc=now_utc,
                 server_time_offset_seconds=int(server_time_offset_seconds),
+                order_send_result=order_send_result,
             )
         return (None, None)
 
@@ -1555,6 +1586,7 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
     request_time_utc: datetime,
     now_utc: datetime,
     server_time_offset_seconds: int,
+    order_send_result: Any = None,
 ) -> None:
     """Emit a structured probe block for a market_lookup_failure event.
 
@@ -1590,6 +1622,35 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
       probe_b but ±24h. Determines whether the datetime form works at
       all on the live broker.
 
+    Fix v5 (diagnostic expansion) adds five MORE probes covering
+    paths 1 + 2. The v4 probe data (run ``3c7208c9``) showed all six
+    path-3 variants returning 0 across ±24h windows in both server-time
+    and UTC interpretations — definitively NOT a window-size or
+    timezone bug. The dark spots are paths 1 and 2:
+
+    * **result_fields** — prints the actual ``OrderSendResult`` ticket
+      fields (``deal`` / ``order`` / ``position`` / ``retcode``) so
+      we know what paths 1 + 2 had to work with.
+    * **probe_g** ``path1_ticket`` — re-issues
+      ``history_deals_get(ticket=result.deal)`` directly. If this
+      returns 0 when ``result.deal != 0``, path 1 is the wrong API
+      shape on this build.
+    * **probe_h** ``path2_position_eq_order`` — re-issues
+      ``history_deals_get(position=result.order)`` (the current path-2
+      call form). Raw count, no filter.
+    * **probe_h_in** ``path2_position_eq_order_entry_in`` — same as
+      probe_h, counted AFTER ``deal.entry == DEAL_ENTRY_IN`` filter.
+    * **probe_i** ``path2_position_eq_position`` — re-issues
+      ``history_deals_get(position=result.position)`` (the CANDIDATE
+      fix per MQL5 convention: ``position`` is the position ticket,
+      not the order ticket). Raw count.
+    * **probe_i_in** ``path2_position_eq_position_entry_in`` — same
+      as probe_i, counted AFTER ``deal.entry == DEAL_ENTRY_IN`` filter.
+
+    If probe_h returns 0 but probe_i returns > 0, fix v5-actual is a
+    one-line switch: change path 2 from ``position=order_ticket`` to
+    ``position=position_ticket``.
+
     Parameters
     ----------
     mt5
@@ -1604,15 +1665,21 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
     server_time_offset_seconds
         The detected MT5 server-time offset (per fix v3). Applied to
         the server-time probe variants and the args_passed line.
+    order_send_result
+        2026-05-14 fix v5 — the ``OrderSendResult`` from the failing
+        send. Required for the new path-1 + path-2 probes (g / h /
+        h_in / i / i_in). Default ``None`` preserves back-compat with
+        existing unit-test invocations that don't exercise the new
+        probes; in production the helper's caller always passes the
+        real ``order_send_result``.
 
     Notes
     -----
     Gated by the module-level toggle :data:`EMIT_MARKET_LOOKUP_FAILURE_PROBES`.
     Callers MUST check the toggle before invoking this function; the
     helper itself does NOT gate so the test surface stays simple.
-    The caller in ``main()`` is the gate; tests can either flip the
-    toggle (see ``EMIT_MARKET_LOOKUP_FAILURE_PROBES = False`` cases)
-    or invoke this function directly with ``True``-default behavior.
+    The caller in ``_resolve_fill_from_deal`` is the gate; tests can
+    either flip the toggle or invoke this function directly.
     """
     # Reproduce the exact int args path 3 just passed.
     date_from_unix_server = (
@@ -1643,6 +1710,24 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
         file=sys.stderr,
     )
 
+    # 2026-05-14 fix v5 — OrderSendResult ticket fields. Knowing whether
+    # ``result.deal``, ``result.order``, ``result.position`` are populated
+    # (and which integer values they carry) is required to interpret the
+    # probe_g / probe_h / probe_i results. The current path-2 code uses
+    # ``position=result.order``; per MQL5 convention ``position`` should
+    # carry a position ticket (``result.position``), not an order ticket
+    # — but some MT5 builds populate only ``result.order`` and others
+    # populate both. The print disambiguates which build we're on.
+    osr_deal = int(getattr(order_send_result, "deal", 0) or 0) if order_send_result else 0
+    osr_order = int(getattr(order_send_result, "order", 0) or 0) if order_send_result else 0
+    osr_position = int(getattr(order_send_result, "position", 0) or 0) if order_send_result else 0
+    osr_retcode = int(getattr(order_send_result, "retcode", 0) or 0) if order_send_result else 0
+    print(
+        f"{_LOG_PREFIX_LOOKUP_PROBE_RESULT_FIELDS} "
+        f"deal={osr_deal} order={osr_order} position={osr_position} retcode={osr_retcode}",
+        file=sys.stderr,
+    )
+
     def _run_probe(prefix: str, label: str, kwargs_repr: str, call: Any) -> None:
         """Run one probe call; log ``returned=K`` or ``returned=ERROR`` on exception.
 
@@ -1670,6 +1755,121 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
     # the probe answers "is the window itself too narrow?" independent
     # of "is the call form wrong?".
     wide_pad = 86400
+
+    # 2026-05-14 fix v5 — paths 1 + 2 probes (g / h / h_in / i / i_in).
+    # These probes do NOT depend on the time-range window; they exercise
+    # the ticket-keyed lookups directly. Each is gated on the relevant
+    # OSR field being non-zero, since MT5 returns ``()`` immediately for
+    # ``ticket=0`` / ``position=0`` queries (no broker round-trip), and
+    # we want to distinguish "skipped because field=0" from "queried but
+    # broker returned empty."
+
+    entry_in_const = int(getattr(mt5, "DEAL_ENTRY_IN", 0) or 0)
+
+    def _count_entry_in(deals: Any) -> int:
+        """Count deals whose ``entry`` field equals ``DEAL_ENTRY_IN``."""
+        if not deals:
+            return 0
+        return sum(1 for d in deals if int(getattr(d, "entry", -1) or -1) == entry_in_const)
+
+    # probe_g — path 1: history_deals_get(ticket=result.deal).
+    if osr_deal:
+        _run_probe(
+            _LOG_PREFIX_LOOKUP_PROBE_G,
+            "path1_ticket",
+            f"ticket={osr_deal}",
+            lambda: mt5.history_deals_get(ticket=osr_deal),
+        )
+    else:
+        print(
+            f"{_LOG_PREFIX_LOOKUP_PROBE_G} path1_ticket ticket=0 "
+            f"returned=SKIPPED (result.deal was 0; path 1 cannot run)",
+            file=sys.stderr,
+        )
+
+    # probe_h — path 2 raw: history_deals_get(position=result.order).
+    # This is the CURRENT path-2 call form. If probe_h returns > 0 but
+    # path 2 still returns empty in production, the DEAL_ENTRY_IN filter
+    # is dropping the candidate; if probe_h returns 0, the call form is
+    # the wrong field type (see probe_i).
+    if osr_order:
+        deals_h: Any = None
+
+        def _probe_h_call() -> Any:
+            nonlocal deals_h
+            deals_h = mt5.history_deals_get(position=osr_order)
+            return deals_h
+
+        _run_probe(
+            _LOG_PREFIX_LOOKUP_PROBE_H,
+            "path2_position_eq_order",
+            f"position={osr_order}",
+            _probe_h_call,
+        )
+        # probe_h_in — path 2 filtered to DEAL_ENTRY_IN.
+        if deals_h is not None:
+            try:
+                count_in = _count_entry_in(deals_h)
+                print(
+                    f"{_LOG_PREFIX_LOOKUP_PROBE_H_IN} path2_position_eq_order_entry_in "
+                    f"position={osr_order} returned={count_in}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"{_LOG_PREFIX_LOOKUP_PROBE_H_IN} path2_position_eq_order_entry_in "
+                    f"position={osr_order} returned=ERROR "
+                    f"exc_type={type(exc).__name__} exc_msg={exc!r}",
+                    file=sys.stderr,
+                )
+    else:
+        print(
+            f"{_LOG_PREFIX_LOOKUP_PROBE_H} path2_position_eq_order position=0 "
+            f"returned=SKIPPED (result.order was 0; path 2 cannot run)",
+            file=sys.stderr,
+        )
+
+    # probe_i — path 2 candidate-fix: history_deals_get(position=result.position).
+    # Per MQL5 convention the ``position`` parameter expects a POSITION
+    # ticket, not an order ticket. On hedging accounts these are different
+    # numbers; on netting accounts they coincide. If probe_i returns > 0
+    # while probe_h returns 0, fix v5-actual is a one-line switch.
+    if osr_position:
+        deals_i: Any = None
+
+        def _probe_i_call() -> Any:
+            nonlocal deals_i
+            deals_i = mt5.history_deals_get(position=osr_position)
+            return deals_i
+
+        _run_probe(
+            _LOG_PREFIX_LOOKUP_PROBE_I,
+            "path2_position_eq_position",
+            f"position={osr_position}",
+            _probe_i_call,
+        )
+        if deals_i is not None:
+            try:
+                count_in = _count_entry_in(deals_i)
+                print(
+                    f"{_LOG_PREFIX_LOOKUP_PROBE_I_IN} path2_position_eq_position_entry_in "
+                    f"position={osr_position} returned={count_in}",
+                    file=sys.stderr,
+                )
+            except Exception as exc:
+                print(
+                    f"{_LOG_PREFIX_LOOKUP_PROBE_I_IN} path2_position_eq_position_entry_in "
+                    f"position={osr_position} returned=ERROR "
+                    f"exc_type={type(exc).__name__} exc_msg={exc!r}",
+                    file=sys.stderr,
+                )
+    else:
+        print(
+            f"{_LOG_PREFIX_LOOKUP_PROBE_I} path2_position_eq_position position=0 "
+            f"returned=SKIPPED (result.position was 0; the candidate-fix path "
+            f"cannot run on this build / this order)",
+            file=sys.stderr,
+        )
 
     # probe_a — int_kwargs_server (the same call that just failed).
     _run_probe(
@@ -1980,6 +2180,19 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
         # broker_fill_time_utc value.
         validate_server_time_offset_seconds(server_time_offset_seconds)
 
+        # 2026-05-14 fix v5 (diagnostic expansion) — emit history_select
+        # availability at session start. Without history_select the
+        # deal-history cache may not be populated, and path-3 lookups
+        # silently return empty. The v4 probes (run 3c7208c9) all
+        # returned 0 across ±24h server-time AND UTC windows — strong
+        # evidence the cache isn't engaged. The hasattr probe tells us
+        # whether the function exists on this MT5 Python build.
+        _hist_select_available = hasattr(mt5, "history_select")
+        print(
+            f"{_LOG_PREFIX_HISTORY_SELECT_AVAILABLE}={_hist_select_available}",
+            file=sys.stderr,
+        )
+
         constants = {
             "TRADE_ACTION_DEAL": mt5.TRADE_ACTION_DEAL,
             "TRADE_ACTION_PENDING": mt5.TRADE_ACTION_PENDING,
@@ -2081,6 +2294,29 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                 result = mt5.order_send(req)
                 after_send = datetime.now(tz=UTC)
                 n_attempted += 1
+
+                # 2026-05-14 fix v5 (diagnostic expansion) — log the OSR
+                # ticket fields per send so the operator can compare
+                # path-1 / path-2 inputs against the probe outputs. The
+                # v4 probes (commit c188508) showed path-3 returning
+                # empty across every variant; without this line we
+                # cannot tell whether path 1's ``result.deal`` was 0
+                # (path 1 skipped) or non-zero (path 1 tried and failed
+                # via probe_g). On the FTMO live broker, ``result.deal``,
+                # ``result.order``, and ``result.position`` may be
+                # populated in different combinations depending on the
+                # MT5 build and account type (hedging vs netting).
+                _osr_deal = int(getattr(result, "deal", 0) or 0)
+                _osr_order = int(getattr(result, "order", 0) or 0)
+                _osr_position = int(getattr(result, "position", 0) or 0)
+                _osr_retcode = int(getattr(result, "retcode", 0) or 0)
+                print(
+                    f"{_LOG_PREFIX_ORDER_SEND_RESULT_FIELDS} "
+                    f"idx={idx:03d} "
+                    f"deal={_osr_deal} order={_osr_order} "
+                    f"position={_osr_position} retcode={_osr_retcode}",
+                    file=sys.stderr,
+                )
 
                 # Resolve the authoritative fill price + time from the deal
                 # record for ALL successful orders (2026-05-14 fix v2). For
