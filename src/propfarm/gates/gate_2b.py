@@ -84,6 +84,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
 import math
 import sys
 from collections import Counter
@@ -659,6 +660,54 @@ def _load_fill_record_class() -> type[BaseModel]:
     return fill_record_cls
 
 
+#: Manifest status value that disqualifies a capture from Gate 2B. Set by
+#: ``scripts/record_fills.py`` on the 2026-05-13 capture after the
+#: OrderSendResult.price=0 bug was confirmed. Any future "salvageable for
+#: spread/latency, unusable for fill_price" capture should reuse this value
+#: so the guard catches it.
+UNUSABLE_MANIFEST_STATUS: Final[str] = "fill_price-unusable"
+
+
+def _reject_if_unusable_manifest(capture_parquet_path: Path) -> None:
+    """Raise ``ValueError`` if the sidecar manifest marks the capture unusable.
+
+    The manifest sits next to the parquet (same stem, ``.json`` suffix) and
+    is written by :func:`scripts.record_fills.write_recording`. If a future
+    bug produces another bad capture, the operator (or the bug-discovery
+    commit) updates the manifest to ``{"status": "fill_price-unusable",
+    "unusable_reason": "..."}`` and Gate 2B refuses to run.
+
+    Forward-compat: a manifest WITHOUT a ``status`` key is the normal case
+    (Phase-0 manifests don't include one) and is accepted. Only an explicit
+    :data:`UNUSABLE_MANIFEST_STATUS` triggers the guard.
+    """
+    manifest_path = capture_parquet_path.with_suffix(".json")
+    if not manifest_path.exists():
+        # Missing manifest is not a fail-stop here — schema validation on the
+        # parquet itself is the primary gate. Capture-from-old-version
+        # parquets may legitimately be manifest-less.
+        return
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        # Corrupt manifest — defer to schema validation rather than blocking
+        # here, since a bad-JSON manifest is a separate concern from the
+        # fill_price-unusable signal.
+        return
+    if not isinstance(manifest, dict):
+        return
+    status = manifest.get("status")
+    if status == UNUSABLE_MANIFEST_STATUS:
+        reason = manifest.get("unusable_reason", "(no unusable_reason provided)")
+        raise ValueError(
+            f"capture parquet at {capture_parquet_path} is marked "
+            f"status={UNUSABLE_MANIFEST_STATUS!r} in its manifest "
+            f"({manifest_path}): {reason}. "
+            f"Re-record with the current scripts/record_fills.py before "
+            f"running Gate 2B."
+        )
+
+
 def _validate_schema(df: pl.DataFrame) -> None:
     """Raise ``ValueError`` if the parquet's columns don't match FillRecord.
 
@@ -874,6 +923,14 @@ def run_gate_2b(
     capture_path = Path(capture_parquet_path).resolve()
     if not capture_path.exists():
         raise FileNotFoundError(f"capture parquet not found: {capture_path}")
+
+    # Reject any capture whose sidecar manifest is flagged unusable. The
+    # 2026-05-13 capture (run_id 24e00278…) is the canonical instance:
+    # OrderSendResult.price=0 bug → every retcode=10009 row has
+    # fill_price=0.0. The manifest carries `"status": "fill_price-unusable"`
+    # and an `"unusable_reason"` string. Feeding it to Gate 2B would produce
+    # nonsense p95s; the guard is the structural protection.
+    _reject_if_unusable_manifest(capture_path)
 
     sha256 = _sha256_file(capture_path)
     df = pl.read_parquet(capture_path)
@@ -1096,6 +1153,7 @@ if _MISSING_THRESHOLDS:  # pragma: no cover — import-time invariant
 __all__ = [
     "SYMBOL_FILL_PRICE_P95_THRESHOLD_PIPS",
     "SYMBOL_SPREAD_P95_THRESHOLD_PIPS",
+    "UNUSABLE_MANIFEST_STATUS",
     "Gate2BReport",
     "MarketStateReconstruction",
     "ResidualDistribution",

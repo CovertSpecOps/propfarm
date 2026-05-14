@@ -42,6 +42,84 @@ The pure helpers are:
   metadata into the canonical FillRecord row.
 
 See ``docs/runbooks/gate-2b-fill-recording.md`` for the operator runbook.
+
+OrderSendResult vs. deal record (MT5 vendor convention — CRITICAL)
+------------------------------------------------------------------
+
+For **market orders** in MT5, ``mt5.order_send`` returns an
+``OrderSendResult`` whose ``.price`` field is **0.0 in most cases** —
+not the executed fill price. The actual fill price lives in the
+subsequent deal record, retrieved via ``mt5.history_deals_get(...)``
+after ``order_send`` returns. The deal record also carries the
+authoritative broker-side fill time as ``.time`` (epoch seconds).
+
+Wave-6b's original implementation read ``result.price`` directly,
+which produced a 110-row capture
+(``data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet``,
+2026-05-13 18:00 UTC -> 2026-05-14 09:06 UTC) where every
+``retcode == 10009`` row had ``fill_price = 0.0`` and absurd
+``slippage_observed_pips`` like +-11,700 to +-13,500 (= ``(0 -
+requested_price) / pip``). The capture is preserved with a
+``UNUSABLE.md`` sidecar and ``status: fill_price-unusable`` in its
+manifest; it is salvageable for ``retcode``, ``requested_price``,
+``spread_at_request_pips``, and ``broker_latency_ms`` calibration but
+must NOT be fed to Gate 2B.
+
+The fix uses **Option B** dependency injection (see Gate 2B fix-up
+dispatch brief, 2026-05-14): ``parse_fill_into_record`` accepts new
+keyword-only parameters ``actual_fill_price`` and
+``actual_fill_time_utc`` for the deal-resolved values. ``main()`` does
+the deal lookup against the real ``mt5.history_deals_get`` and passes
+the resolved scalars. The pure helper stays purely a data-shaping
+function, mock-friendly without ``mt5`` import. Option A (callable
+injection) was considered but B is cleaner because the helper never
+needs to know about MT5 ticket types.
+
+Per-field broker-response audit (2026-05-14)
+--------------------------------------------
+
+* ``retcode`` — from ``result.retcode`` directly. Documented MT5
+  field; reliable against real broker. No change.
+* ``comment`` — from ``result.comment`` directly. Reliable. May carry
+  the ``"retcode_or_deal_failure: …"`` annotation in the soft-failure
+  path described below.
+* ``requested_price`` — from ``open_req["price"]`` (internal). Never
+  reads ``OrderSendResult``. Reliable.
+* ``volume_lots`` — from ``open_req["volume"]`` (internal). Reliable.
+* ``spread_at_request_pips`` — from ``tick.bid`` / ``tick.ask``
+  captured BEFORE the send. Independent of ``OrderSendResult``.
+  Reliable.
+* ``broker_latency_ms`` — from Python-side wallclock
+  (``after_send_utc - request_time_utc``). This is round-trip-time
+  (RTT) including bridge + broker, **not** broker-internal latency.
+  Documented for downstream consumers.
+* ``fill_price`` — for retcode=10009 market orders, **MUST come from
+  the deal record**, not ``result.price``. This is the bug locus.
+* ``broker_fill_time_utc`` — for retcode=10009 market orders, **MUST
+  come from ``deal.time``** (broker authoritative). For non-success
+  retcodes and the soft-failure case (deal lookup returned None /
+  empty), falls back to ``after_send_utc`` (Python wallclock) with a
+  documented caveat.
+* ``slippage_observed_pips`` — derived from ``fill_price`` and
+  ``requested_price`` with the adverse-positive convention. Inherits
+  the fill_price fix automatically.
+
+For **limit/stop pending orders**, ``main()`` cancels the pending
+order immediately after ``order_send`` (see ``_cancel_pending_order``).
+A pending order with no fill produces no deal record, so the deal
+lookup returns ``None`` and the helper sets ``fill_price = NaN`` /
+``slippage_observed_pips = NaN`` via the soft-failure path. This is
+correct: a cancelled pending order has no fill price to record. The
+fix does not regress the limit/stop branch.
+
+Soft-failure: when the deal lookup returns ``None`` or empty (transient
+broker / history-get glitch on an otherwise-successful market order),
+``main()`` calls ``parse_fill_into_record`` with
+``actual_fill_price=None`` and ``actual_fill_time_utc=None``. The helper
+records ``fill_price = NaN`` and prefixes the comment with
+``"retcode_or_deal_failure: "`` so downstream analysis can distinguish
+"rejected by broker" (raw broker comment) from "filled but deal lookup
+failed" (annotated comment).
 """
 
 from __future__ import annotations
@@ -51,8 +129,11 @@ import json
 import math
 import pathlib
 import random
+import sys
 import time
+import traceback
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
@@ -479,6 +560,14 @@ def build_order_request(
     raise ValueError(f"unknown order_type: {order_type!r}")
 
 
+#: Comment prefix used to mark records where the broker reported success
+#: (retcode=10009) but the subsequent deal lookup returned None / empty,
+#: so the helper has no authoritative ``fill_price`` to record. Downstream
+#: consumers (Gate 2B) can distinguish "broker rejected" (raw retcode +
+#: raw comment) from "filled but deal lookup failed" (this prefix).
+DEAL_LOOKUP_FAILURE_PREFIX: Final[str] = "retcode_or_deal_failure: "
+
+
 def parse_fill_into_record(
     *,
     run_id: str,
@@ -491,11 +580,49 @@ def parse_fill_into_record(
     order_type: OrderType,
     side: Side,
     success_retcode: int = 10009,
+    actual_fill_price: float | None = None,
+    actual_fill_time_utc: datetime | None = None,
 ) -> dict[str, Any]:
-    """Convert one ``mt5.OrderSendResult`` into a FillRecord dict.
+    """Convert one ``mt5.OrderSendResult`` (+ deal lookup) into a FillRecord dict.
 
     Pure helper — accepts mock-friendly inputs. ``main()`` calls it with the
-    real ``mt5.OrderSendResult``.
+    real ``mt5.OrderSendResult`` and the resolved deal-record scalars.
+
+    The MT5 ``OrderSendResult.price`` field is 0.0 in most cases for market
+    orders — the executed fill price lives in the deal record, retrieved
+    via ``mt5.history_deals_get`` after ``order_send`` returns. This helper
+    takes the resolved deal scalars as keyword-only inputs
+    (``actual_fill_price`` and ``actual_fill_time_utc``) so the helper stays
+    a pure data-shaping function with no ``mt5`` import. See the module
+    docstring's "OrderSendResult vs. deal record" section for the full
+    convention.
+
+    Parameters
+    ----------
+    actual_fill_price
+        Resolved fill price from ``mt5.history_deals_get(...)``'s deal
+        record. ``None`` signals one of two cases:
+
+        1. The order was rejected (``retcode != success_retcode``). The
+           helper records ``fill_price = NaN`` and
+           ``slippage_observed_pips = NaN``. Comment is the raw broker
+           comment.
+        2. The order succeeded (``retcode == success_retcode``) but the
+           subsequent deal lookup returned ``None`` / empty (transient
+           failure). The helper STILL records ``fill_price = NaN`` and
+           ``slippage_observed_pips = NaN``, but prefixes the comment
+           with :data:`DEAL_LOOKUP_FAILURE_PREFIX` so downstream consumers
+           can identify this case.
+
+        For pending limit/stop orders that ``main()`` immediately cancels,
+        there is no fill, so ``actual_fill_price`` is ``None`` and the
+        record correctly carries ``NaN`` fill_price (the existing
+        behavior).
+    actual_fill_time_utc
+        Resolved fill time from the deal record (``deal.time`` as a tz-aware
+        UTC ``datetime``). ``None`` triggers the ``after_send_utc`` fallback
+        which is the Python-side wallclock — useful only for the
+        soft-failure case; documented as not broker-authoritative.
 
     Slippage convention: **positive = adverse to trader**.
     * Buy: filled higher than requested → adverse → slippage > 0.
@@ -508,7 +635,7 @@ def parse_fill_into_record(
     10030 unsupported filling mode, etc.).
     """
     retcode = int(order_send_result.retcode)
-    comment = str(getattr(order_send_result, "comment", "") or "")
+    raw_comment = str(getattr(order_send_result, "comment", "") or "")
 
     symbol = str(open_req["symbol"])
     # JPY pairs have digits=3 → pip = 0.01; FX majors digits=5 → pip = 0.0001.
@@ -524,23 +651,44 @@ def parse_fill_into_record(
     requested_price = float(open_req.get("price", 0.0) or 0.0)
     broker_latency_ms = (after_send_utc - request_time_utc).total_seconds() * 1000.0
 
+    comment = raw_comment
+
     if retcode != success_retcode:
+        # Broker-side rejection — no deal, no fill price. Leave the comment
+        # as-is (raw broker text like "Market closed", "Requote", …).
         fill_price = float("nan")
         slippage_pips = float("nan")
         broker_fill_time_utc = after_send_utc
+    elif actual_fill_price is None:
+        # Soft-failure: broker accepted (retcode 10009) but the deal lookup
+        # returned None / empty. Cannot record fill_price; mark the row so
+        # downstream consumers can distinguish this from a clean reject.
+        fill_price = float("nan")
+        slippage_pips = float("nan")
+        # Fall back to wallclock — documented as Python-side, not broker-auth.
+        broker_fill_time_utc = actual_fill_time_utc or after_send_utc
+        comment = DEAL_LOOKUP_FAILURE_PREFIX + raw_comment
     else:
-        fill_price = float(order_send_result.price)
+        fill_price = float(actual_fill_price)
         # Adverse-positive slippage.
         if side == "buy":
             slippage_pips = (fill_price - requested_price) / pip
         else:
             slippage_pips = (requested_price - fill_price) / pip
-        result_time = getattr(order_send_result, "time", None)
-        if result_time is None or result_time == 0:
-            broker_fill_time_utc = after_send_utc
+        if actual_fill_time_utc is not None:
+            # Authoritative broker-side fill time (from deal record).
+            broker_fill_time_utc = actual_fill_time_utc
         else:
-            # MT5 OrderSendResult.time is epoch seconds (broker-side).
-            broker_fill_time_utc = datetime.fromtimestamp(int(result_time), tz=UTC)
+            # Should be unreachable when ``actual_fill_price`` is provided —
+            # ``main()`` resolves both atomically — but the fallback chain
+            # (``result.time`` → ``after_send_utc``) is preserved as a last
+            # resort for any caller that supplies a price without a time.
+            result_time = getattr(order_send_result, "time", None)
+            if result_time is None or result_time == 0:
+                broker_fill_time_utc = after_send_utc
+            else:
+                # MT5 OrderSendResult.time is epoch seconds (broker-side).
+                broker_fill_time_utc = datetime.fromtimestamp(int(result_time), tz=UTC)
 
     return {
         "run_id": run_id,
@@ -558,6 +706,73 @@ def parse_fill_into_record(
         "retcode": retcode,
         "comment": comment,
     }
+
+
+def _resolve_fill_from_deal(  # pragma: no cover - integration path
+    mt5: Any,
+    order_send_result: Any,
+    *,
+    success_retcode: int,
+) -> tuple[float | None, datetime | None]:
+    """Resolve the deal-record fill price + time for a successful market order.
+
+    MT5 API summary:
+    * ``mt5.history_deals_get(ticket=<deal_ticket>)`` returns a tuple of
+      ``Deal`` objects matching the deal ticket; typically 1 element.
+    * ``mt5.history_deals_get(position=<position_ticket>)`` returns ALL
+      deals for that position; we filter to the entry-side deal (where
+      ``deal.entry == mt5.DEAL_ENTRY_IN``).
+    * Both calls may return ``None`` (function-level error) or ``()`` on
+      transient history-server failures.
+
+    Returns
+    -------
+    tuple[float | None, datetime | None]
+        ``(fill_price, fill_time_utc)`` on success;
+        ``(None, None)`` on any soft-failure case so the caller can flag
+        the row via :data:`DEAL_LOOKUP_FAILURE_PREFIX`.
+    """
+    if int(order_send_result.retcode) != success_retcode:
+        return (None, None)
+
+    deal_ticket = int(getattr(order_send_result, "deal", 0) or 0)
+    deal = None
+    if deal_ticket:
+        deals = mt5.history_deals_get(ticket=deal_ticket)
+        if deals:
+            deal = deals[0]
+    if deal is None:
+        # Fall back to position-keyed lookup, filtering to the entry-side
+        # deal (DEAL_ENTRY_IN). Some MT5 builds return only the deal
+        # ticket on the OrderSendResult and require this second hop.
+        order_ticket = int(getattr(order_send_result, "order", 0) or 0)
+        if order_ticket:
+            deals = mt5.history_deals_get(position=order_ticket)
+            if deals:
+                entry_in = getattr(mt5, "DEAL_ENTRY_IN", 0)
+                for cand in deals:
+                    if int(getattr(cand, "entry", -1)) == int(entry_in):
+                        deal = cand
+                        break
+                if deal is None:
+                    # No entry-side deal yet (could be in transit). Soft-fail.
+                    return (None, None)
+    if deal is None:
+        return (None, None)
+
+    price = float(getattr(deal, "price", 0.0) or 0.0)
+    if price == 0.0:
+        # Deal exists but reports a zero price — treat as soft-failure
+        # rather than recording a zero. The 2026-05-13 bug capture taught
+        # us never to trust a zero from any broker-side response.
+        return (None, None)
+    deal_time = getattr(deal, "time", None)
+    if deal_time is None or int(deal_time) == 0:
+        # Deal price valid but time missing — record the price, signal the
+        # caller to use the wallclock fallback for the timestamp by
+        # returning the price + None.
+        return (price, None)
+    return (price, datetime.fromtimestamp(int(deal_time), tz=UTC))
 
 
 # --------------------------------------------------------------------------- #
@@ -770,6 +985,9 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
         session_deadline = start_utc + timedelta(hours=HARD_TIME_LIMIT_HOURS)
         rows: list[dict[str, Any]] = []
         rng = random.Random(int(args.seed) ^ 0xA5A5)  # for inside_spread flips
+        n_attempted = 0
+        n_exceptions = 0
+        exception_type_counts: Counter[str] = Counter()
 
         for idx, (target, symbol, order_type, side) in enumerate(
             zip(
@@ -780,104 +998,168 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                 strict=True,
             )
         ):
-            now = datetime.now(tz=UTC)
-            if now >= session_deadline:
-                print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
-                break
-            # W6b reviewer fix: wait UNTIL the scheduled target, even if the
-            # gap is > 1h. The earlier version did a single `time.sleep(min(
-            # sleep_s, 3600))` and then unconditionally fell through to the
-            # `order_send` block, which fired the order up to (gap - 1h)
-            # before its scheduled time. Functionally rare at n=200/24h (avg
-            # gap ~7 min), but a real defect under low-n or quiet-zone-heavy
-            # schedules. The 1h-cap-per-sleep stays as a watchdog (so a
-            # corrupt entry can't block forever in a single syscall), but is
-            # now wrapped in a loop that re-checks `now` and the deadline.
-            while True:
+            try:
                 now = datetime.now(tz=UTC)
                 if now >= session_deadline:
+                    print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
                     break
-                if now >= target:
+                # W6b reviewer fix: wait UNTIL the scheduled target, even if the
+                # gap is > 1h. The earlier version did a single `time.sleep(min(
+                # sleep_s, 3600))` and then unconditionally fell through to the
+                # `order_send` block, which fired the order up to (gap - 1h)
+                # before its scheduled time. Functionally rare at n=200/24h (avg
+                # gap ~7 min), but a real defect under low-n or quiet-zone-heavy
+                # schedules. The 1h-cap-per-sleep stays as a watchdog (so a
+                # corrupt entry can't block forever in a single syscall), but is
+                # now wrapped in a loop that re-checks `now` and the deadline.
+                while True:
+                    now = datetime.now(tz=UTC)
+                    if now >= session_deadline:
+                        break
+                    if now >= target:
+                        break
+                    sleep_s = (target - now).total_seconds()
+                    time.sleep(min(sleep_s, 3600.0))
+                if datetime.now(tz=UTC) >= session_deadline:
+                    print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
                     break
-                sleep_s = (target - now).total_seconds()
-                time.sleep(min(sleep_s, 3600.0))
-            if datetime.now(tz=UTC) >= session_deadline:
-                print(f"[record_fills] hit 48h hard cap at idx={idx}; stopping")
-                break
 
-            # SAFETY ASSERT #2 — open position cap.
-            open_positions = mt5.positions_get() or ()
-            if len(open_positions) >= MAX_SIMULTANEOUS_POSITIONS:
-                print(
-                    f"[record_fills] {len(open_positions)} open positions "
-                    f">= cap {MAX_SIMULTANEOUS_POSITIONS}; force-closing all and aborting"
+                # SAFETY ASSERT #2 — open position cap.
+                open_positions = mt5.positions_get() or ()
+                if len(open_positions) >= MAX_SIMULTANEOUS_POSITIONS:
+                    print(
+                        f"[record_fills] {len(open_positions)} open positions "
+                        f">= cap {MAX_SIMULTANEOUS_POSITIONS}; force-closing all and aborting"
+                    )
+                    _force_close_all(mt5, open_positions, constants, template)
+                    raise SystemExit("position cap reached; session aborted")
+
+                tick = mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    print(f"[record_fills] idx={idx} tick None for {symbol}; skipping")
+                    continue
+
+                template_for_symbol = {**template, "symbol": symbol}
+                inside = bool(order_type == "limit" and rng.random() < 0.6)
+                req = build_order_request(
+                    template_for_symbol,
+                    order_type=order_type,
+                    symbol_info_tick=tick,
+                    side=side,
+                    inside_spread=inside,
+                    mt5_constants=constants,
                 )
-                _force_close_all(mt5, open_positions, constants, template)
-                raise SystemExit("position cap reached; session aborted")
 
-            tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                print(f"[record_fills] idx={idx} tick None for {symbol}; skipping")
-                continue
+                request_time = datetime.now(tz=UTC)
+                result = mt5.order_send(req)
+                after_send = datetime.now(tz=UTC)
+                n_attempted += 1
 
-            template_for_symbol = {**template, "symbol": symbol}
-            inside = bool(order_type == "limit" and rng.random() < 0.6)
-            req = build_order_request(
-                template_for_symbol,
-                order_type=order_type,
-                symbol_info_tick=tick,
-                side=side,
-                inside_spread=inside,
-                mt5_constants=constants,
-            )
+                # Resolve the authoritative fill price + time from the deal
+                # record for successful MARKET orders. Limit / stop pending
+                # orders create no deal until they're triggered; main() cancels
+                # them immediately so `actual_fill_price` will be None and
+                # `parse_fill_into_record` records NaN — the correct behavior
+                # for a cancelled pending order.
+                if order_type == "market":
+                    actual_fill_price, actual_fill_time = _resolve_fill_from_deal(
+                        mt5, result, success_retcode=success_retcode
+                    )
+                else:
+                    actual_fill_price, actual_fill_time = (None, None)
 
-            request_time = datetime.now(tz=UTC)
-            result = mt5.order_send(req)
-            after_send = datetime.now(tz=UTC)
-
-            symbol_info = mt5.symbol_info(symbol)
-            digits = int(symbol_info.digits) if symbol_info is not None else 5
-            row = parse_fill_into_record(
-                run_id=run_id,
-                request_time_utc=request_time,
-                after_send_utc=after_send,
-                open_req=req,
-                order_send_result=result,
-                tick_at_request=tick,
-                symbol_digits=digits,
-                order_type=order_type,
-                side=side,
-                success_retcode=success_retcode,
-            )
-            rows.append(row)
-            print(
-                f"[record_fills] idx={idx:03d} {symbol} {order_type} {side} "
-                f"retcode={row['retcode']} fill={row['fill_price']} "
-                f"slip_pips={row['slippage_observed_pips']:.2f} "
-                f"latency_ms={row['broker_latency_ms']:.1f}"
-            )
-
-            # Round-trip-and-close — only for market fills that filled. Limit
-            # and stop pending orders are cancelled instead so we don't leave
-            # resting orders accumulating.
-            if row["retcode"] == success_retcode and order_type == "market":
-                _close_market_position(mt5, symbol, side, constants, template_for_symbol)
-            elif row["retcode"] == success_retcode and order_type in ("limit", "stop"):
-                _cancel_pending_order(mt5, result, constants)
-
-            # Periodic flush — every 10 fills, write to disk so a crash loses
-            # at most 10 records.
-            if (idx + 1) % 10 == 0:
-                end_utc = datetime.now(tz=UTC)
-                write_recording(
-                    rows,
+                symbol_info = mt5.symbol_info(symbol)
+                digits = int(symbol_info.digits) if symbol_info is not None else 5
+                row = parse_fill_into_record(
                     run_id=run_id,
-                    start_utc=start_utc,
-                    end_utc=end_utc,
-                    root=repo_root,
+                    request_time_utc=request_time,
+                    after_send_utc=after_send,
+                    open_req=req,
+                    order_send_result=result,
+                    tick_at_request=tick,
+                    symbol_digits=digits,
+                    order_type=order_type,
+                    side=side,
                     success_retcode=success_retcode,
+                    actual_fill_price=actual_fill_price,
+                    actual_fill_time_utc=actual_fill_time,
                 )
-                rows = []  # already on disk; avoid double-append next flush
+                rows.append(row)
+                fill_repr = (
+                    f"{row['fill_price']:.5f}"
+                    if isinstance(row["fill_price"], float) and not math.isnan(row["fill_price"])
+                    else "NaN"
+                )
+                slip_repr = (
+                    f"{row['slippage_observed_pips']:.2f}"
+                    if isinstance(row["slippage_observed_pips"], float)
+                    and not math.isnan(row["slippage_observed_pips"])
+                    else "NaN"
+                )
+                print(
+                    f"[record_fills] idx={idx:03d} {symbol} {order_type} {side} "
+                    f"retcode={row['retcode']} fill={fill_repr} "
+                    f"slip_pips={slip_repr} "
+                    f"latency_ms={row['broker_latency_ms']:.1f}"
+                )
+
+                # Round-trip-and-close — only for market fills that filled. Limit
+                # and stop pending orders are cancelled instead so we don't leave
+                # resting orders accumulating.
+                if row["retcode"] == success_retcode and order_type == "market":
+                    _close_market_position(mt5, symbol, side, constants, template_for_symbol)
+                elif row["retcode"] == success_retcode and order_type in ("limit", "stop"):
+                    _cancel_pending_order(mt5, result, constants)
+
+                # Periodic flush — every 10 fills, write to disk so a crash loses
+                # at most 10 records.
+                if (idx + 1) % 10 == 0:
+                    end_utc = datetime.now(tz=UTC)
+                    write_recording(
+                        rows,
+                        run_id=run_id,
+                        start_utc=start_utc,
+                        end_utc=end_utc,
+                        root=repo_root,
+                        success_retcode=success_retcode,
+                    )
+                    rows = []  # already on disk; avoid double-append next flush
+            except SystemExit:
+                # Hard-bail conditions (position cap, server prefix mismatch)
+                # MUST propagate. Flush whatever we have first.
+                try:
+                    end_utc = datetime.now(tz=UTC)
+                    write_recording(
+                        rows,
+                        run_id=run_id,
+                        start_utc=start_utc,
+                        end_utc=end_utc,
+                        root=repo_root,
+                        success_retcode=success_retcode,
+                    )
+                except Exception:  # pragma: no cover — best-effort flush
+                    pass
+                raise
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                # The 2026-05-13 Wave-6b capture exited with LastTaskResult=1
+                # at iteration 110/200 — unknown cause, likely a transient
+                # broker / network exception on one specific order_send. To
+                # survive a future bad row, log to STDERR (Task Scheduler's
+                # stdout is buffered/lost on hidden jobs) and continue.
+                # The structured prefix lets the operator grep for these on
+                # the next run: `findstr "[record_fills:exception]" stderr.log`.
+                n_exceptions += 1
+                exception_type_counts[type(exc).__name__] += 1
+                print(
+                    f"[record_fills:exception] idx={idx:03d} symbol={symbol} "
+                    f"order_type={order_type} side={side} "
+                    f"exc_type={type(exc).__name__} exc_msg={exc!r}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc(file=sys.stderr)
+                continue
 
         end_utc = datetime.now(tz=UTC)
         write_recording(
@@ -888,7 +1170,27 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             root=repo_root,
             success_retcode=success_retcode,
         )
-        print(f"[record_fills] session complete: run_id={run_id}")
+        # Summary to stderr too, so the operator can confirm completion even
+        # if stdout was discarded by the scheduler.
+        summary = (
+            f"[record_fills] session complete: run_id={run_id} "
+            f"scheduled={len(schedule)} attempted={n_attempted} "
+            f"exceptions={n_exceptions} exc_types={dict(exception_type_counts)}"
+        )
+        print(summary)
+        print(summary, file=sys.stderr)
+    except SystemExit:
+        # Propagate after the finally block runs mt5.shutdown().
+        raise
+    except Exception as exc:
+        # Any pre-loop / loop-runaway exception that escapes the per-iteration
+        # try/except still gets visibility on stderr before mt5.shutdown().
+        print(
+            f"[record_fills:fatal] run_id={run_id} exc_type={type(exc).__name__} exc_msg={exc!r}",
+            file=sys.stderr,
+        )
+        traceback.print_exc(file=sys.stderr)
+        raise
     finally:
         mt5.shutdown()
 

@@ -471,3 +471,79 @@ def test_strict_biased_capture_produces_fail_with_both_failure_reasons(tmp_path:
     assert "systematic_bias" in reasons_blob, (
         f"Expected systematic_bias in failure_reasons; got {report.failure_reasons!r}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Manifest-status guard (2026-05-14 fix-up)
+# --------------------------------------------------------------------------- #
+def test_run_gate_2b_rejects_unusable_manifest_status(tmp_path: Path) -> None:
+    """Sidecar manifest with ``status=fill_price-unusable`` → ValueError at load time.
+
+    Regression for the 2026-05-13 capture (run_id 24e00278…) where every
+    retcode=10009 row had fill_price=0.0 due to the OrderSendResult.price
+    bug. The capture is preserved on disk (salvageable spread / latency
+    columns) but must NOT be fed to Gate 2B; the manifest carries the
+    ``status`` flag and the harness refuses to run.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import UNUSABLE_MANIFEST_STATUS, run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(3)]
+    capture = tmp_path / "unusable.parquet"
+    _write_capture(rows, capture)
+    # Write a manifest next to it with the unusable status.
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "unusable-test",
+                "status": UNUSABLE_MANIFEST_STATUS,
+                "unusable_reason": (
+                    "OrderSendResult.price=0 bug, fixed at <commit>; "
+                    "salvageable columns: retcode, requested_price, "
+                    "spread_at_request_pips, broker_latency_ms"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="fill_price-unusable"):
+        run_gate_2b(capture_parquet_path=capture)
+
+
+def test_run_gate_2b_accepts_manifest_without_status_key(tmp_path: Path) -> None:
+    """Manifest without a ``status`` key is the normal Phase-0 case — not rejected.
+
+    Forward-compat: existing manifests written by Phase-0 record_fills
+    don't include a ``status`` key. Only an explicit
+    ``fill_price-unusable`` status triggers the guard.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(5)]
+    capture = tmp_path / "normal.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps({"run_id": "normal-test", "n_attempted": 5, "n_filled": 5, "n_rejected": 0}),
+        encoding="utf-8",
+    )
+    # Should run without raising.
+    report = run_gate_2b(capture_parquet_path=capture)
+    assert report.n_rows_captured == 5
+
+
+def test_run_gate_2b_accepts_missing_manifest(tmp_path: Path) -> None:
+    """Manifest absent → schema validation still runs but no manifest guard fires."""
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(5)]
+    capture = tmp_path / "no_manifest.parquet"
+    _write_capture(rows, capture)
+    # Deliberately do NOT write the manifest.
+    assert not capture.with_suffix(".json").exists()
+    report = run_gate_2b(capture_parquet_path=capture)
+    assert report.n_rows_captured == 5

@@ -63,6 +63,8 @@ Wave 6b shipped spread (6.1), slippage (7.1), and Gate-2B fill-recording prep. W
 
 - **2026-05-13 #5** — Wave 6c dispatched (Task 7.2 fill engine, single high-stakes agent with the adversarial reviewer pattern). Impl shipped 21 unit tests + the schema-lock identity test. Adversarial reviewer independently constructed all 10 user-mandated cases and verified: 4 PASS, 6 DOCUMENTED OUT-OF-SCOPE, zero FAIL. Critical findings confirmed: schema lock `FillResult ≡ FillRecord` (external `model_fields` equality + per-field annotation equality), canonical `MarketState` import (zero local redefinitions), determinism, stress-mode amplification at exactly 15× on EURUSD. **No re-capture needed.** One LOW follow-up applied inline: explicit "Per-request semantics" section in the module docstring locks the 5 deliberately-out-of-scope behaviors (partial fills, SL/TP race, multi-order atomicity, whipsaw, gap-fill price). Commits: `a4049e6`, `fa93d17`.
 
+- **2026-05-14 #1** — **CRITICAL fix-up batch** for `scripts/record_fills.py`. The 2026-05-13 ~15h VPS capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`, 110 rows / 107 filled / 3 rejected) landed with `fill_price = 0.0` on every retcode=10009 row and `slippage_observed_pips` in the ±11,700 to ±13,500 range. Root cause confirmed: `parse_fill_into_record` read `mt5.OrderSendResult.price` directly, which is `0` for MT5 **market orders in most cases** — the executed fill price lives in the subsequent deal record retrieved via `mt5.history_deals_get(...)`. Existing 18 unit tests passed because their `SimpleNamespace` fixtures set `price` to a non-zero value (the semantically-clean shape; not the pathological one real MT5 returns). Fix-up batch: (a) `parse_fill_into_record` patched to accept `actual_fill_price` / `actual_fill_time_utc` keyword-only args (Option B DI), with a soft-failure path that prefixes the comment with `retcode_or_deal_failure:` when retcode=10009 but the deal lookup returned None; (b) `_resolve_fill_from_deal` helper added wrapping `mt5.history_deals_get` with `deal=`-then-`position=` fallback and `DEAL_ENTRY_IN` filter; (c) 11 new regression tests in `tests/scripts/test_record_fills.py` (29 tests total) covering the pathological mock, four-case slippage sign convention, soft-failure path, deal-helper happy / fallback / soft-fail / zero-price / reject paths, structural verification against the captured parquet, and a crash-hardening smoke test; (d) per-iteration `try/except` in `main()` logs to **stderr** with prefix `[record_fills:exception]` so Task Scheduler hidden jobs surface failures; (e) sidecar `UNUSABLE.md` written and manifest updated with `"status": "fill_price-unusable"`; (f) `src/propfarm/gates/gate_2b.py` gained a `_reject_if_unusable_manifest` guard with 3 regression tests in `tests/gates/test_gate_2b.py` (17 tests total). New STATUS.md playbook entry "Pathological-vendor-response catch pattern" added alongside the Vendor-convention pattern. Commit `<pending>`.
+
 ### Wave 6c → Gate 2B drift check
 
 Wave 6c proved the fill engine is structurally correct against the schema; **Gate 2B proves it numerically against live broker reality.** Gate 2B is now unblocked: the user can run `scripts/record_fills.py` on the VPS for 24-48h via Task Scheduler (1A) or Start-Process (1B) per the runbook. Once `data/fills_capture_001.parquet` lands in the repo, the Gate 2B comparison harness can be built — drives each recorded `(request, market_state)` through `simulate_fill`, computes the residual (`live - sim`) per field, and reports p50/p95/p99 of the residual distribution. **Wave 6d (10.2 stress replay) is GATED on both Wave 6c AND Gate 2B passing** — the user explicitly: "Do not dispatch 6d until the fill engine is proven against recorded reality."
@@ -321,6 +323,53 @@ This pattern is broader than reconciliation: spread/slippage models
 calibrating off vendor data must declare which side(s) of the book they
 read; news calendars must declare timezone; holiday calendars must
 declare observation rules (substituted Monday vs literal date).
+
+## Pathological-vendor-response catch pattern (reviewer playbook entry)
+
+Added 2026-05-14 after a CRITICAL bug in `scripts/record_fills.py` was
+caught against the 2026-05-13 capture
+(`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`):
+every retcode=10009 row had `fill_price = 0.0` and `slippage_observed_pips`
+in the ±11,700 to ±13,500 range, because the script read
+`mt5.OrderSendResult.price` directly. For MT5 **market orders**,
+`OrderSendResult.price` is **0 in most cases** — the executed price
+lives in the deal record, accessible via `mt5.history_deals_get(...)`
+after `order_send` returns. The existing 18 unit tests passed because
+their `SimpleNamespace` fixtures set `price` to a non-zero value (the
+semantically-clean value a careful broker *would* return), not the
+pathological value real MT5 brokers actually return. The bug only
+manifested against live broker response shapes.
+
+**Lesson:**
+
+> Mock fixtures for broker-response objects must match the pathological
+> values real brokers actually return — not the semantically-clean
+> values a careful broker would return. MT5's `OrderSendResult.price = 0`
+> for market deals is one instance; document others as they're found.
+
+**Reviewer rejection criteria** for any code that reads from a
+vendor-response object (broker OrderSendResult, exchange ExecutionReport,
+data-vendor DataPoint, …):
+
+1. Module docstring identifies which fields are reliably populated vs.
+   which require a secondary lookup (e.g. "MT5 market-order fill_price
+   comes from `history_deals_get`, NOT `OrderSendResult.price`").
+2. At least one regression test uses the pathological value
+   (`price = 0.0`, `time = 0`, `volume = 0`, etc.) and asserts the code
+   resolves the truth via the secondary lookup.
+3. Test fixtures default to the pathological shape; only tests that
+   specifically validate "broker happened to populate the field" use the
+   clean value.
+4. Any place where a field is used downstream documents the soft-failure
+   behavior when the secondary lookup fails (e.g.
+   `DEAL_LOOKUP_FAILURE_PREFIX` in `scripts/record_fills.py` so
+   downstream consumers can distinguish reject from filled-but-no-deal).
+
+Cross-link: this entry was added at commit `<pending>` (fix-up batch
+that patched `parse_fill_into_record` to read via deal record, added 11
+new regression tests in `tests/scripts/test_record_fills.py`, added a
+manifest-status guard in `src/propfarm/gates/gate_2b.py`, and marked
+the 2026-05-13 capture as `fill_price-unusable`).
 
 ## Source-verification protocol for predicates and tables
 
