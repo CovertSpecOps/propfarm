@@ -1,0 +1,10 @@
+{
+  "run_id": "24e00278d0024a98beb009b75762adb6",
+  "start_utc": "2026-05-13T18:00:36.098776Z",
+  "end_utc": "2026-05-14T09:06:06.041775Z",
+  "n_attempted": 110,
+  "n_filled": 107,
+  "n_rejected": 3,
+  "schema_version": "1.0",
+  "vps_host_redacted": true
+}
