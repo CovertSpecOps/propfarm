@@ -8,5 +8,5 @@
   "schema_version": "1.0",
   "vps_host_redacted": true,
   "status": "fill_price-unusable",
-  "unusable_reason": "OrderSendResult.price=0 bug; every retcode=10009 row has fill_price=0.0 and absurd slippage_observed_pips (~plus/minus 11700 to 13500). Salvageable columns: retcode, requested_price, spread_at_request_pips, broker_latency_ms. DO NOT feed to Gate 2B. See sibling UNUSABLE.md. Fixed in scripts/record_fills.py at commit pending-fix-commit (2026-05-14)."
+  "unusable_reason": "OrderSendResult.price=0 bug; every retcode=10009 row has fill_price=0.0 and absurd slippage_observed_pips (~plus/minus 11700 to 13500). Salvageable columns: retcode, requested_price, spread_at_request_pips, broker_latency_ms. DO NOT feed to Gate 2B. See sibling UNUSABLE.md. Fixed in scripts/record_fills.py at commit 9dd9af6 (2026-05-14)."
 }
