@@ -1860,6 +1860,129 @@ def test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_mar
     assert "symbol=EURUSD" in captured.err
 
 
+def test_resolve_fill_from_deal_emits_probes_when_called_directly_on_market_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Direct-helper-call probe wiring (2026-05-14 fix v4-rewire regression).
+
+    The original fix v4 wired the probe block into ``main()`` alongside
+    the loud ``[record_fills:market_lookup_failure]`` log. The
+    live-broker marker test
+    (``tests/scripts/test_live_broker_validation.py``) calls
+    ``_resolve_fill_from_deal`` DIRECTLY and saw the helper return
+    ``(None, None)`` with NO probe lines in captured stderr — the
+    diagnostic was instrumented at the wrong layer.
+
+    This regression test pins the rewire: build a mock that fails all
+    three lookup paths for a ``market`` order with success retcode,
+    call ``_resolve_fill_from_deal`` directly (no ``main()``), and
+    assert ALL eight diagnostic lines (1 args-passed + 6 probes a-f
+    + the existing ``market_lookup_failure`` log is emitted by
+    ``main()`` only, NOT by the helper) — actually, the helper is
+    responsible only for the probe block; the loud failure log
+    stays in ``main()``'s control. So we assert lines 1-7 of the
+    block here (args + probes a..f) and skip ``market_lookup_failure``.
+
+    If a future refactor moves the probe call back to ``main()`` (or
+    deletes it from the helper), this test fails and points to the
+    rewire's operator-facing lesson: "Diagnostic instrumentation must
+    be in the same call-path layer as the failure it's instrumenting."
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+
+    # Build a mock that returns empty from all three lookup paths for
+    # a market order at success retcode. We stage NO deals in any
+    # path; the helper exercises path 1, path 2, path 3 in sequence
+    # and soft-fails to (None, None). The helper then emits the
+    # probe block from inside its market+empty branch.
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},  # path 1 returns empty
+        deals_by_position={},  # path 2 returns empty
+        deals_for_time_range=(),  # path 3 returns empty
+        server_time_offset_seconds=10800,
+    )
+    result = SimpleNamespace(retcode=10009, deal=9001, order=9002)
+
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="market",
+            side="buy",
+            idx=42,
+        ),
+    )
+    assert price is None
+    assert fill_time is None
+
+    captured = capsys.readouterr()
+    # All seven probe-block lines must appear in stderr, fired from
+    # INSIDE the helper, NOT main(). The existing
+    # market_lookup_failure log is main()'s job and is intentionally
+    # absent here (we didn't call main()).
+    assert "[record_fills:lookup_probe_args_passed]" in captured.err, (
+        "args-passed line missing — the helper did not emit the probe block"
+    )
+    for probe_label in ("a", "b", "c", "d", "e", "f"):
+        assert f"[record_fills:lookup_probe_{probe_label}]" in captured.err, (
+            f"probe_{probe_label} line missing from captured stderr — "
+            "probe block did not fire from inside _resolve_fill_from_deal"
+        )
+
+
+def test_resolve_fill_from_deal_does_not_emit_probes_on_pending_order_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Probes do NOT fire on limit/stop pending-order soft-failures.
+
+    An empty lookup for ``order_type in ('limit', 'stop')`` is the
+    legitimate expected state: the order was queued, not yet filled.
+    Firing the six-line probe block on every pending order would
+    drown stderr. The helper-level gate (added in fix v4-rewire) must
+    preserve this behavioral split.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        server_time_offset_seconds=10800,
+    )
+    # Limit order with success retcode (queued, no deal yet).
+    result = SimpleNamespace(retcode=10009, deal=0, order=9003)
+
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="limit",  # ← pending, not market
+            side="buy",
+            idx=43,
+        ),
+    )
+    assert price is None
+    assert fill_time is None
+
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_args_passed]" not in captured.err, (
+        "probes fired on a limit order — would drown stderr on every pending fill"
+    )
+    for probe_label in ("a", "b", "c", "d", "e", "f"):
+        assert f"[record_fills:lookup_probe_{probe_label}]" not in captured.err, (
+            f"probe_{probe_label} fired on a limit order"
+        )
+
+
 def test_resolve_fill_from_deal_default_offset_zero_preserves_back_compat() -> None:
     """Default ``server_time_offset_seconds=0`` preserves pre-fix-v3 mock contracts.
 
@@ -2561,36 +2684,42 @@ def test_emit_market_lookup_failure_probes_widewindow_distinguishes_form_from_wi
     assert f"int_kwargs_server_widewindow window=[{df_server - 86400},{dt_server + 86400}]" in text
 
 
-def test_main_does_not_emit_probes_when_order_type_not_market(
+def test_resolve_fill_from_deal_emits_probes_only_for_market_order_type(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Probe block does NOT fire when order_type != "market".
+    """Probe block lives in `_resolve_fill_from_deal` and fires only on market.
 
-    The probe block is gated inside the SAME ``if order_type == "market"
-    and retcode == success_retcode and actual_fill_price is None`` branch
-    that fires ``emit_market_lookup_failure_log``. A limit / stop pending
-    order with no fill is expected (no deal exists yet); emitting a
-    six-line probe block on every pending order would drown stderr.
+    Originally the wiring was in ``main()`` next to the loud
+    ``market_lookup_failure`` log. The 2026-05-14 live-broker marker
+    test exposed the gap: a direct call to ``_resolve_fill_from_deal``
+    (bypassing main()) silently skipped the probes. The fix moved the
+    probe call INTO the helper itself, so it fires regardless of
+    caller — the operator-facing rule is "diagnostic instrumentation
+    must be in the same call-path layer as the failure it's
+    instrumenting."
 
-    Verified at the call-site level: a direct call to the probe helper
-    fires on any input (the helper is unconditional). The gating logic
-    sits in main(). This test pins the gating contract — if a future
-    refactor moves the helper inside an unconditional branch, the gating
-    logic at the AST level would visibly regress.
+    AST-level contract: the probe call lives inside
+    ``_resolve_fill_from_deal``, gated on ``order_type == "market"``.
+    A limit / stop pending order with no fill is expected (no deal
+    exists yet); emitting a six-line probe block on every pending
+    order would drown stderr.
     """
     import ast
 
     script_path = _SCRIPT_PATH
     tree = ast.parse(script_path.read_text())
-    main_fn = next(
-        (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main"),
+    helper_fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_resolve_fill_from_deal"
+        ),
         None,
     )
-    assert main_fn is not None
+    assert helper_fn is not None, "_resolve_fill_from_deal not found in scripts/record_fills.py"
 
-    # Find the call to emit_market_lookup_failure_probes inside main().
     probe_calls: list[ast.Call] = []
-    for node in ast.walk(main_fn):
+    for node in ast.walk(helper_fn):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
@@ -2598,68 +2727,101 @@ def test_main_does_not_emit_probes_when_order_type_not_market(
         ):
             probe_calls.append(node)
     assert len(probe_calls) == 1, (
-        "expected exactly one call to emit_market_lookup_failure_probes in main(); "
-        f"found {len(probe_calls)}"
+        "expected exactly one call to emit_market_lookup_failure_probes in "
+        f"_resolve_fill_from_deal; found {len(probe_calls)}"
     )
-    # Walk up the AST to find the enclosing ``If`` and verify its test
-    # contains an ``order_type == "market"`` comparison.
+
+    # Collect ALL enclosing ``If`` nodes (the rewire nests the probe call
+    # inside both ``if deal is None:`` and ``if order_type == "market"
+    # and EMIT_...:``; we accept either as long as at least one tests
+    # ``order_type == "market"``).
     probe_call = probe_calls[0]
-    enclosing_if: ast.If | None = None
-    for if_node in ast.walk(main_fn):
+    enclosing_ifs: list[ast.If] = []
+    for if_node in ast.walk(helper_fn):
         if not isinstance(if_node, ast.If):
             continue
         for desc in ast.walk(if_node):
             if desc is probe_call:
-                enclosing_if = if_node
+                enclosing_ifs.append(if_node)
                 break
-        if enclosing_if is not None:
+    assert enclosing_ifs, (
+        "emit_market_lookup_failure_probes call has no enclosing `if` in the helper — "
+        "the probe block would fire on every soft-failure path, not just market failures"
+    )
+    market_guard_seen = False
+    for if_node in enclosing_ifs:
+        test_src = ast.unparse(if_node.test)
+        if 'order_type == "market"' in test_src or "order_type == 'market'" in test_src:
+            market_guard_seen = True
             break
-    assert enclosing_if is not None, (
-        "emit_market_lookup_failure_probes call has no enclosing `if` — "
-        "the probe block would fire on every order, not just market failures"
+    assert market_guard_seen, (
+        "the probe call must be gated on `order_type == 'market'`; none of "
+        f"its {len(enclosing_ifs)} enclosing `if` nodes contains that comparison. "
+        "Without this gate, probes would fire on every limit/stop pending order."
     )
-    # The test must literally compare order_type to "market".
-    test_src = ast.unparse(enclosing_if.test)
-    assert 'order_type == "market"' in test_src or "order_type == 'market'" in test_src, (
-        "the `if` guarding the probe call must include `order_type == 'market'`; "
-        f"got test: {test_src}"
-    )
-    # Silence the captured stream (the AST test never wrote anything).
-    _ = capsys.readouterr()
 
-
-def test_main_probe_call_is_gated_on_emit_toggle() -> None:
-    """The probe call in main() must be guarded by the module toggle.
-
-    Tests can set ``EMIT_MARKET_LOOKUP_FAILURE_PROBES = False`` to
-    suppress probe noise; the production capture pass sets it to
-    ``True`` (default). The gating must be at the call site, not
-    inside the helper — keeping the helper unconditional makes the
-    unit tests above straightforward.
-    """
-    import ast
-
-    tree = ast.parse(_SCRIPT_PATH.read_text())
+    # AND: probes must NOT also fire from main() (would double-emit on
+    # production runs). Confirm there's no `emit_market_lookup_failure_probes`
+    # call left over in main() after the rewire.
     main_fn = next(
         (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == "main"),
         None,
     )
     assert main_fn is not None
+    main_probe_calls = [
+        node
+        for node in ast.walk(main_fn)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "emit_market_lookup_failure_probes"
+    ]
+    assert not main_probe_calls, (
+        f"emit_market_lookup_failure_probes must NOT be called from main() after the "
+        f"2026-05-14 fix v4-rewire; found {len(main_probe_calls)} call(s) in main(). "
+        "The wiring lives in _resolve_fill_from_deal so direct-helper callers "
+        "(e.g. the live_broker_validation marker test) see the probes too."
+    )
+
+    # Silence the captured stream (the AST test never wrote anything).
+    _ = capsys.readouterr()
+
+
+def test_resolve_fill_from_deal_probe_call_is_gated_on_emit_toggle() -> None:
+    """The probe call inside the helper must be guarded by the module toggle.
+
+    Tests can set ``EMIT_MARKET_LOOKUP_FAILURE_PROBES = False`` to
+    suppress probe noise; the diagnostic-pass default is ``True``.
+    The gating must be at the call site (inside the helper, alongside
+    the ``order_type == "market"`` predicate), not inside the probe
+    function — keeping the probe helper unconditional makes the
+    unit tests above straightforward.
+    """
+    import ast
+
+    tree = ast.parse(_SCRIPT_PATH.read_text())
+    helper_fn = next(
+        (
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.FunctionDef) and n.name == "_resolve_fill_from_deal"
+        ),
+        None,
+    )
+    assert helper_fn is not None
 
     probe_calls: list[ast.Call] = []
-    for node in ast.walk(main_fn):
+    for node in ast.walk(helper_fn):
         if (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "emit_market_lookup_failure_probes"
         ):
             probe_calls.append(node)
-    assert probe_calls, "no emit_market_lookup_failure_probes call in main()"
+    assert probe_calls, "no emit_market_lookup_failure_probes call in _resolve_fill_from_deal"
 
-    # Walk all `If` nodes and find the innermost one enclosing the call.
     probe_call = probe_calls[0]
     enclosing_ifs: list[ast.If] = []
-    for if_node in ast.walk(main_fn):
+    for if_node in ast.walk(helper_fn):
         if not isinstance(if_node, ast.If):
             continue
         for desc in ast.walk(if_node):
@@ -2667,7 +2829,6 @@ def test_main_probe_call_is_gated_on_emit_toggle() -> None:
                 enclosing_ifs.append(if_node)
                 break
     assert enclosing_ifs, "no enclosing `if` for the probe call"
-    # Check that AT LEAST ONE enclosing `if` references the toggle by name.
     toggle_seen = False
     for if_node in enclosing_ifs:
         for desc in ast.walk(if_node.test):

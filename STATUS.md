@@ -580,10 +580,31 @@ that as a rule.
     flip it to True only during the diagnostic pass. Leaving the
     toggle on after the fix lands is a low-quality-cost regression.
 
+11. **Diagnostic instrumentation must be in the same call-path layer
+    as the failure it's instrumenting.** Added 2026-05-14 fix
+    v4-rewire after the initial fix v4 (commit `78a5d48`) wired the
+    probe call into `main()` (the orchestration layer) — but the
+    failure surfaces at the helper level (`_resolve_fill_from_deal`),
+    and the live-broker marker test
+    (`tests/scripts/test_live_broker_validation.py`) calls the helper
+    directly. The result: the marker test saw `(None, None)` from
+    the helper with **no probe lines** in stderr, because the
+    diagnostic was instrumented one layer up from where the failure
+    actually surfaces. The corollary in test design:
+    every test that exercises the failure (focused unit test, live
+    marker test, or production main()) must see the same diagnostic
+    output. Two AST regression tests
+    (`test_resolve_fill_from_deal_emits_probes_only_for_market_order_type`,
+    `test_resolve_fill_from_deal_probe_call_is_gated_on_emit_toggle`)
+    + one direct-call regression test
+    (`test_resolve_fill_from_deal_emits_probes_when_called_directly_on_market_failure`)
+    pin this contract.
+
 Cross-link to this entry's commit: see the 2026-05-14 #4 session-log
 entry at the top of this file for the fix-v4 diagnostic-pass commit
-hash. The probe-block stderr prefixes (`lookup_probe_args_passed`,
-`lookup_probe_a` through `lookup_probe_f`) are documented in
+hash + the fix-v4-rewire follow-up commit. The probe-block stderr
+prefixes (`lookup_probe_args_passed`, `lookup_probe_a` through
+`lookup_probe_f`) are documented in
 `docs/runbooks/gate-2b-fill-recording.md` 2026-05-14 fix-up #4.
 
 ## Source-verification protocol for predicates and tables

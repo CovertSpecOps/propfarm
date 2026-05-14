@@ -1357,6 +1357,34 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
         )
 
     if deal is None:
+        # 2026-05-14 fix v4-rewire — the diagnostic probe block lives
+        # HERE (inside the helper) so it fires regardless of caller.
+        # The initial fix v4 wiring put the probe call in ``main()``
+        # alongside the loud ``market_lookup_failure`` log; a direct
+        # call to ``_resolve_fill_from_deal`` (the
+        # ``test_live_broker_validation`` marker test does exactly
+        # this) bypassed the probes entirely, leaving the operator
+        # with a NaN return and no diagnostic.
+        #
+        # Operator-facing lesson (also in the STATUS.md playbook):
+        # "Diagnostic instrumentation must be in the same call-path
+        # layer as the failure it's instrumenting. If the failure
+        # surfaces at the helper level, the diagnostic must emit at
+        # the helper level too."
+        #
+        # At this point ``retcode == success_retcode`` (checked at the
+        # top of this function) AND all three lookup paths returned
+        # empty AND we are about to soft-fail to ``(None, None)``.
+        # The probes fire only for ``order_type == "market"`` because
+        # an empty lookup on a pending limit / stop is legitimate
+        # (the order is queued, not yet filled).
+        if order_type == "market" and EMIT_MARKET_LOOKUP_FAILURE_PROBES:
+            emit_market_lookup_failure_probes(
+                mt5,
+                request_time_utc=request_time_utc,
+                now_utc=now_utc,
+                server_time_offset_seconds=int(server_time_offset_seconds),
+            )
         return (None, None)
 
     # Successful resolution — claim the ticket if tracking is enabled
@@ -2092,18 +2120,15 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                     _window_to = (
                         max(_now_at_failure, request_time) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
                     )
-                    # 2026-05-14 fix v4 (diagnostic-only) — emit the six
-                    # probe lines BEFORE the loud market_lookup_failure
-                    # log so they appear together in stderr and the
-                    # operator can paste them back as a block. Gated on
-                    # the module-level toggle so tests can disable it.
-                    if EMIT_MARKET_LOOKUP_FAILURE_PROBES:
-                        emit_market_lookup_failure_probes(
-                            mt5,
-                            request_time_utc=request_time,
-                            now_utc=_now_at_failure,
-                            server_time_offset_seconds=server_time_offset_seconds,
-                        )
+                    # 2026-05-14 fix v4-rewire — the probe block now lives
+                    # inside ``_resolve_fill_from_deal`` itself (fires on
+                    # the path-3 empty return), so main() only emits the
+                    # loud market_lookup_failure log + bumps the counter.
+                    # The earlier wiring put the probe call here, which
+                    # meant a direct call to the helper (live-broker
+                    # marker test) silently skipped the probes. The
+                    # rewire keeps the diagnostic in the same call-path
+                    # layer as the failure it instruments.
                     emit_market_lookup_failure_log(
                         idx=idx,
                         symbol=symbol,
