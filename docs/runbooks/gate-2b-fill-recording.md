@@ -556,3 +556,142 @@ Then:
 2. Read the manifest at `data/raw/fill_recordings/{run_id}.json`.
    Confirm `n_market_lookup_failures` is `0`.
 3. If either gate fails, STOP and re-investigate before any 24h run.
+
+## 2026-05-14 fix-up #3 — server-time offset for `history_deals_get`
+
+The fix v2 short-test capture (run_id
+`ef34a234bf1649418d3735c3b930ca8c`, 2026-05-14, Ctrl-C'd before the
+first 10-row flush — no parquet on disk; only the stdout transcript
+is the artifact) revealed that every market fill triggered
+`[record_fills:market_lookup_failure] idx=N symbol=EURUSD order=market
+side=buy request_time=2026-05-14T18:04:34.058477+00:00
+window=[2026-05-14T18:04:33.058477+00:00,
+2026-05-14T18:04:39.204354+00:00]` on stderr — even though the MT5
+History tab confirmed the deals materialised broker-side. The
+window in UTC corresponds to ~21:04 server time (FTMO MT5 runs
+EET/EEST, currently UTC+3); the actual deals live at server-time
+~21:04 (= UTC 18:04). The script was querying a UTC window against
+a server-time-keyed cache, missing every deal by exactly 3 h.
+
+Short-test session log: **`short-test-2 FAILED`** — no parquet on
+disk (only the stdout transcript is the artifact; sibling note to
+the failed `a68b59a6…` short-test-1 from fix v2).
+
+### Root cause v3
+
+The MQL5 `HistorySelect` reference page
+(`https://www.mql5.com/en/docs/trading/historyselect`) states verbatim
+*"Retrieves the history of deals and orders for the specified period
+of server time."* The Python `history_deals_get` doc is silent on
+timezone semantics — but `HistorySelect` is the MQL5 primitive the
+date-range overload drives. The Python `symbol_info_tick` doc shows
+`tick.time = 1585070338` (a Unix-second value) without saying which
+timezone; the MQL5 `TimeCurrent` doc clarifies *"The time value is
+formed on a trade server and does not depend on the time settings on
+your computer"* — i.e. tick.time is server-time Unix seconds.
+
+The v2 mocks did not model server-time semantics — `_MockMt5`
+compared `date_from.timestamp()` (UTC) against `deal.time` (also
+UTC in the mock fixtures). Tests passed; live broker failed.
+
+### Fix v3 (this commit)
+
+* **`detect_server_time_offset_seconds(tick_time_server_unix, utc_now_unix)`**
+  helper: rounds `(tick.time - utc) / 3600` to the nearest integer
+  hour. Real-world timezone offsets are integer hours; sub-hour skew
+  is clock noise plus broker-side write latency.
+* **`main()` startup**: after `mt5.initialize()` and before the first
+  `order_send`, the script reads `mt5.symbol_info_tick("EURUSD").time`,
+  detects the offset, and emits
+  `[record_fills:server_time_offset_seconds=N] server_tz_offset_hours=+H`
+  to stderr. If `abs(offset) > 43200` (12 h), also emits
+  `[record_fills:server_offset_out_of_range] offset_seconds=N — VPS clock
+  may be misconfigured, but continuing.` and CONTINUES (does not abort —
+  the user might be running this in an odd timezone on purpose).
+* **`_resolve_fill_from_deal`** gains keyword-only
+  `server_time_offset_seconds: int = 0`. Internal datetimes stay UTC;
+  translation lives at the MT5 call-site boundary only. The helper
+  computes `date_from_unix_server = int(request_time_utc.timestamp())
+  - HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS + offset` and the matching
+  `date_to_unix_server`, and passes these ints (not datetimes) to
+  `mt5.history_select` and `mt5.history_deals_get(date_from, date_to)`.
+  The Python doc explicitly permits int Unix seconds for date params
+  ("Set by the 'datetime' object or as a number of seconds elapsed
+  since 1970.01.01") so int form is canonical, not a workaround.
+* **`deal.time` is server-time Unix**; the helper subtracts the offset
+  before constructing a UTC-tz-aware datetime, so the parquet's
+  `broker_fill_time_utc` column remains in UTC as documented.
+
+### Mock + test updates
+
+`_MockMt5` gains `server_time_offset_seconds: int = 0`.
+`symbol_info_tick(symbol)` returns `Tick(time = int(utc_now + offset),
+bid, ask)`. `history_select` and `history_deals_get(date_from,
+date_to)` interpret date params as server-time Unix seconds. The mock
+accepts either ints or datetimes for back-compat with v1/v2 fixtures.
+
+The mutation regression test
+(`test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_market_lookup_failure`)
+stages a deal at server-time UTC+3 and calls the helper with
+`server_time_offset_seconds=0` (the v2 bug condition). Assertion:
+result is `(None, None)` and `[record_fills:market_lookup_failure]`
+appears on stderr. The positive control
+(`test_resolve_fill_from_deal_engages_when_server_time_offset_applied`)
+calls the same helper with `server_time_offset_seconds=10800` and
+asserts the fill resolves. Both must pass.
+
+### What running looks like (operator stderr cheat sheet)
+
+After `mt5.initialize()`:
+
+```
+[record_fills] connected to server=FTMO-Demo01 login=12345
+[record_fills:server_time_offset_seconds=10800] server_tz_offset_hours=+3
+```
+
+If the broker is genuinely on UTC (or the VPS clock matches the
+broker), the line will read `=0]` with `+0` — that is fine, document
+it. The first non-zero `fill_price` value is only meaningful AFTER you
+confirm this line.
+
+If the line reads `[record_fills:server_offset_out_of_range]`, the
+VPS clock is likely misconfigured (or the broker is in an odd
+timezone). The script continues regardless; investigate before
+running the 24h capture.
+
+### Stderr log prefixes (extended cheat sheet)
+
+| Prefix | Meaning |
+|---|---|
+| `[record_fills:server_time_offset_seconds=N]` | (fix v3) Detected MT5 server-time offset on session startup. Companion line: `server_tz_offset_hours=+H`. |
+| `[record_fills:server_offset_out_of_range]` | (fix v3) `abs(offset_seconds) > 43200` (12 h). Warning only; script continues. |
+| `[record_fills:server_time_offset_detection_failed]` | (fix v3) `symbol_info_tick` failed or `tick.time` was 0; offset defaults to 0. Investigate before running 24h. |
+
+### Updated short-test gate
+
+After re-running the short test, the user must paste:
+
+1. The full `[record_fills:server_time_offset_seconds=N]` line from
+   stderr.
+2. The first 5 `fill_price` values from
+   `data/raw/fill_recordings/{run_id}.parquet`.
+
+The first non-zero `fill_price` is only meaningful if (a) the offset
+detection logged a non-zero N matching the broker's real timezone,
+OR (b) it logged N=0 with a documented reason (broker on UTC, VPS
+clock matches broker).
+
+If `[record_fills:market_lookup_failure]` appears in stderr for any
+market row, STOP — the offset translation is not engaging on the
+live broker. Re-investigate (likely: the offset detected at startup
+doesn't match the offset the date-range overload actually wants;
+re-check the doc reading).
+
+### Cross-links
+
+* Fix v3 commit: `<TBD>` (this commit).
+* Failed short-test session: run_id `ef34a234bf1649418d3735c3b930ca8c`
+  (no parquet flushed; stdout transcript only).
+* Playbook addendum: STATUS.md "Pathological-vendor-response catch
+  pattern → 2026-05-14 addendum #3" — three cumulative learnings
+  verbatim.

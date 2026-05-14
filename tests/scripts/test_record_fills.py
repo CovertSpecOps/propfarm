@@ -792,15 +792,29 @@ def test_parse_fill_rejected_order_unchanged_by_fix() -> None:
 class _MockMt5:
     """Mock of the MetaTrader5 module's deal-lookup surface.
 
-    Models the history-cache precondition contract: ``history_deals_get``
-    returns the pre-staged deals iff ``history_select(date_from,
-    date_to)`` has been called for a range covering the relevant deal
-    times. Without ``history_select``, every overload returns ``()`` —
-    the failure mode the v1 fix's mocks did not model and that caused
-    the 2026-05-14 short-test capture to land with NaN fills.
+    Models two real-MT5 contracts:
 
-    Three modes
-    -----------
+    1. **History-cache precondition** (fix v2). ``history_deals_get``
+       returns the pre-staged deals iff ``history_select(date_from,
+       date_to)`` has been called for a range covering the relevant
+       deal times. Without ``history_select``, every overload returns
+       ``()`` — the failure mode the v1 fix's mocks did not model and
+       that caused the 2026-05-14 short-test-1 capture to land with
+       NaN fills.
+
+    2. **Server-time semantics** (fix v3 — 2026-05-14). The
+       ``date_from`` / ``date_to`` params on ``history_select`` and the
+       date-range ``history_deals_get`` overload are interpreted as
+       **server-time** Unix seconds, not UTC. Real MT5 + the MQL5
+       ``HistorySelect`` reference doc state the date params are in
+       server time. ``deal.time`` and ``tick.time`` are also server-time
+       Unix seconds. If the helper passes UTC ints (the v2 bug), the
+       mock returns ``()`` from the time-range overload — matching the
+       real broker behavior the 2026-05-14 short-test-2 capture
+       (run_id ``ef34a234bf1649418d3735c3b930ca8c``) exposed.
+
+    Modes
+    -----
 
     * ``history_select_failure_mode="absent"`` — no ``history_select``
       attribute at all. Simulates an older MT5 build where the function
@@ -811,6 +825,14 @@ class _MockMt5:
     * ``history_select_failure_mode="returns_true"`` — normal happy path.
       ``history_select`` returns ``True``; ``history_deals_get`` is then
       gated on the prior ``history_select`` call covering the deal time.
+
+    Server-time offset
+    ------------------
+
+    ``server_time_offset_seconds`` (default 0) controls the offset
+    between server-time and UTC. ``symbol_info_tick(symbol).time``
+    returns ``utc_now + server_time_offset_seconds`` so the helper's
+    detection routine reads back the configured offset.
     """
 
     def __init__(
@@ -823,37 +845,95 @@ class _MockMt5:
         deal_entry_in: int = 0,
         deal_type_buy: int = 0,
         deal_type_sell: int = 1,
+        server_time_offset_seconds: int = 0,
+        tick_bid: float = 1.10000,
+        tick_ask: float = 1.10003,
     ) -> None:
         self._deal_by_ticket = deal_by_ticket or {}
         self._deals_by_position = deals_by_position or {}
         self._deals_for_time_range = deals_for_time_range or ()
         self._mode = history_select_failure_mode
-        self._selected_windows: list[tuple[datetime, datetime]] = []
+        # Selected windows are stored as (df_unix_int, dt_unix_int) on a
+        # **server-time** axis — that is the contract the date params
+        # carry in fix v3.
+        self._selected_windows: list[tuple[int, int]] = []
         self.history_select_calls: list[dict[str, Any]] = []
         self.DEAL_ENTRY_IN = deal_entry_in
         self.DEAL_TYPE_BUY = deal_type_buy
         self.DEAL_TYPE_SELL = deal_type_sell
+        self.server_time_offset_seconds = int(server_time_offset_seconds)
+        self._tick_bid = float(tick_bid)
+        self._tick_ask = float(tick_ask)
 
         if self._mode != "absent":
             # Bind the method only if the mode says it should exist.
             self.history_select = self._history_select
 
+    @staticmethod
+    def _coerce_unix_seconds(date_param: Any) -> int | None:
+        """Coerce a date param (int Unix or datetime) to int Unix seconds.
+
+        The Python ``history_deals_get`` doc accepts either a
+        ``datetime`` or "a number of seconds elapsed since 1970.01.01."
+        The mock accepts both shapes so tests that pre-date fix v3 and
+        pass datetimes continue to work — but the fix-v3 production
+        code path always passes ints (server-time Unix).
+        """
+        if date_param is None:
+            return None
+        if isinstance(date_param, datetime):
+            return int(date_param.timestamp())
+        return int(date_param)
+
+    def symbol_info_tick(self, symbol: str) -> SimpleNamespace:
+        """Return a tick whose ``time`` reflects the configured offset.
+
+        2026-05-14 fix v3 — the offset-detection helper compares
+        ``tick.time`` against ``time.time()``. Setting
+        ``server_time_offset_seconds`` on the mock makes
+        ``tick.time = utc_now + offset`` so the detected value matches
+        the mock's configured offset.
+        """
+        utc_now = datetime.now(UTC).timestamp()
+        return SimpleNamespace(
+            bid=self._tick_bid,
+            ask=self._tick_ask,
+            time=int(utc_now + self.server_time_offset_seconds),
+            last=0.0,
+            volume=0,
+        )
+
     def _history_select(
         self,
-        date_from: datetime | None = None,
-        date_to: datetime | None = None,
+        date_from: Any | None = None,
+        date_to: Any | None = None,
     ) -> bool:
-        self.history_select_calls.append({"date_from": date_from, "date_to": date_to})
+        df_unix = self._coerce_unix_seconds(date_from)
+        dt_unix = self._coerce_unix_seconds(date_to)
+        self.history_select_calls.append(
+            {
+                "date_from": date_from,
+                "date_to": date_to,
+                "date_from_unix": df_unix,
+                "date_to_unix": dt_unix,
+            }
+        )
         if self._mode == "returns_false":
             return False
-        if date_from is not None and date_to is not None:
-            self._selected_windows.append((date_from, date_to))
+        if df_unix is not None and dt_unix is not None:
+            self._selected_windows.append((df_unix, dt_unix))
         return True
 
     def _is_covered(self, deal_time_ts: int) -> bool:
-        """True iff some prior history_select window covers the deal time."""
-        for date_from, date_to in self._selected_windows:
-            if date_from.timestamp() <= deal_time_ts <= date_to.timestamp():
+        """True iff some prior history_select server-time window covers the deal time.
+
+        Both the window and ``deal_time_ts`` are on the server-time
+        axis (fix v3). A helper that passes UTC ints to the mock will
+        produce windows that DON'T cover the (server-time) deal_time —
+        which is the regression the mutation test exercises.
+        """
+        for df_unix, dt_unix in self._selected_windows:
+            if df_unix <= deal_time_ts <= dt_unix:
                 return True
         return False
 
@@ -861,8 +941,8 @@ class _MockMt5:
         self,
         ticket: int | None = None,
         position: int | None = None,
-        date_from: datetime | None = None,
-        date_to: datetime | None = None,
+        date_from: Any | None = None,
+        date_to: Any | None = None,
         group: str | None = None,
     ) -> tuple[Any, ...]:
         # Precondition: history_select must have been called with a
@@ -893,10 +973,14 @@ class _MockMt5:
         if date_from is not None and date_to is not None:
             if not precondition_ok:
                 return ()
-            # Filter the pre-staged time-range deals to those whose time
-            # falls within the requested window.
-            df_ts = date_from.timestamp()
-            dt_ts = date_to.timestamp()
+            # Filter the pre-staged time-range deals to those whose
+            # **server-time** ``deal.time`` falls within the requested
+            # **server-time** window (fix v3). Both axes are server-time
+            # Unix int seconds.
+            df_ts = self._coerce_unix_seconds(date_from)
+            dt_ts = self._coerce_unix_seconds(date_to)
+            if df_ts is None or dt_ts is None:
+                return ()
             return tuple(
                 d
                 for d in self._deals_for_time_range
@@ -914,6 +998,7 @@ def _make_mock_mt5(
     deal_entry_in: int = 0,
     deal_type_buy: int = 0,
     deal_type_sell: int = 1,
+    server_time_offset_seconds: int = 0,
 ) -> _MockMt5:
     """Thin factory for :class:`_MockMt5` — preserves the call site shape."""
     return _MockMt5(
@@ -924,6 +1009,7 @@ def _make_mock_mt5(
         deal_entry_in=deal_entry_in,
         deal_type_buy=deal_type_buy,
         deal_type_sell=deal_type_sell,
+        server_time_offset_seconds=server_time_offset_seconds,
     )
 
 
@@ -1119,7 +1205,12 @@ def test_resolve_fill_from_deal_requires_history_select_precondition() -> None:
     sel = happy_mock.history_select_calls[0]
     assert sel["date_from"] is not None
     assert sel["date_to"] is not None
-    assert sel["date_from"] < request_time < sel["date_to"]
+    # 2026-05-14 fix v3 — date params are now int Unix seconds (server
+    # time). With ``server_time_offset_seconds=0`` (default for this
+    # test) server-time and UTC are identical, so the window encloses
+    # ``request_time.timestamp()``.
+    request_unix = int(request_time.timestamp())
+    assert int(sel["date_from"]) < request_unix < int(sel["date_to"])
 
 
 def test_resolve_fill_from_deal_history_select_returns_false_soft_fails_and_logs(
@@ -1421,6 +1512,335 @@ def test_emit_market_lookup_failure_log_format(capsys: pytest.CaptureFixture[str
     assert "side=buy" in captured.err
     assert "request_time=" in captured.err
     assert "window=" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Fix v3 regression — server-time offset for history_deals_get date params.
+# Encodes the 2026-05-14 short-test-2 (run_id ef34a234bf1649418d3735c3b930ca8c)
+# bug class: the MQL5 ``HistorySelect`` doc states the date params are
+# interpreted in **server time**, but fix v2 passed UTC datetimes. FTMO
+# MT5 runs on EET/EEST (UTC+3 in summer); the offset must be applied at
+# the MT5 boundary. The mutation test is the load-bearing check.
+# --------------------------------------------------------------------------- #
+def test_detect_server_time_offset_rounds_to_nearest_hour() -> None:
+    """Sub-hour skew rounds to the closest whole-hour offset.
+
+    Real-world timezone offsets are integer hours; broker write latency
+    and clock drift can produce sub-hour skew that should be rounded
+    away. The detection helper rounds (tick.time - utc_now) / 3600 to
+    the nearest integer hour, then multiplies back to seconds.
+    """
+    rf = _load_module()
+    # 3 hours minus 55 seconds: still rounds to 3h = 10800s.
+    detected = rf.detect_server_time_offset_seconds(
+        tick_time_server_unix=1715600000 + 10745,
+        utc_now_unix=1715600000,
+    )
+    assert detected == 10800, f"sub-hour skew of -55s should round to nearest hour; got {detected}"
+
+    # Slightly past 3h (3h + 200s): also rounds to 3h.
+    detected = rf.detect_server_time_offset_seconds(
+        tick_time_server_unix=1715600000 + 10800 + 200,
+        utc_now_unix=1715600000,
+    )
+    assert detected == 10800
+
+    # 3h + 31 min = 12660s → rounds UP to 4h (14400).
+    detected = rf.detect_server_time_offset_seconds(
+        tick_time_server_unix=1715600000 + 12660,
+        utc_now_unix=1715600000,
+    )
+    assert detected == 14400
+
+    # Negative offset: -5h - 30s.
+    detected = rf.detect_server_time_offset_seconds(
+        tick_time_server_unix=1715600000 - 18030,
+        utc_now_unix=1715600000,
+    )
+    assert detected == -18000
+
+    # Exactly zero.
+    assert (
+        rf.detect_server_time_offset_seconds(
+            tick_time_server_unix=1715600000,
+            utc_now_unix=1715600000,
+        )
+        == 0
+    )
+
+
+def test_emit_server_time_offset_logs_normal_offset(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Normal offset (e.g. UTC+3) emits a single startup line.
+
+    Format: ``[record_fills:server_time_offset_seconds=N] server_tz_offset_hours=+H``
+    """
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(10800)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=10800]" in captured.err
+    assert "server_tz_offset_hours=+3" in captured.err
+    # No out-of-range warning at a normal offset.
+    assert "server_offset_out_of_range" not in captured.err
+
+
+def test_emit_server_time_offset_logs_at_12h_does_not_warn(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Exactly 12h (43200s) is at the threshold but does NOT warn.
+
+    The sanity bound is ``abs(offset) > 12h`` (strict greater-than).
+    """
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(43200)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=43200]" in captured.err
+    assert "server_offset_out_of_range" not in captured.err
+
+
+def test_emit_server_time_offset_logs_above_12h_warns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """43201s (just above the threshold) triggers the out-of-range warning.
+
+    Pinned to ``43200 + 1`` (and not at exactly ``43200``) per the fix v3
+    spec: the warning fires at ``abs(offset_seconds) > 43200``, strict.
+    """
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(43201)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=43201]" in captured.err
+    assert "[record_fills:server_offset_out_of_range]" in captured.err
+    assert "offset_seconds=43201" in captured.err
+    assert "VPS clock may be misconfigured" in captured.err
+    # Continues, does not abort — caller invariant. The function returns None
+    # rather than raising; we already got here, so the invariant holds.
+
+
+def test_emit_server_time_offset_logs_negative_extreme_also_warns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Negative offsets > 12h in magnitude also trigger the warning."""
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(-43201)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=-43201]" in captured.err
+    assert "[record_fills:server_offset_out_of_range]" in captured.err
+
+
+def test_resolve_fill_from_deal_engages_when_server_time_offset_applied() -> None:
+    """Positive control: correct offset → lookup succeeds.
+
+    Simulates the live FTMO summer scenario (UTC+3). The mock's
+    ``history_deals_get(date_from=int, date_to=int)`` interprets the
+    date params as server-time Unix seconds; the staged deal sits at
+    ``int(utc_now + 10800)`` (server-time). Calling the helper with the
+    matching ``server_time_offset_seconds=10800`` translates the UTC
+    window to the same server-time axis, the lookup engages, and the
+    fill price is returned.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 4, 34, tzinfo=UTC)
+    # Server-time deal: at UTC+3, ``deal.time`` = utc_unix + 10800.
+    deal_server_time_unix = int(request_time.timestamp()) + 10800
+    deal = SimpleNamespace(
+        ticket=8001,
+        price=1.10009,
+        time=deal_server_time_unix,
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={8001: deal},
+        server_time_offset_seconds=10800,
+    )
+    result = SimpleNamespace(retcode=10009, deal=8001, order=8002)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        **_resolve_kwargs(request_time_utc=request_time, symbol="EURUSD"),
+    )
+    assert price == pytest.approx(1.10009)
+    # Returned fill_time MUST be UTC. The deal.time is server-time
+    # (utc + 10800); the helper subtracts the offset before constructing
+    # the UTC datetime so the parquet's broker_fill_time_utc column is
+    # genuinely UTC.
+    assert fill_time is not None
+    assert fill_time.tzinfo is UTC
+    assert fill_time == request_time
+
+
+def test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_market_lookup_failure(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Mutation regression (load-bearing): offset=0 on a UTC+3 server reproduces the v2 bug.
+
+    Pre-stage a real deal at server-time (utc + 10800); call the helper
+    with the BUG condition ``server_time_offset_seconds=0`` (i.e. pass
+    UTC ints to ``history_deals_get`` against a server-time-keyed deal
+    cache). The mock returns ``()`` because the UTC window misses the
+    server-time deal time by 3h. Helper soft-fails to ``(None, None)``
+    and ``main()``'s downstream contract — exercised via the
+    market-lookup-failure log helper here — emits the
+    ``[record_fills:market_lookup_failure]`` line to stderr.
+
+    This pair (positive + negative) locks the regression: if a future
+    change drops the offset translation, the positive test fails
+    because the helper no longer engages; the negative test still
+    passes because it's testing the bug condition exactly.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 4, 34, tzinfo=UTC)
+    # The deal sits at server-time UTC+3.
+    deal_server_time_unix = int(request_time.timestamp()) + 10800
+    deal = SimpleNamespace(
+        ticket=8101,
+        price=1.10009,
+        time=deal_server_time_unix,
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    # Same deal also staged in the time-range bucket so path 3 is exercised.
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={8101: deal},
+        deals_for_time_range=(deal,),
+        server_time_offset_seconds=10800,
+    )
+    result = SimpleNamespace(retcode=10009, deal=8101, order=8102)
+
+    # BUG CONDITION: server_time_offset_seconds=0. The helper passes
+    # UTC int seconds to the mock's history_select / history_deals_get;
+    # the mock interprets them as server-time and finds NO covering
+    # window for the deal at utc+10800.
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=0,  # ← the v2 bug condition
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="market",
+            side="buy",
+            idx=2,
+        ),
+    )
+    assert price is None, (
+        "offset=0 against a server-time-keyed deal cache must miss; "
+        "if this asserts price != None, the fix v3 regression has reverted"
+    )
+    assert fill_time is None
+
+    # Downstream: main()'s market-lookup-failure path would emit the log.
+    # We exercise the helper directly so the test doesn't depend on main().
+    rf.emit_market_lookup_failure_log(
+        idx=2,
+        symbol="EURUSD",
+        order_type="market",
+        side="buy",
+        request_time_utc=request_time,
+        date_from=request_time - timedelta(seconds=1),
+        date_to=request_time + timedelta(seconds=5),
+    )
+    captured = capsys.readouterr()
+    assert "[record_fills:market_lookup_failure]" in captured.err
+    assert "idx=2" in captured.err
+    assert "symbol=EURUSD" in captured.err
+
+
+def test_resolve_fill_from_deal_default_offset_zero_preserves_back_compat() -> None:
+    """Default ``server_time_offset_seconds=0`` preserves pre-fix-v3 mock contracts.
+
+    All v2 tests pass without specifying ``server_time_offset_seconds``
+    on the mock or the helper (both default to 0). This test is the
+    explicit pin: with both defaults at zero, deal.time = utc_unix
+    matches the helper's UTC-axis window, and the lookup succeeds.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 11, 0, tzinfo=UTC)
+    deal = SimpleNamespace(
+        ticket=8201,
+        price=1.10005,
+        time=int(request_time.timestamp()),  # both axes UTC
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(deal_by_ticket={8201: deal})  # offset=0 default
+    result = SimpleNamespace(retcode=10009, deal=8201, order=8202)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        # No server_time_offset_seconds kwarg — defaults to 0.
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
+    assert price == pytest.approx(1.10005)
+    assert fill_time == request_time
+
+
+def test_resolve_fill_from_deal_offset_applied_via_time_range_fallback() -> None:
+    """Time-range fallback path (path 3) also applies the server-time offset.
+
+    Path 3 is the documented robust path. Verifies the offset reaches
+    the ``history_deals_get(date_from=int, date_to=int)`` call site,
+    not only the optional ``history_select`` precondition.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 19, 30, tzinfo=UTC)
+    deal_server_time_unix = int(request_time.timestamp()) + 10800
+    target = SimpleNamespace(
+        ticket=9001,
+        price=1.10011,
+        time=deal_server_time_unix,
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    # Path 1 and 2 return empty (no ticket / position match); only path
+    # 3 (time-range fallback) can resolve.
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(target,),
+        server_time_offset_seconds=10800,
+    )
+    result = SimpleNamespace(retcode=10009, deal=42, order=43)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        **_resolve_kwargs(request_time_utc=request_time, symbol="EURUSD"),
+    )
+    assert price == pytest.approx(1.10011)
+    assert fill_time == request_time
+
+
+def test_mock_symbol_info_tick_reflects_configured_offset() -> None:
+    """``_MockMt5.symbol_info_tick`` returns server-time + offset.
+
+    This is the surface the offset-detection helper reads. Pin the
+    contract so a future mock change can't silently break detection.
+    """
+    rf = _load_module()
+    mock_mt5 = _make_mock_mt5(server_time_offset_seconds=10800)
+    utc_before = datetime.now(UTC).timestamp()
+    tick = mock_mt5.symbol_info_tick("EURUSD")
+    utc_after = datetime.now(UTC).timestamp()
+    detected = rf.detect_server_time_offset_seconds(int(tick.time), utc_before)
+    assert detected == 10800
+    detected2 = rf.detect_server_time_offset_seconds(int(tick.time), utc_after)
+    assert detected2 == 10800
 
 
 # --------------------------------------------------------------------------- #

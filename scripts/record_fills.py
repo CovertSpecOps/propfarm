@@ -195,6 +195,70 @@ The :class:`SessionManifest` schema bumps to ``"1.1"`` with the new
 ``n_market_lookup_failures`` field. The :class:`FillRecord` (parquet
 column) schema is **unchanged** — the parquet column set stays locked
 at v1.0 column names; only the sidecar manifest carries the new field.
+
+2026-05-14 CRITICAL fix v3 — server-time offset for history_deals_get date params
+---------------------------------------------------------------------------------
+
+Fix v2 (commits ``9527839`` + ``a29877a`` + ``c5913d4``) wired the
+date-range overload ``history_deals_get(date_from, date_to)`` as the
+robust fallback path, but used UTC ``datetime`` objects directly as the
+date params. The short-test capture
+(run_id ``ef34a234bf1649418d3735c3b930ca8c``, 2026-05-14, no parquet
+flushed — only the stdout transcript) revealed every market row coming
+back with ``[record_fills:market_lookup_failure]`` to stderr. MT5
+History tab confirmed the deals materialised broker-side.
+
+Root cause v3: the MQL5 ``HistorySelect`` reference page
+(``https://www.mql5.com/en/docs/trading/historyselect``) states
+verbatim "Retrieves the history of deals and orders for the specified
+period of **server time**." The Python ``history_deals_get`` docs are
+silent on timezone semantics — but ``HistorySelect`` is the underlying
+MQL5 primitive the date-range overload drives. FTMO MT5 currently runs
+on EET/EEST (UTC+3 in summer, UTC+2 in winter). When the script passes
+``request_time_utc`` (e.g. 18:04 UTC) the broker interprets it as
+server-time 18:04 (which is 15:04 UTC), so the lookup window misses
+the real deals (at server-time 21:04 = UTC 18:04) by 3 hours.
+
+Fix v3:
+
+* On startup, after ``mt5.initialize()``, the script calls
+  ``mt5.symbol_info_tick("EURUSD")`` and compares ``tick.time``
+  (server-time Unix seconds — confirmed by the Python doc example
+  ``Tick(time=1585070338, …)`` which is consistent with epoch
+  seconds; the MQL5-side ``TimeCurrent`` doc clarifies that
+  "the time value is formed on a trade server and does not depend
+  on the time settings on your computer") against ``time.time()``
+  (UTC Unix seconds). The difference, rounded to the nearest hour,
+  is the ``server_time_offset_seconds``. Logged as
+  ``[record_fills:server_time_offset_seconds=<N>]`` to stderr
+  (plus a human-readable ``server_tz_offset_hours=+<H>`` companion).
+* The detected offset is threaded into ``_resolve_fill_from_deal``
+  via a keyword-only ``server_time_offset_seconds: int = 0`` param
+  (default 0 keeps existing unit tests backward-compatible).
+* At the ``mt5.history_select`` and ``mt5.history_deals_get(date_from,
+  date_to)`` call sites the helper translates the UTC window to
+  **server-time integer Unix seconds** before passing them. The
+  ``history_deals_get`` docs explicitly permit integer Unix-seconds
+  for date params: *"Set by the 'datetime' object or as a number of
+  seconds elapsed since 1970.01.01."* — so the integer form is
+  canonical, not a workaround. Internal datetimes in the helper
+  stay UTC; translation lives at the MT5 call-site boundary only.
+* Sanity check: if ``abs(offset_seconds) > 43200`` (12 hours), the
+  script emits a loud ``[record_fills:server_offset_out_of_range]``
+  warning to stderr but does NOT abort (the VPS might be on an odd
+  timezone on purpose; just warn).
+
+The ``_MockMt5`` test class gains a ``server_time_offset_seconds``
+field so ``history_deals_get(date_from=int, date_to=int)`` interprets
+its integer params as server-time. A mutation regression test exercises
+the offset=10800 case (UTC+3 like FTMO summer) and asserts that calling
+the helper with offset=0 (the bug condition) reproduces the empty-lookup
+soft-fail.
+
+``FillRecord`` parquet schema unchanged. ``SessionManifest`` schema
+stays at ``"1.2"`` — recording the detected offset in the manifest was
+considered for forensics but rejected to avoid a v1.3 bump for a
+diagnostic value already logged to stderr.
 """
 
 from __future__ import annotations
@@ -237,6 +301,23 @@ ALLOWED_SERVER_PREFIX: Final[str] = "FTMO-Demo"
 #: of seconds around ``order_send`` calls.
 HISTORY_LOOKUP_WINDOW_PAD_BEFORE: Final[timedelta] = timedelta(seconds=1)
 HISTORY_LOOKUP_WINDOW_PAD_AFTER: Final[timedelta] = timedelta(seconds=5)
+
+#: Integer-second siblings of the pad constants above. Used at the
+#: ``mt5.history_select`` / ``mt5.history_deals_get`` boundary where the
+#: docs permit integer Unix-seconds in addition to ``datetime`` objects,
+#: and where the date params are interpreted in **server time** (see
+#: 2026-05-14 fix v3 docstring section). The helper translates the UTC
+#: window to server-time int Unix-seconds by adding the detected
+#: ``server_time_offset_seconds`` at the boundary.
+HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS: Final[int] = 1
+HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS: Final[int] = 5
+
+#: Maximum plausible absolute server-time offset in seconds. 12h = 43200s.
+#: Anything wider suggests a clock issue on the VPS rather than a real
+#: timezone offset. The script logs ``[record_fills:server_offset_out_of_range]``
+#: but does NOT abort (the user might be running this in an odd timezone
+#: on purpose — e.g. a manually-set test clock).
+SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS: Final[int] = 12 * 3600
 
 # Session anchor minutes-of-day in UTC. London 07:00, NY am 12:00 (DST safety
 # captured in distribution; we keep a single canonical UTC anchor since FX
@@ -836,6 +917,91 @@ def parse_fill_into_record(
 _LOG_PREFIX_HISTORY_SELECT_FAILED: Final[str] = "[record_fills:history_select_failed]"
 _LOG_PREFIX_MARKET_LOOKUP_FAILURE: Final[str] = "[record_fills:market_lookup_failure]"
 _LOG_PREFIX_AMBIGUOUS_DEAL_MATCH: Final[str] = "[record_fills:ambiguous_deal_match]"
+#: 2026-05-14 fix v3 — startup diagnostic emitted after offset detection.
+_LOG_PREFIX_SERVER_TIME_OFFSET: Final[str] = "[record_fills:server_time_offset_seconds"
+_LOG_PREFIX_SERVER_OFFSET_OUT_OF_RANGE: Final[str] = "[record_fills:server_offset_out_of_range]"
+
+
+def detect_server_time_offset_seconds(
+    tick_time_server_unix: int | float,
+    utc_now_unix: int | float,
+) -> int:
+    """Detect the MT5 trade-server timezone offset relative to UTC.
+
+    The MT5 ``HistorySelect`` reference (the MQL5 primitive underlying
+    the Python ``history_deals_get(date_from, date_to)`` overload) is
+    documented as operating on **server time**. FTMO MT5 currently
+    runs on EET/EEST (UTC+2 winter / UTC+3 summer); a script that
+    passes UTC datetimes to the date-range overload will miss every
+    deal by the offset width.
+
+    Detection: compare a fresh ``symbol_info_tick(...).time`` value
+    (server-time Unix seconds per the MQL5 ``TimeCurrent`` doc:
+    "the time value is formed on a trade server and does not depend
+    on the time settings on your computer") against the UTC Unix
+    wallclock. Round to the nearest hour because real-world timezone
+    offsets are integer hours; sub-hour skew is just clock noise
+    plus broker-side write latency.
+
+    Parameters
+    ----------
+    tick_time_server_unix
+        The ``time`` field from ``mt5.symbol_info_tick(symbol)``,
+        i.e. server-time Unix seconds.
+    utc_now_unix
+        ``time.time()`` snapshotted close to the tick read, i.e.
+        UTC Unix seconds.
+
+    Returns
+    -------
+    int
+        Server-time offset in seconds, rounded to the nearest hour
+        (``round((tick - utc) / 3600) * 3600``). Positive means the
+        server is ahead of UTC.
+    """
+    delta_seconds = float(tick_time_server_unix) - float(utc_now_unix)
+    return int(round(delta_seconds / 3600.0) * 3600)
+
+
+def emit_server_time_offset_logs(
+    offset_seconds: int,
+    *,
+    stream: Any = None,
+) -> None:
+    """Emit the startup diagnostic logs for the detected offset.
+
+    Always emits ``[record_fills:server_time_offset_seconds=N]`` plus a
+    human-readable ``server_tz_offset_hours=±H`` companion. If the
+    absolute offset exceeds :data:`SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS`
+    (12 h), also emits ``[record_fills:server_offset_out_of_range]`` —
+    not an abort, just a warning. The VPS might be on an odd timezone
+    on purpose, but a > 12 h offset most often indicates a clock issue.
+
+    Parameters
+    ----------
+    offset_seconds
+        The integer-second offset returned by
+        :func:`detect_server_time_offset_seconds`.
+    stream
+        Optional file-like target; defaults to ``sys.stderr``. Tests
+        can pass an ``io.StringIO`` to capture without ``capsys``.
+    """
+    target = stream if stream is not None else sys.stderr
+    hours = offset_seconds / 3600.0
+    # Format with explicit sign so +0 and -0 both render as +0.
+    sign = "+" if hours >= 0 else "-"
+    hours_repr = f"{sign}{abs(hours):g}"
+    print(
+        f"{_LOG_PREFIX_SERVER_TIME_OFFSET}={offset_seconds}] server_tz_offset_hours={hours_repr}",
+        file=target,
+    )
+    if abs(offset_seconds) > SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS:
+        print(
+            f"{_LOG_PREFIX_SERVER_OFFSET_OUT_OF_RANGE} "
+            f"offset_seconds={offset_seconds} — "
+            f"VPS clock may be misconfigured, but continuing.",
+            file=target,
+        )
 
 
 def _resolve_fill_from_deal(  # pragma: no cover - integration path
@@ -850,6 +1016,7 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     side: Side,
     idx: int | None = None,
     claimed_deal_tickets: set[int] | None = None,
+    server_time_offset_seconds: int = 0,
 ) -> tuple[float | None, datetime | None]:
     """Resolve the deal-record fill price + time for a successful order.
 
@@ -914,6 +1081,20 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
         deal's ticket. Prevents double-attribution when two same-symbol
         same-side orders fire within the lookup window. The caller
         owns the set; passing ``None`` disables claim tracking (tests).
+    server_time_offset_seconds
+        2026-05-14 fix v3 — the MT5 server timezone offset relative to
+        UTC in integer seconds (detected by
+        :func:`detect_server_time_offset_seconds` at session startup).
+        Applied at the ``mt5.history_select`` and
+        ``mt5.history_deals_get(date_from, date_to)`` call sites only;
+        internal datetimes stay UTC. The MQL5 ``HistorySelect`` doc
+        states the date params are interpreted in **server time**, so
+        the helper translates ``request_time_utc → server-time int
+        Unix seconds`` at the boundary. The Python
+        ``history_deals_get`` doc explicitly permits int-second date
+        params ("Set by the 'datetime' object or as a number of
+        seconds elapsed since 1970.01.01"). Default ``0`` preserves
+        unit-test back-compat for tests that don't model the offset.
 
     Returns
     -------
@@ -933,26 +1114,54 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     # window stays well-formed even when the caller passes a future
     # ``request_time_utc`` (test fixtures use future timestamps; in
     # production ``request_time_utc`` is always just before ``order_send``
-    # and ``now_utc`` is the later anchor).
+    # and ``now_utc`` is the later anchor). The ``date_from`` / ``date_to``
+    # datetimes are kept in UTC for the stderr log (human-readable ISO);
+    # the int Unix-seconds variants below are what we pass to MT5 with the
+    # server-time offset applied (2026-05-14 fix v3).
     now_utc = datetime.now(tz=UTC)
     date_from = request_time_utc - HISTORY_LOOKUP_WINDOW_PAD_BEFORE
     date_to = max(now_utc, request_time_utc) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
+
+    # 2026-05-14 fix v3 — server-time translation at the MT5 call-site
+    # boundary. The MQL5 ``HistorySelect`` doc states the date params
+    # are interpreted in **server time**; FTMO MT5 runs on EET/EEST
+    # (UTC+3 in summer / UTC+2 in winter). Passing UTC datetimes
+    # silently misses every deal by the offset width. Translation is
+    # UTC int seconds + offset → server-time int seconds. The Python
+    # ``history_deals_get`` doc permits int seconds for date params
+    # ("Set by the 'datetime' object or as a number of seconds elapsed
+    # since 1970.01.01") — int form is canonical, not a workaround.
+    date_from_unix_server = (
+        int(request_time_utc.timestamp())
+        - HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS
+        + int(server_time_offset_seconds)
+    )
+    date_to_unix_server = (
+        int(max(now_utc, request_time_utc).timestamp())
+        + HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS
+        + int(server_time_offset_seconds)
+    )
 
     # Defensive history_select precondition. Not officially in the Python
     # MetaTrader5 API docs (only the MQL5 server-side HistorySelect is
     # documented), but some MT5 builds expose it as the precondition that
     # populates the deal-history cache. Calling it via ``hasattr`` is safe
-    # on all versions: present -> engages; absent -> skipped.
+    # on all versions: present -> engages; absent -> skipped. Passes the
+    # server-time int unix seconds (per fix v3) since this is the MQL5
+    # primitive that operates on server time.
     history_select = getattr(mt5, "history_select", None)
     if history_select is not None:
         ok = True
         select_exc_type: str | None = None
         try:
-            ok = history_select(date_from=date_from, date_to=date_to)
+            ok = history_select(
+                date_from=date_from_unix_server,
+                date_to=date_to_unix_server,
+            )
         except TypeError:
             # Older builds may use positional-only; retry positionally.
             try:
-                ok = history_select(date_from, date_to)
+                ok = history_select(date_from_unix_server, date_to_unix_server)
             except Exception as exc:  # pragma: no cover — defensive
                 ok = False
                 select_exc_type = type(exc).__name__
@@ -960,7 +1169,9 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
             # Disambiguate "returned False" from "raised <Exc>" so the
             # operator can grep stderr and tell whether the broker is
             # reporting a select-failure or whether some other exception
-            # short-circuited the call.
+            # short-circuited the call. Window is logged in human-readable
+            # UTC ISO; the server-time ints we actually passed are derived
+            # from these via ``server_time_offset_seconds``.
             raised_suffix = f" raised={select_exc_type}" if select_exc_type else ""
             print(
                 f"{_LOG_PREFIX_HISTORY_SELECT_FAILED} "
@@ -1011,11 +1222,18 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
         # period in a single call similar to the HistoryDealsTotal and
         # HistoryDealSelect tandem", i.e. it drives the history cache
         # internally. Filter strictly by (symbol, volume, side, entry).
+        # The date params are server-time int Unix-seconds (fix v3);
+        # ``request_time_utc`` stays UTC so the closest-time delta
+        # arithmetic inside the fallback operates on a comparable
+        # server-time-Unix vs server-time-Unix axis (deal.time on the
+        # broker side is already server-time; we shift request_time_utc
+        # to server-time-Unix inside the fallback for the delta math).
         deal = _time_range_fallback_lookup(
             mt5,
-            date_from=date_from,
-            date_to=date_to,
+            date_from_unix_server=date_from_unix_server,
+            date_to_unix_server=date_to_unix_server,
             request_time_utc=request_time_utc,
+            server_time_offset_seconds=int(server_time_offset_seconds),
             symbol=symbol,
             volume_lots=volume_lots,
             side=side,
@@ -1043,15 +1261,22 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     deal_time = getattr(deal, "time", None)
     if deal_time is None or int(deal_time) == 0:
         return (price, None)
-    return (price, datetime.fromtimestamp(int(deal_time), tz=UTC))
+    # 2026-05-14 fix v3 — ``deal.time`` is server-time Unix seconds
+    # (per the MQL5 ``HistorySelect`` doc + community broker behavior);
+    # subtract the offset before constructing a UTC-tz-aware datetime
+    # so ``broker_fill_time_utc`` in the parquet remains in UTC as the
+    # column name documents.
+    deal_time_utc_unix = int(deal_time) - int(server_time_offset_seconds)
+    return (price, datetime.fromtimestamp(deal_time_utc_unix, tz=UTC))
 
 
 def _time_range_fallback_lookup(  # pragma: no cover - integration path
     mt5: Any,
     *,
-    date_from: datetime,
-    date_to: datetime,
+    date_from_unix_server: int,
+    date_to_unix_server: int,
     request_time_utc: datetime,
+    server_time_offset_seconds: int,
     symbol: str,
     volume_lots: float,
     side: Side,
@@ -1072,7 +1297,9 @@ def _time_range_fallback_lookup(  # pragma: no cover - integration path
       already claimed.
 
     Multi-match: pick the deal whose ``time`` is closest to
-    ``request_time_utc`` and log
+    ``request_time_utc`` (after translating to server-time Unix so the
+    delta math operates on a server-vs-server axis — see 2026-05-14
+    fix v3 docstring section) and log
     ``[record_fills:ambiguous_deal_match]`` to stderr. The closest-time
     heuristic is correct when two consecutive same-symbol same-side
     market orders fire within the lookup window — the second order's
@@ -1083,7 +1310,14 @@ def _time_range_fallback_lookup(  # pragma: no cover - integration path
     Any | None
         The chosen deal, or ``None`` if no candidate matched.
     """
-    deals = mt5.history_deals_get(date_from=date_from, date_to=date_to)
+    # 2026-05-14 fix v3 — pass server-time int Unix seconds to MT5. The
+    # MQL5 ``HistorySelect`` doc states the date params are interpreted
+    # in server time; the Python ``history_deals_get`` doc explicitly
+    # permits int Unix seconds in addition to datetime.
+    deals = mt5.history_deals_get(
+        date_from=date_from_unix_server,
+        date_to=date_to_unix_server,
+    )
     if not deals:
         return None
 
@@ -1091,7 +1325,12 @@ def _time_range_fallback_lookup(  # pragma: no cover - integration path
     deal_type_buy = int(getattr(mt5, "DEAL_TYPE_BUY", 0))
     deal_type_sell = int(getattr(mt5, "DEAL_TYPE_SELL", 1))
     want_type = deal_type_buy if side == "buy" else deal_type_sell
-    request_ts = request_time_utc.timestamp()
+    # 2026-05-14 fix v3 — translate request_time_utc to server-time Unix
+    # for the closest-time delta math, since deal.time is server-time
+    # Unix already. Without this translation, delta values printed in
+    # the ambiguous-match log would carry the offset (still correct
+    # for ranking — offset cancels — but misleading in the log line).
+    request_ts_server = request_time_utc.timestamp() + float(server_time_offset_seconds)
 
     candidates: list[Any] = []
     for cand in deals:
@@ -1112,12 +1351,15 @@ def _time_range_fallback_lookup(  # pragma: no cover - integration path
     if not candidates:
         return None
 
-    # Closest-time match. The deal's time is broker-side epoch seconds.
+    # Closest-time match. The deal's time is broker-side (server-time)
+    # epoch seconds. ``request_ts_server`` is request_time_utc shifted
+    # into the same server-time axis (fix v3) so the delta math is
+    # invariant under the timezone offset.
     def _delta(c: Any) -> float:
         t = getattr(c, "time", None)
         if t is None:
             return float("inf")
-        return abs(float(int(t)) - request_ts)
+        return abs(float(int(t)) - request_ts_server)
 
     candidates.sort(key=_delta)
     chosen = candidates[0]
@@ -1368,6 +1610,29 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             )
         print(f"[record_fills] connected to server={account.server} login={account.login}")
 
+        # 2026-05-14 fix v3 — detect the MT5 trade-server timezone offset
+        # before the first order_send. FTMO MT5 currently runs on
+        # EET/EEST (UTC+3 in summer). The offset is applied at the
+        # ``mt5.history_select`` / ``mt5.history_deals_get(date_from,
+        # date_to)`` boundary inside ``_resolve_fill_from_deal``;
+        # internal datetimes stay UTC.
+        server_time_offset_seconds = 0
+        try:
+            offset_tick = mt5.symbol_info_tick("EURUSD")
+            if offset_tick is not None and getattr(offset_tick, "time", None):
+                server_time_offset_seconds = detect_server_time_offset_seconds(
+                    int(offset_tick.time),
+                    time.time(),
+                )
+        except Exception as exc:  # pragma: no cover — defensive on broker quirks
+            print(
+                f"[record_fills:server_time_offset_detection_failed] "
+                f"exc_type={type(exc).__name__} exc_msg={exc!r} — "
+                f"defaulting offset_seconds=0",
+                file=sys.stderr,
+            )
+        emit_server_time_offset_logs(server_time_offset_seconds)
+
         constants = {
             "TRADE_ACTION_DEAL": mt5.TRADE_ACTION_DEAL,
             "TRADE_ACTION_PENDING": mt5.TRADE_ACTION_PENDING,
@@ -1488,6 +1753,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                     side=side,
                     idx=idx,
                     claimed_deal_tickets=claimed_deal_tickets,
+                    server_time_offset_seconds=server_time_offset_seconds,
                 )
 
                 # Market-vs-pending lookup-failure distinction. A market

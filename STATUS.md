@@ -65,6 +65,14 @@ Wave 6b shipped spread (6.1), slippage (7.1), and Gate-2B fill-recording prep. W
 
 - **2026-05-14 #1** — **CRITICAL fix-up batch** for `scripts/record_fills.py`. The 2026-05-13 ~15h VPS capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`, 110 rows / 107 filled / 3 rejected) landed with `fill_price = 0.0` on every retcode=10009 row and `slippage_observed_pips` in the ±11,700 to ±13,500 range. Root cause confirmed: `parse_fill_into_record` read `mt5.OrderSendResult.price` directly, which is `0` for MT5 **market orders in most cases** — the executed fill price lives in the subsequent deal record retrieved via `mt5.history_deals_get(...)`. Existing 18 unit tests passed because their `SimpleNamespace` fixtures set `price` to a non-zero value (the semantically-clean shape; not the pathological one real MT5 returns). Fix-up batch: (a) `parse_fill_into_record` patched to accept `actual_fill_price` / `actual_fill_time_utc` keyword-only args (Option B DI), with a soft-failure path that prefixes the comment with `retcode_or_deal_failure:` when retcode=10009 but the deal lookup returned None; (b) `_resolve_fill_from_deal` helper added wrapping `mt5.history_deals_get` with `deal=`-then-`position=` fallback and `DEAL_ENTRY_IN` filter; (c) 11 new regression tests in `tests/scripts/test_record_fills.py` (29 tests total) covering the pathological mock, four-case slippage sign convention, soft-failure path, deal-helper happy / fallback / soft-fail / zero-price / reject paths, structural verification against the captured parquet, and a crash-hardening smoke test; (d) per-iteration `try/except` in `main()` logs to **stderr** with prefix `[record_fills:exception]` so Task Scheduler hidden jobs surface failures; (e) sidecar `UNUSABLE.md` written and manifest updated with `"status": "fill_price-unusable"`; (f) `src/propfarm/gates/gate_2b.py` gained a `_reject_if_unusable_manifest` guard with 3 regression tests in `tests/gates/test_gate_2b.py` (17 tests total). New STATUS.md playbook entry "Pathological-vendor-response catch pattern" added alongside the Vendor-convention pattern. Commits: `9dd9af6` (fix); `a91ccbf` (placeholder-hash backfill in playbook / manifest / UNUSABLE.md); `09bf313` (sidecar gained buggy-version SHA `450873c` and per-column VALID/INVALID downstream-use enumeration per user addendum). Fresh adversarial reviewer returned APPROVED WITH FOLLOW-UPS; HIGH (AST regression on `main()` except clauses), MEDIUM (runbook lesson + short-test protocol), LOW (this session-log cross-link), NIT (Gate 2B status row) all applied in a single fix-up commit.
 
+- **2026-05-14 #3** — **CRITICAL fix v3 batch** for `scripts/record_fills.py` after fix v2 (commits `9527839` + `a29877a` + `c5913d4`) did not engage on the live broker. The user ran the v2 short-test capture (run_id `ef34a234bf1649418d3735c3b930ca8c`, 2026-05-14, Ctrl-C'd before any parquet flush — only the stdout transcript is preserved as artifact); every market fill came back with `[record_fills:market_lookup_failure] idx=N symbol=EURUSD order=market side=buy request_time=2026-05-14T18:04:34.058477+00:00 window=[2026-05-14T18:04:33.058477+00:00, 2026-05-14T18:04:39.204354+00:00]` on stderr while the MT5 History tab confirmed the deals materialised broker-side. Root cause v3: the MQL5 `HistorySelect` reference doc (`https://www.mql5.com/en/docs/trading/historyselect`) states verbatim *"Retrieves the history of deals and orders for the specified period of server time"* — but fix v2 passed UTC datetimes to the date-range overload. The Python `history_deals_get` doc is silent on timezone semantics, but `HistorySelect` is the MQL5 primitive the Python overload drives. FTMO MT5 currently runs on EET/EEST (UTC+3 in summer); when the script passed `request_time_utc` (e.g. 18:04 UTC) the broker interpreted it as server-time 18:04 (which is 15:04 UTC), so the lookup window missed the real deals (at server-time 21:04 = UTC 18:04) by exactly the offset width. The v2 mocks did not model server-time semantics, so v2 tests passed while the live broker failed — third instance of the same class of bug (fill_price=0 in v1, history_select precondition in v2, server-time in v3). Fix v3 (this commit): (a) `detect_server_time_offset_seconds(tick_time_server_unix, utc_now_unix)` helper added — rounds `(tick.time - utc) / 3600` to the nearest integer hour; (b) `main()` reads `mt5.symbol_info_tick("EURUSD").time` after `mt5.initialize()`, detects the offset, and emits `[record_fills:server_time_offset_seconds=N] server_tz_offset_hours=+H` to stderr; if `abs(offset) > 43200` (12 h) also emits `[record_fills:server_offset_out_of_range]` warning but does NOT abort; (c) `_resolve_fill_from_deal` gains keyword-only `server_time_offset_seconds: int = 0` param; internal datetimes stay UTC; translation lives at the MT5 call-site boundary only — passes int Unix seconds (server-time) to `mt5.history_select` and `mt5.history_deals_get(date_from, date_to)` per the doc's permissible `"datetime object or number of seconds elapsed since 1970.01.01"`; (d) `deal.time` (server-time Unix) is shifted back to UTC by subtracting the offset before constructing the `broker_fill_time_utc` tz-aware datetime, keeping the parquet column genuinely UTC; (e) module-level int constants `HISTORY_LOOKUP_WINDOW_PAD_BEFORE_SECONDS = 1` and `HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS = 5` added alongside the existing timedelta versions; (f) `_MockMt5` gains `server_time_offset_seconds: int = 0` field; `symbol_info_tick(symbol)` returns `Tick(time = int(utc_now + offset), bid, ask)`; `history_select` and `history_deals_get(date_from, date_to)` interpret the date params as server-time Unix seconds (so the helper passing UTC ints — the v2 bug — returns `()` matching real-broker behavior); the mock accepts either ints or datetimes for back-compat with v1/v2 tests; (g) 10 new regression tests in `tests/scripts/test_record_fills.py` (53 tests total) covering rounding (positive offset, sub-hour skew, negative, exactly-zero, just-above-12h), emit-log format (normal / at-12h-threshold / above-12h / negative-extreme), mutation regression (offset=10800 on mock vs offset=0 on helper reproduces the v2 bug as `(None, None)` + market_lookup_failure log), positive control (offset=10800 on both → fill resolved), back-compat (both defaults at 0 → existing v2 fixtures pass unchanged), path-3-applies-offset, mock symbol_info_tick reflects configured offset. **MetaQuotes doc verification** (per fix v3 dispatch-brief mandate): the `history_deals_get` page itself is silent on timezone semantics; the MQL5-side `HistorySelect` page is explicit ("server time"). The `history_deals_get` doc DOES explicitly permit int Unix seconds for date params: *"Set by the 'datetime' object or as a number of seconds elapsed since 1970.01.01."* — so the int form is canonical, not a workaround. The Python `symbol_info_tick` doc is silent on `tick.time` timezone semantics; the MQL5 `TimeCurrent` doc clarifies *"The time value is formed on a trade server and does not depend on the time settings on your computer"* — confirming server-time. The Python `copy_ticks_range` doc says *"MetaTrader 5 stores tick and bar open time in UTC time zone (without the shift)"* — that applies to ticks and bars only, NOT to history deals; the history-deal date params are server-time per the MQL5 primitive they drive. `SessionManifest` schema stays at `"1.2"` — recording the offset in the manifest for forensics was considered and rejected (stderr log is sufficient; no parquet column change needed; v1.0/v1.1/v1.2 manifest back-compat tests stay green). `FillRecord` parquet column schema **unchanged**. Runbook gained a `2026-05-14 fix-up #3` section sibling to #2 + the failed `ef34a234` short-test-2 session-log note + updated short-test gate (operator must also paste `server_time_offset_seconds` line). Playbook entry "Pathological-vendor-response catch pattern" gained a 2026-05-14 addendum #3 with the three cumulative learnings verbatim from the dispatch brief. Commit: `<TBD>`.
+
+  > **The three cumulative learnings (verbatim from the user, fix v3 dispatch brief):**
+  >
+  > 1. MetaTrader5 Python API mocks must reflect real API contracts (history_select precondition, server-time semantics, possibly more we haven't hit yet). Each new mock added to the test suite must be cross-referenced against the documented contract OR against a live-broker validation run.
+  > 2. Each broker-side integration class should ship with at least one live-broker validation test that runs against a real account in demo mode and asserts the contract holds. The unit tests with mocks are necessary but not sufficient.
+  > 3. When a fix doesn't engage on the live broker but mocks pass, the FIRST hypothesis should be "the mock doesn't match real API behavior," not "the implementation is wrong." This is the third instance of that class of bug (fill_price=0, history_select, server time). All three classes were not in the original mock contract.
+
 - **2026-05-14 #2** — **CRITICAL fix v2 batch** for `scripts/record_fills.py` after fix v1 (commit `9dd9af6`) did not engage on the live broker. The user ran the short-test capture per the runbook (run_id `a68b59a65e384f4d859d3bf257253d75`, 2026-05-14 16:11 UTC); every market fill came back with `fill_price=NaN`. **No parquet on disk** — the user Ctrl-C'd at idx=006 before the first 10-row flush, so the stdout transcript (7 rows: 1 limit + 1 limit + 4 market + 1 stop + 1 market, all `retcode=10009 fill=NaN`) is the only artifact and lives in the fix-v2 dispatch brief, not in `data/raw/`. MT5 History tab on the VPS confirmed the deals DID execute broker-side (~17 round-trip deals, real prices like GBPUSD 1.35237 / EURUSD 1.17179, real ticket numbers 448311315 / 448313054, $100,000 → $99,990.89 balance change matching individual costs). Root cause: the Python `history_deals_get(ticket=...)` and `(position=...)` overloads silently return `()` on certain MT5 builds unless the deal-history cache has been populated for the relevant time window first; the v1 fix mocks did not model that precondition. Fix v2 (this commit): (a) `_resolve_fill_from_deal` rewritten with three-path lookup ordering — ticket → position → time-range via `history_deals_get(date_from, date_to)` filtered by symbol+volume+side+`DEAL_ENTRY_IN` (documented MetaQuotes overload that engages the history cache); (b) defensive `mt5.history_select(date_from, date_to)` precondition call gated by `hasattr` so safe on all MT5 builds; emits `[record_fills:history_select_failed]` to stderr on False return; (c) session-scoped claim-tracking set passed to the helper prevents double-attribution of one deal to two consecutive same-symbol same-side market orders; (d) closest-time match on multi-candidate emits `[record_fills:ambiguous_deal_match]` to stderr; (e) order-type-aware loud-error path: `order_type='market'` + `retcode=10009` + empty lookup increments a session-scoped `n_market_lookup_failures` counter AND emits `[record_fills:market_lookup_failure] idx=N symbol=S order=M side=D request_time=T window=[F,T]` to stderr; `order_type in ('limit','stop')` + empty lookup is silent and expected; (f) `SessionManifest` schema bumped to `"1.1"` with new `n_market_lookup_failures: int` field; `FillRecord` parquet column schema **unchanged**; (g) Gate 2B `_reject_if_unusable_manifest` gains second rejection criterion: `n_market_lookup_failures / max(n_filled, 1) > 0.05` (strict-greater-than; new constant `MAX_MARKET_LOOKUP_FAILURE_RATIO = 0.05`); (h) `_MockMt5` test class replaces the v1 `SimpleNamespace` mock — models the `history_select` → `history_deals_get` precondition contract; `history_deals_get` returns `()` until `history_select` is called for a covering window. 13 new regression tests in `tests/scripts/test_record_fills.py` (43 tests total) and 4 new regression tests in `tests/gates/test_gate_2b.py` (21 tests total) covering history_select happy path / returns-False soft-fail / absent-attr build / time-range fallback / time-range side filter / claim tracking / ambiguous-match log / market-vs-pending parse-helper behavior / manifest schema v1.1 / gate threshold rejection above 5% / acceptance below 5% / acceptance at exactly 5% / forward-compat with v1.0 manifests. **MetaQuotes doc verification** (per dispatch-brief mandate): `history_deals_get(date_from, date_to)` overload is documented as "receiving all history deals within a specified period in a single call similar to the HistoryDealsTotal and HistoryDealSelect tandem" — i.e. it drives the history cache internally. The Python `MetaTrader5` documented API does NOT list `history_select`; only the MQL5 server-side `HistorySelect` is documented. The defensive `hasattr(mt5, "history_select")` call is therefore safe on documented builds and additive on builds where the function exists undocumented. Runbook gained a 2026-05-14 fix-up #2 section + stderr-prefix grep cheat-sheet + updated short-test gate (also check `n_market_lookup_failures == 0` in manifest). Playbook entry "Pathological-vendor-response catch pattern" gained a 2026-05-14 addendum #2 with the user-mandated `history_select` lesson and two new reviewer rejection criteria (5: state-changing-call history queries must model precondition; 6: order-type-aware empty-response semantics need both branches tested). Commit: `9527839`.
 
 ### Short-test capture protocol — `short-test-1 FAILED` (2026-05-14)
@@ -78,6 +86,26 @@ returning `(None, None)` for every successful retcode=10009 market
 order. The fix-v2 short-test gate (per runbook) now requires the next
 short-test to additionally show `n_market_lookup_failures == 0` in the
 manifest before any 24h run is kicked off.
+
+### Short-test capture protocol — `short-test-2 FAILED` (2026-05-14)
+
+The fix-v2 short-test capture (run_id
+`ef34a234bf1649418d3735c3b930ca8c`) exposed the v3 bug. Same shape as
+short-test-1: no parquet flushed; only the stdout transcript is the
+artifact. Every market fill triggered
+`[record_fills:market_lookup_failure] idx=2 symbol=EURUSD order=market
+side=buy request_time=2026-05-14T18:04:34.058477+00:00
+window=[2026-05-14T18:04:33.058477+00:00,
+2026-05-14T18:04:39.204354+00:00]` on stderr — the window in UTC
+corresponds to ~21:04 server time (UTC+3 on FTMO EET/EEST), while the
+actual deals lived at server-time ~21:04 (= UTC 18:04). The
+fix-v3 short-test gate (per runbook 2026-05-14 fix-up #3) requires
+the next short-test to additionally show
+`[record_fills:server_time_offset_seconds=N]` on stderr with a
+documented non-zero N (or zero plus a documented reason — e.g. the
+broker is genuinely on UTC, or the VPS clock matches the broker).
+The first non-zero `fill_price` value in the parquet is only
+meaningful if the detected offset matches the broker's real timezone.
 
 ### Wave 6c → Gate 2B drift check
 
@@ -431,6 +459,66 @@ above):
 
 Cross-link to this entry's commit: see the 2026-05-14 #2 session-log
 entry at the top of this file for the fix-v2 commit hash.
+
+### 2026-05-14 addendum #3 — MT5 server-time semantics (fix v3)
+
+Added after the 2026-05-14 fix-v2 short-test capture (run_id
+`ef34a234bf1649418d3735c3b930ca8c`, no parquet flushed — Ctrl-C'd
+before the first 10-row flush; only the stdout transcript is the
+artifact) revealed that fix v2 did not engage on the live broker.
+Every market fill triggered `[record_fills:market_lookup_failure]` on
+stderr while the MT5 History tab confirmed the deals materialised
+broker-side. The MQL5 `HistorySelect` reference doc states the
+date params are interpreted in **server time** (FTMO MT5 currently
+runs on EET/EEST, UTC+3 in summer); fix v2 passed UTC datetimes,
+which missed every deal by the full offset width.
+
+**The three cumulative learnings (verbatim — the load-bearing
+strategic insights of this cycle, locked here for the playbook):**
+
+> 1. MetaTrader5 Python API mocks must reflect real API contracts
+>    (history_select precondition, server-time semantics, possibly
+>    more we haven't hit yet). Each new mock added to the test suite
+>    must be cross-referenced against the documented contract OR
+>    against a live-broker validation run.
+>
+> 2. Each broker-side integration class should ship with at least one
+>    live-broker validation test that runs against a real account in
+>    demo mode and asserts the contract holds. The unit tests with
+>    mocks are necessary but not sufficient.
+>
+> 3. When a fix doesn't engage on the live broker but mocks pass, the
+>    FIRST hypothesis should be "the mock doesn't match real API
+>    behavior," not "the implementation is wrong." This is the third
+>    instance of that class of bug (fill_price=0, history_select,
+>    server time). All three classes were not in the original mock
+>    contract.
+
+**Additional reviewer rejection criteria** (extends bullets 1–6 above):
+
+7. For any broker-side API where the official docs are silent on a
+   semantic (timezone, units, sign convention, fill semantics),
+   prefer the strictest documented sibling (e.g. the MQL5 doc for the
+   primitive the Python overload drives) over an inferred reading.
+   The Python `history_deals_get` doc is silent on timezone; the
+   MQL5 `HistorySelect` doc is explicit ("server time"). Reading the
+   silent doc as "UTC by analogy with `copy_ticks_range`" silently
+   passed three instance of the v3 bug class through to live broker.
+
+8. Every broker integration test that exercises a date-window query
+   MUST configure a non-zero `server_time_offset_seconds` on the
+   mock at least once. The mutation regression test
+   (`test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_market_lookup_failure`)
+   is the load-bearing check — if a future change drops the offset
+   translation, this test still passes (it tests the bug condition),
+   but the positive control
+   (`test_resolve_fill_from_deal_engages_when_server_time_offset_applied`)
+   fails because the helper no longer engages on the correct
+   server-time window. Both must run on every change to
+   `scripts/record_fills.py`.
+
+Cross-link to this entry's commit: see the 2026-05-14 #3 session-log
+entry at the top of this file for the fix-v3 commit hash.
 
 ## Source-verification protocol for predicates and tables
 
