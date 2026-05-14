@@ -547,3 +547,152 @@ def test_run_gate_2b_accepts_missing_manifest(tmp_path: Path) -> None:
     assert not capture.with_suffix(".json").exists()
     report = run_gate_2b(capture_parquet_path=capture)
     assert report.n_rows_captured == 5
+
+
+# --------------------------------------------------------------------------- #
+# Market-lookup-failure ratio guard (2026-05-14 fix v2)
+# --------------------------------------------------------------------------- #
+def test_run_gate_2b_rejects_manifest_above_market_lookup_failure_threshold(
+    tmp_path: Path,
+) -> None:
+    """Manifest with n_market_lookup_failures > 5% of n_filled → ValueError.
+
+    Regression for the 2026-05-14 short-test (run_id ``a68b59a6…``)
+    where every market fill returned NaN due to the broker / Python
+    history-cache contract not engaging. The fix v2 manifest schema
+    1.1 surfaces the count as ``n_market_lookup_failures`` and Gate 2B
+    refuses captures whose ratio exceeds 5%.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import (
+        MAX_MARKET_LOOKUP_FAILURE_RATIO,
+        run_gate_2b,
+    )
+
+    rows = [_make_row(idx=i) for i in range(20)]
+    capture = tmp_path / "lookup_fail_high.parquet"
+    _write_capture(rows, capture)
+    # 4 failures / 20 filled = 20% → far above 5%.
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "lookup-fail-high",
+                "n_attempted": 20,
+                "n_filled": 20,
+                "n_rejected": 0,
+                "n_market_lookup_failures": 4,
+                "schema_version": "1.1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Threshold is 0.05 (5%); 4/20 = 0.20 > 0.05.
+    assert MAX_MARKET_LOOKUP_FAILURE_RATIO < 4 / 20
+    with pytest.raises(ValueError, match="n_market_lookup_failures"):
+        run_gate_2b(capture_parquet_path=capture)
+
+
+def test_run_gate_2b_accepts_manifest_below_market_lookup_failure_threshold(
+    tmp_path: Path,
+) -> None:
+    """Manifest with n_market_lookup_failures <= 5% of n_filled → accepted.
+
+    A capture with 1 failure out of 100 filled (1%) sits well below the
+    5% threshold and the guard passes. Verifies the threshold is the
+    inclusive tolerance ceiling, not a zero-tolerance reject.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(100)]
+    capture = tmp_path / "lookup_fail_low.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "lookup-fail-low",
+                "n_attempted": 100,
+                "n_filled": 100,
+                "n_rejected": 0,
+                "n_market_lookup_failures": 1,  # 1% — under the 5% ceiling
+                "schema_version": "1.1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = run_gate_2b(capture_parquet_path=capture)
+    assert report.n_rows_captured == 100
+
+
+def test_run_gate_2b_accepts_manifest_at_market_lookup_failure_threshold(
+    tmp_path: Path,
+) -> None:
+    """Exactly at 5% → accepted (strict-greater-than rejection).
+
+    The threshold is the inclusive ceiling: a capture at exactly 5%
+    passes; one above 5% rejects. Documented justification: the 5%
+    headroom is itself the noise budget, so the boundary case should
+    be tolerated (otherwise float comparison + rounding could
+    spuriously reject a clean capture sitting at the line).
+    """
+    import json
+
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(20)]
+    capture = tmp_path / "lookup_fail_at.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "lookup-fail-at",
+                "n_attempted": 20,
+                "n_filled": 20,
+                "n_rejected": 0,
+                "n_market_lookup_failures": 1,  # 5% exactly
+                "schema_version": "1.1",
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = run_gate_2b(capture_parquet_path=capture)
+    assert report.n_rows_captured == 20
+
+
+def test_run_gate_2b_accepts_manifest_without_n_market_lookup_failures_key(
+    tmp_path: Path,
+) -> None:
+    """Forward-compat: pre-v1.1 manifests lack the key → treated as 0.
+
+    Existing Phase-0 manifests written under schema_version=1.0 do not
+    include ``n_market_lookup_failures``. The loader treats missing as
+    ``0`` so legacy captures pass the guard without re-recording.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(10)]
+    capture = tmp_path / "v1_0_manifest.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "legacy",
+                "n_attempted": 10,
+                "n_filled": 10,
+                "n_rejected": 0,
+                "schema_version": "1.0",
+                # NO n_market_lookup_failures key — pre-v1.1 manifest.
+            }
+        ),
+        encoding="utf-8",
+    )
+    report = run_gate_2b(capture_parquet_path=capture)
+    assert report.n_rows_captured == 10

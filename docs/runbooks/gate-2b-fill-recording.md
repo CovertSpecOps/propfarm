@@ -238,7 +238,13 @@ The parquet is **gitignored** (per the repo `.gitignore`'s
 `data/raw/` rule); the manifest is small enough that you can paste its
 contents into a STATUS.md update.
 
-### Parquet schema (v1.0)
+### Parquet schema (v1.0 — unchanged)
+
+(FillRecord column set is locked at v1.0 even though SessionManifest
+bumped to v1.1 on 2026-05-14 fix-up #2. Only the sidecar JSON manifest
+gained the new ``n_market_lookup_failures`` field; the parquet columns
+below are untouched.)
+
 
 | Column | Type | Notes |
 |---|---|---|
@@ -296,10 +302,16 @@ The manifest content is safe to paste — no creds, no IPs. Example:
   "n_attempted": 200,
   "n_filled": 167,
   "n_rejected": 33,
-  "schema_version": "1.0",
+  "n_market_lookup_failures": 0,
+  "schema_version": "1.1",
   "vps_host_redacted": true
 }
 ```
+
+`n_market_lookup_failures` is added in schema v1.1 (2026-05-14 fix-up
+#2). The expected value on a healthy capture is `0`. Gate 2B's
+harness refuses any manifest where
+`n_market_lookup_failures / max(n_filled, 1) > 0.05`.
 
 `n_filled >= 100` is the success condition. If `n_filled < 100`, do not
 proceed to Gate 2B — investigate the rejection codes in the parquet
@@ -417,3 +429,130 @@ the sidecar UNUSABLE.md:
 * Sidecar: `data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.UNUSABLE.md`.
 * Manifest: same dir, `.json` extension, has `"status": "fill_price-unusable"`.
 * Playbook entry: STATUS.md "Pathological-vendor-response catch pattern".
+
+## 2026-05-14 fix-up #2 — `history_select` precondition + market lookup tracking
+
+The fix-v1 (commit `9dd9af6`) added `_resolve_fill_from_deal` calling
+`mt5.history_deals_get(ticket=...)` / `(position=...)`. The user ran the
+short-test capture (run_id `a68b59a65e384f4d859d3bf257253d75`,
+2026-05-14 16:11 UTC, Ctrl-C'd at idx=006 before any flush so no parquet
+landed) and observed every market fill come back with `fill_price=NaN`.
+MT5 History tab on the VPS confirmed the deals DID execute broker-side
+(~17 round-trip deals, real prices like GBPUSD 1.35237 / EURUSD 1.17179,
+real ticket numbers, balance change $100,000 → $99,990.89 matching
+individual round-trip costs). So orders fired and filled; only the
+Python `history_deals_get(...)` lookup returned empty.
+
+Short-test session log: **`short-test-1 FAILED`** — no parquet on disk
+(stdout transcript in the dispatch brief is the only artifact).
+
+### Root cause v2
+
+The Python `MetaTrader5` package's `history_deals_get(ticket=...)` and
+`(position=...)` overloads silently return `()` on certain MT5 client
+builds unless the deal-history cache has been populated for the
+relevant time window first. The MetaQuotes Python docs describe the
+**date-range overload** `history_deals_get(date_from, date_to)` as the
+documented robust path: it "allows receiving all history deals within
+a specified period in a single call similar to the HistoryDealsTotal
+and HistoryDealSelect tandem" — i.e. it drives the MQL5 `HistorySelect`
+step internally. The ticket / position overloads do NOT.
+
+The v1 fix unit tests modelled `history_deals_get(ticket=...)` as
+unconditionally returning the pre-staged deal — they did not model the
+real-broker behavior where the lookup needs the history cache engaged.
+The tests passed; live broker behavior failed.
+
+### Fix v2 (this commit)
+
+* **`_resolve_fill_from_deal` rewrite** — three-path lookup ordering:
+
+  1. `mt5.history_deals_get(ticket=result.deal)` (fast path).
+  2. `mt5.history_deals_get(position=result.order)` filtered to
+     `DEAL_ENTRY_IN` (legacy v1 fallback).
+  3. `mt5.history_deals_get(date_from=request_time-1s,
+     date_to=max(now, request_time)+5s)` filtered by symbol + volume +
+     side + `DEAL_ENTRY_IN`, closest-time match on multi-candidate.
+     This is the documented MetaQuotes overload that engages the
+     history cache.
+
+* **Defensive `history_select` precondition** — the helper calls
+  `mt5.history_select(date_from, date_to)` iff `hasattr(mt5,
+  "history_select")`. The Python `MetaTrader5` documented API does
+  not list `history_select` (only the MQL5 server-side function),
+  but some MT5 builds expose it. Calling it via `hasattr` is safe on
+  all versions and may engage the history cache on builds where it
+  exists. On `False` return the helper soft-fails and emits a
+  `[record_fills:history_select_failed]` stderr log.
+
+* **Session-scoped claim tracking** — `_resolve_fill_from_deal`
+  optionally tracks attributed deal tickets in a session-scoped set
+  passed by `main()`. The time-range fallback skips already-claimed
+  tickets, preventing double-attribution when two same-symbol
+  same-side market orders fire within the ~6-second lookup window.
+  Closest-time matching on multi-candidate also emits
+  `[record_fills:ambiguous_deal_match]` to stderr.
+
+### Market-vs-pending lookup-failure distinction
+
+The user-mandated behavioral change for fix v2:
+
+* **`order_type == "market"`** with `retcode == 10009` and empty
+  lookup after all three paths is an **error condition** — the deal
+  MUST exist (broker confirmed the fill). The helper records
+  `fill_price=NaN`, the comment is prefixed `retcode_or_deal_failure:`,
+  AND `main()` increments a session-scoped `n_market_lookup_failures`
+  counter AND emits a `[record_fills:market_lookup_failure] idx=N
+  symbol=S order=M side=D request_time=T window=[F,T]` stderr log.
+
+* **`order_type in ("limit", "stop")`** with `retcode == 10009` and
+  empty lookup is **expected** — a pending order returns 10009 to
+  acknowledge the placement, not a fill. The helper records
+  `fill_price=NaN` (the correct expected state for a queued pending
+  order) silently, without incrementing the counter or emitting a log.
+
+### Manifest schema bump v1.0 → v1.1
+
+`SessionManifest` (the sidecar JSON) gains a top-level
+`n_market_lookup_failures: int` field. `SCHEMA_VERSION` bumped to
+`"1.1"`. **`FillRecord` (parquet column) schema is unchanged** — the
+parquet column set stays locked at v1.0 column names.
+
+### Gate 2B threshold
+
+`src/propfarm/gates/gate_2b.py::_reject_if_unusable_manifest` gains a
+second rejection criterion: if
+`n_market_lookup_failures / max(n_filled, 1) > 0.05`, the harness
+refuses to run. The 5% threshold is the inclusive tolerance ceiling
+(strict-greater-than rejection) — a capture at exactly 5% passes; one
+above 5% rejects. Constant: `MAX_MARKET_LOOKUP_FAILURE_RATIO`.
+
+### Stderr log prefixes (operator grep cheat sheet)
+
+| Prefix | Meaning |
+|---|---|
+| `[record_fills:exception]` | Per-iteration exception (loop continues) |
+| `[record_fills:history_select_failed]` | `history_select(date_from, date_to)` returned False |
+| `[record_fills:market_lookup_failure]` | Market order succeeded broker-side but Python could not retrieve the deal |
+| `[record_fills:ambiguous_deal_match]` | Time-range fallback found >1 candidate matching (symbol, volume, side, entry); closest-time wins |
+
+On the next 24h Task Scheduler run, `findstr "[record_fills:"
+stderr.log` surfaces every diagnostic the script emits.
+
+### Short-test gate (do this BEFORE any future 24h run)
+
+Unchanged from fix-v1 — but the success criteria now also include
+`n_market_lookup_failures == 0` in the manifest:
+
+```powershell
+python scripts\record_fills.py --duration-hours 1 --n-samples 10
+```
+
+Then:
+
+1. Read first 5 rows of `data/raw/fill_recordings/{run_id}.parquet`
+   via `pl.read_parquet(...).head(5)`. All `fill_price` values must be
+   non-zero / non-NaN.
+2. Read the manifest at `data/raw/fill_recordings/{run_id}.json`.
+   Confirm `n_market_lookup_failures` is `0`.
+3. If either gate fails, STOP and re-investigate before any 24h run.

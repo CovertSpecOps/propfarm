@@ -65,6 +65,20 @@ Wave 6b shipped spread (6.1), slippage (7.1), and Gate-2B fill-recording prep. W
 
 - **2026-05-14 #1** — **CRITICAL fix-up batch** for `scripts/record_fills.py`. The 2026-05-13 ~15h VPS capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`, 110 rows / 107 filled / 3 rejected) landed with `fill_price = 0.0` on every retcode=10009 row and `slippage_observed_pips` in the ±11,700 to ±13,500 range. Root cause confirmed: `parse_fill_into_record` read `mt5.OrderSendResult.price` directly, which is `0` for MT5 **market orders in most cases** — the executed fill price lives in the subsequent deal record retrieved via `mt5.history_deals_get(...)`. Existing 18 unit tests passed because their `SimpleNamespace` fixtures set `price` to a non-zero value (the semantically-clean shape; not the pathological one real MT5 returns). Fix-up batch: (a) `parse_fill_into_record` patched to accept `actual_fill_price` / `actual_fill_time_utc` keyword-only args (Option B DI), with a soft-failure path that prefixes the comment with `retcode_or_deal_failure:` when retcode=10009 but the deal lookup returned None; (b) `_resolve_fill_from_deal` helper added wrapping `mt5.history_deals_get` with `deal=`-then-`position=` fallback and `DEAL_ENTRY_IN` filter; (c) 11 new regression tests in `tests/scripts/test_record_fills.py` (29 tests total) covering the pathological mock, four-case slippage sign convention, soft-failure path, deal-helper happy / fallback / soft-fail / zero-price / reject paths, structural verification against the captured parquet, and a crash-hardening smoke test; (d) per-iteration `try/except` in `main()` logs to **stderr** with prefix `[record_fills:exception]` so Task Scheduler hidden jobs surface failures; (e) sidecar `UNUSABLE.md` written and manifest updated with `"status": "fill_price-unusable"`; (f) `src/propfarm/gates/gate_2b.py` gained a `_reject_if_unusable_manifest` guard with 3 regression tests in `tests/gates/test_gate_2b.py` (17 tests total). New STATUS.md playbook entry "Pathological-vendor-response catch pattern" added alongside the Vendor-convention pattern. Commits: `9dd9af6` (fix); `a91ccbf` (placeholder-hash backfill in playbook / manifest / UNUSABLE.md); `09bf313` (sidecar gained buggy-version SHA `450873c` and per-column VALID/INVALID downstream-use enumeration per user addendum). Fresh adversarial reviewer returned APPROVED WITH FOLLOW-UPS; HIGH (AST regression on `main()` except clauses), MEDIUM (runbook lesson + short-test protocol), LOW (this session-log cross-link), NIT (Gate 2B status row) all applied in a single fix-up commit.
 
+- **2026-05-14 #2** — **CRITICAL fix v2 batch** for `scripts/record_fills.py` after fix v1 (commit `9dd9af6`) did not engage on the live broker. The user ran the short-test capture per the runbook (run_id `a68b59a65e384f4d859d3bf257253d75`, 2026-05-14 16:11 UTC); every market fill came back with `fill_price=NaN`. **No parquet on disk** — the user Ctrl-C'd at idx=006 before the first 10-row flush, so the stdout transcript (7 rows: 1 limit + 1 limit + 4 market + 1 stop + 1 market, all `retcode=10009 fill=NaN`) is the only artifact and lives in the fix-v2 dispatch brief, not in `data/raw/`. MT5 History tab on the VPS confirmed the deals DID execute broker-side (~17 round-trip deals, real prices like GBPUSD 1.35237 / EURUSD 1.17179, real ticket numbers 448311315 / 448313054, $100,000 → $99,990.89 balance change matching individual costs). Root cause: the Python `history_deals_get(ticket=...)` and `(position=...)` overloads silently return `()` on certain MT5 builds unless the deal-history cache has been populated for the relevant time window first; the v1 fix mocks did not model that precondition. Fix v2 (this commit): (a) `_resolve_fill_from_deal` rewritten with three-path lookup ordering — ticket → position → time-range via `history_deals_get(date_from, date_to)` filtered by symbol+volume+side+`DEAL_ENTRY_IN` (documented MetaQuotes overload that engages the history cache); (b) defensive `mt5.history_select(date_from, date_to)` precondition call gated by `hasattr` so safe on all MT5 builds; emits `[record_fills:history_select_failed]` to stderr on False return; (c) session-scoped claim-tracking set passed to the helper prevents double-attribution of one deal to two consecutive same-symbol same-side market orders; (d) closest-time match on multi-candidate emits `[record_fills:ambiguous_deal_match]` to stderr; (e) order-type-aware loud-error path: `order_type='market'` + `retcode=10009` + empty lookup increments a session-scoped `n_market_lookup_failures` counter AND emits `[record_fills:market_lookup_failure] idx=N symbol=S order=M side=D request_time=T window=[F,T]` to stderr; `order_type in ('limit','stop')` + empty lookup is silent and expected; (f) `SessionManifest` schema bumped to `"1.1"` with new `n_market_lookup_failures: int` field; `FillRecord` parquet column schema **unchanged**; (g) Gate 2B `_reject_if_unusable_manifest` gains second rejection criterion: `n_market_lookup_failures / max(n_filled, 1) > 0.05` (strict-greater-than; new constant `MAX_MARKET_LOOKUP_FAILURE_RATIO = 0.05`); (h) `_MockMt5` test class replaces the v1 `SimpleNamespace` mock — models the `history_select` → `history_deals_get` precondition contract; `history_deals_get` returns `()` until `history_select` is called for a covering window. 13 new regression tests in `tests/scripts/test_record_fills.py` (43 tests total) and 4 new regression tests in `tests/gates/test_gate_2b.py` (21 tests total) covering history_select happy path / returns-False soft-fail / absent-attr build / time-range fallback / time-range side filter / claim tracking / ambiguous-match log / market-vs-pending parse-helper behavior / manifest schema v1.1 / gate threshold rejection above 5% / acceptance below 5% / acceptance at exactly 5% / forward-compat with v1.0 manifests. **MetaQuotes doc verification** (per dispatch-brief mandate): `history_deals_get(date_from, date_to)` overload is documented as "receiving all history deals within a specified period in a single call similar to the HistoryDealsTotal and HistoryDealSelect tandem" — i.e. it drives the history cache internally. The Python `MetaTrader5` documented API does NOT list `history_select`; only the MQL5 server-side `HistorySelect` is documented. The defensive `hasattr(mt5, "history_select")` call is therefore safe on documented builds and additive on builds where the function exists undocumented. Runbook gained a 2026-05-14 fix-up #2 section + stderr-prefix grep cheat-sheet + updated short-test gate (also check `n_market_lookup_failures == 0` in manifest). Playbook entry "Pathological-vendor-response catch pattern" gained a 2026-05-14 addendum #2 with the user-mandated `history_select` lesson and two new reviewer rejection criteria (5: state-changing-call history queries must model precondition; 6: order-type-aware empty-response semantics need both branches tested). Commit: fix-v2 commit hash inserted post-commit.
+
+### Short-test capture protocol — `short-test-1 FAILED` (2026-05-14)
+
+For the audit trail: the short-test capture run that exposed the v2
+bug. No parquet landed (user Ctrl-C'd at idx=006 before the first
+10-row flush), so the only evidence is the stdout transcript in the
+fix-v2 dispatch brief. The 7 idx rows all show `fill=NaN` for both
+market and pending orders, confirming the deal-lookup path was
+returning `(None, None)` for every successful retcode=10009 market
+order. The fix-v2 short-test gate (per runbook) now requires the next
+short-test to additionally show `n_market_lookup_failures == 0` in the
+manifest before any 24h run is kicked off.
+
 ### Wave 6c → Gate 2B drift check
 
 Wave 6c proved the fill engine is structurally correct against the schema; **Gate 2B proves it numerically against live broker reality.** Gate 2B is now unblocked: the user can run `scripts/record_fills.py` on the VPS for 24-48h via Task Scheduler (1A) or Start-Process (1B) per the runbook. Once `data/fills_capture_001.parquet` lands in the repo, the Gate 2B comparison harness can be built — drives each recorded `(request, market_state)` through `simulate_fill`, computes the residual (`live - sim`) per field, and reports p50/p95/p99 of the residual distribution. **Wave 6d (10.2 stress replay) is GATED on both Wave 6c AND Gate 2B passing** — the user explicitly: "Do not dispatch 6d until the fill engine is proven against recorded reality."
@@ -371,6 +385,53 @@ new regression tests in `tests/scripts/test_record_fills.py`, added a
 manifest-status guard in `src/propfarm/gates/gate_2b.py`, and marked
 the 2026-05-13 capture as `fill_price-unusable`).
 
+### 2026-05-14 addendum #2 — MT5 history-cache precondition (fix v2)
+
+Added after the 2026-05-14 short-test capture (run_id
+`a68b59a65e384f4d859d3bf257253d75`, Ctrl-C'd at idx=006 before any
+flush — no parquet on disk) revealed that fix v1 did not engage on
+live broker. Every market fill returned `NaN` even though MT5 History
+tab confirmed the deals DID execute (~17 round-trip deals with real
+prices, real ticket numbers, $100,000 → $99,990.89 balance change
+matching individual costs). The Python `history_deals_get(ticket=...)`
+and `(position=...)` overloads returned empty.
+
+**Lesson (verbatim, user mandate):**
+
+> MetaTrader5 Python mocks must model the `history_select` /
+> `history_deals_get` precondition contract. Mocks that test the
+> deal-lookup function in isolation without simulating the precondition
+> will pass while real-broker behavior fails. The contract is:
+> `history_deals_get` returns empty unless `history_select` was called
+> for an overlapping time range first.
+
+The MetaQuotes Python docs do not list `history_select` as a Python-API
+function (only the MQL5 server-side `HistorySelect` is documented), so
+the fix uses the documented date-range overload `history_deals_get(
+date_from, date_to)` — described in the docs as "receiving all history
+deals within a specified period in a single call similar to the
+HistoryDealsTotal and HistoryDealSelect tandem" — as the most-robust
+fallback path. Plus a defensive `hasattr(mt5, "history_select")` call
+that engages on builds where the function is exposed and no-ops on
+builds where it is not.
+
+**Additional reviewer rejection criteria** (extends the four bullets
+above):
+
+5. For any code that queries a broker history endpoint after a state-
+   changing call (`order_send`, `position_modify`, etc.), the mock
+   fixture MUST model a precondition contract that mirrors how the
+   real broker populates its history cache. A mock that returns the
+   pre-staged data unconditionally is a known false-positive pattern.
+6. For any code with order-type-aware semantics around "is empty
+   response an error?" (market expects a fill, limit/stop does not),
+   tests must cover both branches and the loud-error branch must
+   produce a structured stderr log + counter increment that downstream
+   consumers (here Gate 2B) can refuse on.
+
+Cross-link to this entry's commit: see the 2026-05-14 #2 session-log
+entry at the top of this file for the fix-v2 commit hash.
+
 ## Source-verification protocol for predicates and tables
 
 **User-supplied expectations get the same source-verification treatment as
@@ -454,7 +515,7 @@ broker behavior. Active from W1 dispatch through 2026-05-12 ADR closure.
 | Gate 2 part B: sim/live fill comparison ≤ 1 pip | ⬜ pending | Needs Task 7.2 fill engine + Task 14.3 nautilus integration + a 10-cycle live distribution |
 | Gate 1: Placebo residual bootstrap (alpha-leak detector) | 🟨 SHIPPED 2026-05-13, deviation accepted (option c) | Residual bootstrap PASS on canonical choppy fixture. Paired with cost-reconciliation sister test for cost-arithmetic correctness. **Necessary but NOT sufficient** alone — see "Gate 1 ruling" section. Commit `d88f6b5` |
 | Cost-reconciliation sister test (Task 13.1b, deterministic) | ✅ PASSED 2026-05-13 | 22 new tests (644 total); N=10,112 deterministic synthetic trades; `relative_error_bps = 0.0` (IEEE-754 bit-exact match); all four `nights_held` cases (0/1/2/triple-Wed) covered. Fresh adversarial reviewer verified: non-tautological (analytic side re-derives inline, never calls pipeline), RNG/bootstrap-free, 15:00 UTC anchor confirmed in `session_factor=1.0` for every symbol, swap sign-flip mutation would not silently cancel (broker rates are asymmetric long/short). Commit `af3ed3c` |
-| Gate 2B: sim/live fill comparison (harness ready, awaiting re-capture) | 🟥 BLOCKED on re-capture | Harness commits `987e5f5` + `a2b56d4`. The 2026-05-13 capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`) is `fill_price-unusable` — see `…UNUSABLE.md` sidecar. Fix shipped at `9dd9af6` (2026-05-14). User must run the short-test capture first (`--duration-hours 1 --n-samples 10`, verify first 5 rows have non-zero `fill_price`) per the runbook's 2026-05-14 fix-up section, then kick off a fresh 24h Task Scheduler run before Gate 2B can execute |
+| Gate 2B: sim/live fill comparison (harness ready, awaiting re-capture) | 🟥 BLOCKED on re-capture | Harness commits `987e5f5` + `a2b56d4`. The 2026-05-13 capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`) is `fill_price-unusable` — see `…UNUSABLE.md` sidecar. Fix v1 shipped at `9dd9af6` (2026-05-14); fix v2 follows after the 2026-05-14 `a68b59a6` short-test exposed the `history_select` precondition gap (NO parquet on disk; Ctrl-C'd at idx=006 before flush). User must run a fresh short-test capture (`--duration-hours 1 --n-samples 10`, verify first 5 rows have non-zero `fill_price` AND `n_market_lookup_failures == 0` in manifest) per the runbook's 2026-05-14 fix-up #2 section, then kick off a fresh 24h Task Scheduler run before Gate 2B can execute |
 | Phase 0 gate review | ⬜ pending | Needs everything above AND cost-reconciliation sister PASS (paired prerequisite with Gate 1) |
 
 ## User-side blockers (cannot be done by agents)

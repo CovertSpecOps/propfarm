@@ -546,8 +546,12 @@ def test_write_recording_round_trip(tmp_path: Path) -> None:
     assert manifest["n_attempted"] == 2
     assert manifest["n_filled"] == 1
     assert manifest["n_rejected"] == 1
-    assert manifest["schema_version"] == "1.0"
+    # Schema bumped to 1.1 on 2026-05-14 fix v2 (history_select precondition +
+    # market-lookup-failure tracking).
+    assert manifest["schema_version"] == "1.1"
     assert manifest["vps_host_redacted"] is True
+    # Default `n_market_lookup_failures` when no failures supplied: 0.
+    assert manifest["n_market_lookup_failures"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -776,98 +780,792 @@ def test_parse_fill_rejected_order_unchanged_by_fix() -> None:
 # --------------------------------------------------------------------------- #
 # _resolve_fill_from_deal helper tests — exercise the MT5-side lookup with
 # a mock mt5 module so we cover the integration code path that ``main()``
-# uses.
+# uses. The mock models the 2026-05-14 fix-v2 contract: history_deals_get
+# returns the pre-staged deals **only after** history_select has been
+# called for a covering time range, matching real MT5 broker behavior
+# (the precondition the v1 fix mocks failed to model).
 # --------------------------------------------------------------------------- #
+class _MockMt5:
+    """Mock of the MetaTrader5 module's deal-lookup surface.
+
+    Models the history-cache precondition contract: ``history_deals_get``
+    returns the pre-staged deals iff ``history_select(date_from,
+    date_to)`` has been called for a range covering the relevant deal
+    times. Without ``history_select``, every overload returns ``()`` —
+    the failure mode the v1 fix's mocks did not model and that caused
+    the 2026-05-14 short-test capture to land with NaN fills.
+
+    Three modes
+    -----------
+
+    * ``history_select_failure_mode="absent"`` — no ``history_select``
+      attribute at all. Simulates an older MT5 build where the function
+      doesn't exist. Helper proceeds straight to ``history_deals_get``.
+    * ``history_select_failure_mode="returns_false"`` — ``history_select``
+      attribute exists and returns ``False``. Helper soft-fails and emits
+      ``[record_fills:history_select_failed]`` to stderr.
+    * ``history_select_failure_mode="returns_true"`` — normal happy path.
+      ``history_select`` returns ``True``; ``history_deals_get`` is then
+      gated on the prior ``history_select`` call covering the deal time.
+    """
+
+    def __init__(
+        self,
+        *,
+        deal_by_ticket: dict[int, Any] | None = None,
+        deals_by_position: dict[int, tuple[Any, ...]] | None = None,
+        deals_for_time_range: tuple[Any, ...] | None = None,
+        history_select_failure_mode: str = "returns_true",
+        deal_entry_in: int = 0,
+        deal_type_buy: int = 0,
+        deal_type_sell: int = 1,
+    ) -> None:
+        self._deal_by_ticket = deal_by_ticket or {}
+        self._deals_by_position = deals_by_position or {}
+        self._deals_for_time_range = deals_for_time_range or ()
+        self._mode = history_select_failure_mode
+        self._selected_windows: list[tuple[datetime, datetime]] = []
+        self.history_select_calls: list[dict[str, Any]] = []
+        self.DEAL_ENTRY_IN = deal_entry_in
+        self.DEAL_TYPE_BUY = deal_type_buy
+        self.DEAL_TYPE_SELL = deal_type_sell
+
+        if self._mode != "absent":
+            # Bind the method only if the mode says it should exist.
+            self.history_select = self._history_select
+
+    def _history_select(
+        self,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+    ) -> bool:
+        self.history_select_calls.append({"date_from": date_from, "date_to": date_to})
+        if self._mode == "returns_false":
+            return False
+        if date_from is not None and date_to is not None:
+            self._selected_windows.append((date_from, date_to))
+        return True
+
+    def _is_covered(self, deal_time_ts: int) -> bool:
+        """True iff some prior history_select window covers the deal time."""
+        for date_from, date_to in self._selected_windows:
+            if date_from.timestamp() <= deal_time_ts <= date_to.timestamp():
+                return True
+        return False
+
+    def history_deals_get(
+        self,
+        ticket: int | None = None,
+        position: int | None = None,
+        date_from: datetime | None = None,
+        date_to: datetime | None = None,
+        group: str | None = None,
+    ) -> tuple[Any, ...]:
+        # Precondition: history_select must have been called with a
+        # covering window. In the "absent" mode there's no
+        # history_select at all → the mock unconditionally returns the
+        # pre-staged deals (some MT5 builds need no precondition).
+        precondition_ok = self._mode == "absent" or bool(self._selected_windows)
+
+        if ticket is not None:
+            if not precondition_ok:
+                return ()
+            cand = self._deal_by_ticket.get(int(ticket))
+            if cand is None:
+                return ()
+            cand_time = int(getattr(cand, "time", 0) or 0)
+            if self._mode != "absent" and not self._is_covered(cand_time):
+                return ()
+            return (cand,)
+        if position is not None:
+            if not precondition_ok:
+                return ()
+            cands = self._deals_by_position.get(int(position))
+            if not cands:
+                return ()
+            if self._mode == "absent":
+                return tuple(cands)
+            return tuple(c for c in cands if self._is_covered(int(getattr(c, "time", 0) or 0)))
+        if date_from is not None and date_to is not None:
+            if not precondition_ok:
+                return ()
+            # Filter the pre-staged time-range deals to those whose time
+            # falls within the requested window.
+            df_ts = date_from.timestamp()
+            dt_ts = date_to.timestamp()
+            return tuple(
+                d
+                for d in self._deals_for_time_range
+                if df_ts <= int(getattr(d, "time", 0) or 0) <= dt_ts
+            )
+        return ()
+
+
 def _make_mock_mt5(
     *,
     deal_by_ticket: dict[int, Any] | None = None,
     deals_by_position: dict[int, tuple[Any, ...]] | None = None,
+    deals_for_time_range: tuple[Any, ...] | None = None,
+    history_select_failure_mode: str = "returns_true",
     deal_entry_in: int = 0,
-) -> SimpleNamespace:
-    """Build a SimpleNamespace that quacks like the parts of mt5 we use."""
-
-    def history_deals_get(
-        ticket: int | None = None,
-        position: int | None = None,
-    ) -> tuple[Any, ...] | None:
-        if ticket is not None and deal_by_ticket is not None and ticket in deal_by_ticket:
-            return (deal_by_ticket[ticket],)
-        if position is not None and deals_by_position is not None:
-            return deals_by_position.get(position)
-        return None
-
-    return SimpleNamespace(
-        history_deals_get=history_deals_get,
-        DEAL_ENTRY_IN=deal_entry_in,
+    deal_type_buy: int = 0,
+    deal_type_sell: int = 1,
+) -> _MockMt5:
+    """Thin factory for :class:`_MockMt5` — preserves the call site shape."""
+    return _MockMt5(
+        deal_by_ticket=deal_by_ticket,
+        deals_by_position=deals_by_position,
+        deals_for_time_range=deals_for_time_range,
+        history_select_failure_mode=history_select_failure_mode,
+        deal_entry_in=deal_entry_in,
+        deal_type_buy=deal_type_buy,
+        deal_type_sell=deal_type_sell,
     )
+
+
+def _resolve_kwargs(
+    *,
+    request_time_utc: datetime,
+    order_type: str = "market",
+    symbol: str = "EURUSD",
+    volume_lots: float = 0.01,
+    side: str = "buy",
+    idx: int | None = None,
+    claimed_deal_tickets: set[int] | None = None,
+) -> dict[str, Any]:
+    """Bundle the v2 required kwargs so test call sites stay readable."""
+    return {
+        "request_time_utc": request_time_utc,
+        "order_type": order_type,
+        "symbol": symbol,
+        "volume_lots": volume_lots,
+        "side": side,
+        "idx": idx,
+        "claimed_deal_tickets": claimed_deal_tickets,
+    }
 
 
 def test_resolve_fill_from_deal_happy_path_ticket_lookup() -> None:
-    """Deal ticket present on result → single history_deals_get(ticket=...) call resolves."""
+    """Deal ticket present on result → ticket lookup resolves after history_select."""
     rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
     deal = SimpleNamespace(
-        price=1.10007, time=int(datetime(2026, 5, 14, 12, 0, tzinfo=UTC).timestamp()), entry=0
+        ticket=555,
+        price=1.10007,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
     )
     mock_mt5 = _make_mock_mt5(deal_by_ticket={555: deal})
     result = SimpleNamespace(retcode=10009, deal=555, order=999)
-    price, fill_time = rf._resolve_fill_from_deal(mock_mt5, result, success_retcode=10009)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
     assert price == pytest.approx(1.10007)
-    assert fill_time == datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    assert fill_time == request_time
+    # The fix v2 precondition: history_select MUST have been called.
+    assert mock_mt5.history_select_calls, (
+        "_resolve_fill_from_deal did not call history_select before "
+        "history_deals_get — this is the v2 regression the bug v2 fixed"
+    )
 
 
 def test_resolve_fill_from_deal_position_fallback() -> None:
-    """deal=0 on result → falls back to position-keyed lookup with DEAL_ENTRY_IN filter."""
+    """deal=0 on result → position-keyed lookup, DEAL_ENTRY_IN-filtered."""
     rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 5, tzinfo=UTC)
     entry_in_deal = SimpleNamespace(
-        price=1.10011, time=int(datetime(2026, 5, 14, 12, 5, tzinfo=UTC).timestamp()), entry=0
+        ticket=10,
+        price=1.10011,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
     )
     entry_out_deal = SimpleNamespace(
-        price=1.10012, time=int(datetime(2026, 5, 14, 12, 6, tzinfo=UTC).timestamp()), entry=1
+        ticket=11,
+        price=1.10012,
+        time=int((request_time + timedelta(minutes=1)).timestamp()),
+        entry=1,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
     )
-    # history_deals_get(position=...) returns BOTH deals; the helper must pick
-    # the entry-side one (DEAL_ENTRY_IN=0).
     mock_mt5 = _make_mock_mt5(deals_by_position={777: (entry_in_deal, entry_out_deal)})
     result = SimpleNamespace(retcode=10009, deal=0, order=777)
-    price, fill_time = rf._resolve_fill_from_deal(mock_mt5, result, success_retcode=10009)
-    assert price == pytest.approx(1.10011)  # the entry-side deal
-    assert fill_time == datetime(2026, 5, 14, 12, 5, tzinfo=UTC)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
+    assert price == pytest.approx(1.10011)  # entry-side deal
+    assert fill_time == request_time
 
 
 def test_resolve_fill_from_deal_soft_failure_returns_none_pair() -> None:
-    """history_deals_get returns None for both lookups → (None, None) soft-failure."""
+    """history_deals_get returns empty across all three paths → (None, None)."""
     rf = _load_module()
-    mock_mt5 = _make_mock_mt5(deal_by_ticket={}, deals_by_position={})
+    request_time = datetime(2026, 5, 14, 14, 0, tzinfo=UTC)
+    mock_mt5 = _make_mock_mt5(deal_by_ticket={}, deals_by_position={}, deals_for_time_range=())
     result = SimpleNamespace(retcode=10009, deal=42, order=43)
-    price, fill_time = rf._resolve_fill_from_deal(mock_mt5, result, success_retcode=10009)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
     assert price is None
     assert fill_time is None
 
 
 def test_resolve_fill_from_deal_treats_zero_price_as_soft_failure() -> None:
-    """Even if a deal record returns, a zero price is treated as soft-failure.
-
-    The 2026-05-13 bug taught us never to trust a 0 from any broker-side
-    response object. Deal-record zero price → soft-fail → caller writes NaN.
-    """
+    """Deal exists but reports a 0 price → soft-fail → caller writes NaN."""
     rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
     bad_deal = SimpleNamespace(
-        price=0.0, time=int(datetime(2026, 5, 14, 12, 0, tzinfo=UTC).timestamp()), entry=0
+        ticket=1,
+        price=0.0,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
     )
     mock_mt5 = _make_mock_mt5(deal_by_ticket={1: bad_deal})
     result = SimpleNamespace(retcode=10009, deal=1, order=1)
-    price, fill_time = rf._resolve_fill_from_deal(mock_mt5, result, success_retcode=10009)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
     assert price is None
     assert fill_time is None
 
 
 def test_resolve_fill_from_deal_rejected_order_returns_none_pair() -> None:
-    """retcode != 10009 → no deal lookup, just (None, None)."""
+    """retcode != 10009 → no deal lookup, just (None, None) — no history_select call."""
     rf = _load_module()
+    request_time = datetime(2026, 5, 14, 15, 0, tzinfo=UTC)
     mock_mt5 = _make_mock_mt5()
     result = SimpleNamespace(retcode=10018, deal=0, order=0)
-    price, fill_time = rf._resolve_fill_from_deal(mock_mt5, result, success_retcode=10009)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
     assert price is None
     assert fill_time is None
+    # Short-circuit on the rejected retcode means no history_select call either.
+    assert not mock_mt5.history_select_calls
+
+
+# --------------------------------------------------------------------------- #
+# Fix v2 regression: history_select precondition + time-range fallback +
+# market-vs-pending lookup-failure distinction. These tests pin the
+# 2026-05-14 short-test bug surface: real MT5 brokers require the
+# history cache to be populated before ticket / position lookups
+# succeed, and the absence of the precondition silently returns ().
+# --------------------------------------------------------------------------- #
+def test_resolve_fill_from_deal_requires_history_select_precondition() -> None:
+    """The 2026-05-14 fix-v2 contract: history_select MUST be called.
+
+    Two halves:
+
+    1. With a mock that returns deals only after history_select(...) is
+       called, _resolve_fill_from_deal succeeds and the mock records the
+       call.
+    2. With a mock that flags history_select as failing (returns False),
+       the helper soft-fails to (None, None) AND emits a structured
+       stderr log starting with [record_fills:history_select_failed].
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 16, 0, tzinfo=UTC)
+
+    # --- Half 1: happy path. history_select returns True, then ticket lookup wins.
+    deal = SimpleNamespace(
+        ticket=200,
+        price=1.30000,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="GBPUSD",
+        volume=0.01,
+        type=0,
+    )
+    happy_mock = _make_mock_mt5(deal_by_ticket={200: deal})
+    result = SimpleNamespace(retcode=10009, deal=200, order=201)
+    price, fill_time = rf._resolve_fill_from_deal(
+        happy_mock,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time, symbol="GBPUSD"),
+    )
+    assert price == pytest.approx(1.30000)
+    assert fill_time == request_time
+    # Single history_select call must have been made, with date_from / date_to keys.
+    assert len(happy_mock.history_select_calls) == 1
+    sel = happy_mock.history_select_calls[0]
+    assert sel["date_from"] is not None
+    assert sel["date_to"] is not None
+    assert sel["date_from"] < request_time < sel["date_to"]
+
+
+def test_resolve_fill_from_deal_history_select_returns_false_soft_fails_and_logs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """history_select returns False → (None, None) + [record_fills:history_select_failed] stderr."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 17, 0, tzinfo=UTC)
+    bad_mock = _make_mock_mt5(
+        deal_by_ticket={
+            555: SimpleNamespace(
+                ticket=555,
+                price=1.10000,
+                time=int(request_time.timestamp()),
+                entry=0,
+                symbol="EURUSD",
+                volume=0.01,
+                type=0,
+            )
+        },
+        history_select_failure_mode="returns_false",
+    )
+    result = SimpleNamespace(retcode=10009, deal=555, order=556)
+    price, fill_time = rf._resolve_fill_from_deal(
+        bad_mock,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time, idx=42),
+    )
+    assert price is None
+    assert fill_time is None
+    captured = capsys.readouterr()
+    assert "[record_fills:history_select_failed]" in captured.err
+    assert "idx=42" in captured.err
+    assert "symbol=EURUSD" in captured.err
+
+
+def test_resolve_fill_from_deal_works_on_build_without_history_select() -> None:
+    """Older MT5 builds lack history_select; helper still works (hasattr-gated)."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 0, tzinfo=UTC)
+    deal = SimpleNamespace(
+        ticket=900,
+        price=1.10005,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    no_select_mock = _make_mock_mt5(
+        deal_by_ticket={900: deal},
+        history_select_failure_mode="absent",
+    )
+    # The mock has no history_select attribute in this mode.
+    assert not hasattr(no_select_mock, "history_select")
+    result = SimpleNamespace(retcode=10009, deal=900, order=901)
+    price, fill_time = rf._resolve_fill_from_deal(
+        no_select_mock,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
+    assert price == pytest.approx(1.10005)
+    assert fill_time == request_time
+
+
+def test_resolve_fill_from_deal_time_range_fallback_when_ticket_and_position_empty() -> None:
+    """Both ticket=... and position=... lookups return empty → time-range path wins.
+
+    Real-broker shape: OrderSendResult.deal and .order are populated
+    but history_deals_get(ticket=...) and history_deals_get(position=...)
+    return () because the history cache wasn't engaged for that ticket
+    on this build. The time-range fallback queries by date range —
+    documented in MetaQuotes as the "single call similar to the
+    HistoryDealsTotal and HistoryDealSelect tandem" overload — and
+    filters by symbol, volume, side, and entry.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 19, 0, tzinfo=UTC)
+    # The deal exists, but only in the time-range bucket — ticket and
+    # position lookups return empty even after history_select.
+    target_deal = SimpleNamespace(
+        ticket=12345,
+        price=1.10009,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    # Time-range bucket also contains an exit-leg deal (entry=1, same
+    # symbol same volume) that the filter must skip.
+    exit_leg = SimpleNamespace(
+        ticket=12346,
+        price=1.10010,
+        time=int((request_time + timedelta(seconds=1)).timestamp()),
+        entry=1,
+        symbol="EURUSD",
+        volume=0.01,
+        type=1,  # opposite side: closing
+    )
+    # And an unrelated EURUSD entry deal that's outside the volume filter.
+    unrelated = SimpleNamespace(
+        ticket=12347,
+        price=1.10011,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.10,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},  # ticket lookup returns ()
+        deals_by_position={},  # position lookup returns ()
+        deals_for_time_range=(target_deal, exit_leg, unrelated),
+    )
+    result = SimpleNamespace(retcode=10009, deal=99, order=100)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            volume_lots=0.01,
+            side="buy",
+        ),
+    )
+    assert price == pytest.approx(1.10009)
+    assert fill_time == request_time
+
+
+def test_resolve_fill_from_deal_time_range_fallback_filters_by_side() -> None:
+    """Time-range fallback filters by DEAL_TYPE_BUY / DEAL_TYPE_SELL."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 20, 0, tzinfo=UTC)
+    buy_deal = SimpleNamespace(
+        ticket=1,
+        price=1.10000,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,  # DEAL_TYPE_BUY
+    )
+    sell_deal = SimpleNamespace(
+        ticket=2,
+        price=1.10005,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=1,  # DEAL_TYPE_SELL
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(buy_deal, sell_deal),
+    )
+    result = SimpleNamespace(retcode=10009, deal=99, order=100)
+    # Request a SELL side → only sell_deal should win.
+    price, _fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time, side="sell"),
+    )
+    assert price == pytest.approx(1.10005)
+
+
+def test_resolve_fill_from_deal_time_range_fallback_claim_tracking() -> None:
+    """Claimed deal tickets are skipped → no double-attribution."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 21, 0, tzinfo=UTC)
+    deal_one = SimpleNamespace(
+        ticket=501,
+        price=1.10000,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    deal_two = SimpleNamespace(
+        ticket=502,
+        price=1.10005,
+        time=int((request_time + timedelta(milliseconds=500)).timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(deal_one, deal_two),
+    )
+    result = SimpleNamespace(retcode=10009, deal=99, order=100)
+    claimed: set[int] = set()
+    # First call: should grab deal_one (closer to request_time) and claim 501.
+    p1, _ = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            volume_lots=0.01,
+            side="buy",
+            claimed_deal_tickets=claimed,
+        ),
+    )
+    assert p1 == pytest.approx(1.10000)
+    assert 501 in claimed
+    # Second call: same window, but ticket 501 is claimed → deal_two wins.
+    p2, _ = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            volume_lots=0.01,
+            side="buy",
+            claimed_deal_tickets=claimed,
+        ),
+    )
+    assert p2 == pytest.approx(1.10005)
+    assert 502 in claimed
+
+
+def test_resolve_fill_from_deal_time_range_ambiguous_match_logs_warning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Multi-match → log [record_fills:ambiguous_deal_match], pick closest in time."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 22, 0, tzinfo=UTC)
+    deal_close = SimpleNamespace(
+        ticket=701,
+        price=1.10000,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    deal_far = SimpleNamespace(
+        ticket=702,
+        price=1.10010,
+        time=int((request_time + timedelta(seconds=3)).timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(deal_far, deal_close),
+    )
+    result = SimpleNamespace(retcode=10009, deal=99, order=100)
+    price, _ = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time, idx=7),
+    )
+    # Closest-time wins.
+    assert price == pytest.approx(1.10000)
+    captured = capsys.readouterr()
+    assert "[record_fills:ambiguous_deal_match]" in captured.err
+    assert "idx=7" in captured.err
+    assert "n_candidates=2" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Market-vs-pending lookup-failure logging contract — exercises the
+# emit_market_lookup_failure_log helper directly.
+# --------------------------------------------------------------------------- #
+def test_emit_market_lookup_failure_log_format(capsys: pytest.CaptureFixture[str]) -> None:
+    """The stderr format is exactly `[record_fills:market_lookup_failure] idx=N ...`."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 23, 0, tzinfo=UTC)
+    rf.emit_market_lookup_failure_log(
+        idx=5,
+        symbol="EURUSD",
+        order_type="market",
+        side="buy",
+        request_time_utc=request_time,
+        date_from=request_time - timedelta(seconds=1),
+        date_to=request_time + timedelta(seconds=5),
+    )
+    captured = capsys.readouterr()
+    assert "[record_fills:market_lookup_failure]" in captured.err
+    assert "idx=5" in captured.err
+    assert "symbol=EURUSD" in captured.err
+    assert "order=market" in captured.err
+    assert "side=buy" in captured.err
+    assert "request_time=" in captured.err
+    assert "window=" in captured.err
+
+
+# --------------------------------------------------------------------------- #
+# Manifest schema v1.1 — n_market_lookup_failures field.
+# --------------------------------------------------------------------------- #
+def test_session_manifest_schema_version_bumped_to_1_1() -> None:
+    """SCHEMA_VERSION constant + manifest default must be '1.1'."""
+    rf = _load_module()
+    assert rf.SCHEMA_VERSION == "1.1"
+    manifest = rf.SessionManifest(
+        run_id="test",
+        start_utc=datetime(2026, 5, 14, 0, 0, tzinfo=UTC),
+        end_utc=datetime(2026, 5, 14, 1, 0, tzinfo=UTC),
+        n_attempted=0,
+        n_filled=0,
+        n_rejected=0,
+    )
+    assert manifest.schema_version == "1.1"
+    assert manifest.n_market_lookup_failures == 0
+
+
+def test_write_recording_persists_n_market_lookup_failures(tmp_path: Path) -> None:
+    """write_recording threads n_market_lookup_failures into the manifest JSON."""
+    rf = _load_module()
+    start = datetime(2026, 5, 14, 12, 0, 0, tzinfo=UTC)
+    rows = [
+        {
+            "run_id": "lookup-fail-test",
+            "request_time_utc": start,
+            "broker_fill_time_utc": start + timedelta(milliseconds=150),
+            "symbol": "EURUSD",
+            "order_type": "market",
+            "side": "buy",
+            "volume_lots": 0.01,
+            "requested_price": 1.10000,
+            "fill_price": math.nan,
+            "spread_at_request_pips": 0.3,
+            "slippage_observed_pips": math.nan,
+            "broker_latency_ms": 150.0,
+            "retcode": 10009,
+            "comment": "retcode_or_deal_failure: filled",
+        }
+    ]
+    _, mf = rf.write_recording(
+        rows,
+        run_id="lookup-fail-test",
+        start_utc=start,
+        end_utc=start + timedelta(minutes=5),
+        root=tmp_path,
+        n_market_lookup_failures=3,
+    )
+    import json as _json
+
+    manifest = _json.loads(mf.read_text())
+    assert manifest["n_market_lookup_failures"] == 3
+    assert manifest["schema_version"] == "1.1"
+
+
+# --------------------------------------------------------------------------- #
+# Per-order-type behavior on empty lookup. parse_fill_into_record's
+# soft-failure path is order-type agnostic (the helper records NaN
+# either way), but main() decides separately whether to bump the
+# counter + emit the stderr log. These tests pin that contract by
+# inspecting parse_fill_into_record + the documented behavior.
+# --------------------------------------------------------------------------- #
+def test_parse_fill_market_empty_lookup_records_nan_and_annotates_comment() -> None:
+    """market + 10009 + empty lookup → fill_price=NaN, comment prefixed with marker."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 13, 0, tzinfo=UTC)
+    after_send = request_time + timedelta(milliseconds=180)
+    tick = _tick(bid=1.10000, ask=1.10003)
+    open_req = {"symbol": "EURUSD", "volume": 0.01, "type": 0, "price": 1.10003, "action": 1}
+    result = SimpleNamespace(retcode=10009, price=0.0, comment="filled", time=0, deal=0, order=42)
+    rec = rf.parse_fill_into_record(
+        run_id="market-empty",
+        request_time_utc=request_time,
+        after_send_utc=after_send,
+        open_req=open_req,
+        order_send_result=result,
+        tick_at_request=tick,
+        symbol_digits=5,
+        order_type="market",
+        side="buy",
+        actual_fill_price=None,
+        actual_fill_time_utc=None,
+    )
+    assert math.isnan(rec["fill_price"])
+    assert rec["comment"].startswith(rf.DEAL_LOOKUP_FAILURE_PREFIX)
+
+
+def test_parse_fill_pending_empty_lookup_records_nan_without_market_log() -> None:
+    """limit + 10009 + empty lookup → fill_price=NaN expected (no broker fill yet).
+
+    The parse_fill_into_record helper is order-type agnostic — it
+    records NaN either way. The main()-level distinction is the stderr
+    log and counter increment, which only fires on order_type='market'.
+    This test verifies that the helper-level shape is the same as the
+    market path so downstream Gate 2B logic doesn't need to special-case
+    limit/stop rows that legitimately have no fill.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 13, 30, tzinfo=UTC)
+    after_send = request_time + timedelta(milliseconds=20)
+    tick = _tick(bid=1.10000, ask=1.10003)
+    open_req = {"symbol": "EURUSD", "volume": 0.01, "type": 2, "price": 1.09995, "action": 5}
+    result = SimpleNamespace(retcode=10009, price=0.0, comment="placed", time=0, deal=0, order=99)
+    rec = rf.parse_fill_into_record(
+        run_id="limit-empty",
+        request_time_utc=request_time,
+        after_send_utc=after_send,
+        open_req=open_req,
+        order_send_result=result,
+        tick_at_request=tick,
+        symbol_digits=5,
+        order_type="limit",
+        side="buy",
+        actual_fill_price=None,
+        actual_fill_time_utc=None,
+    )
+    assert math.isnan(rec["fill_price"])
+    # The parse helper still annotates the comment because it cannot know
+    # from order_type alone whether the empty lookup is legit (limit not
+    # yet filled) or a bug (market that should have filled). The main()
+    # counter / log distinguishes the two.
+    assert rec["comment"].startswith(rf.DEAL_LOOKUP_FAILURE_PREFIX)
+
+
+def test_parse_fill_stop_empty_lookup_records_nan() -> None:
+    """stop + 10009 + empty lookup → fill_price=NaN. Parity with limit case."""
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 13, 45, tzinfo=UTC)
+    after_send = request_time + timedelta(milliseconds=25)
+    tick = _tick(bid=1.10000, ask=1.10003)
+    open_req = {"symbol": "EURUSD", "volume": 0.01, "type": 4, "price": 1.10010, "action": 5}
+    result = SimpleNamespace(retcode=10009, price=0.0, comment="placed", time=0, deal=0, order=100)
+    rec = rf.parse_fill_into_record(
+        run_id="stop-empty",
+        request_time_utc=request_time,
+        after_send_utc=after_send,
+        open_req=open_req,
+        order_send_result=result,
+        tick_at_request=tick,
+        symbol_digits=5,
+        order_type="stop",
+        side="buy",
+        actual_fill_price=None,
+        actual_fill_time_utc=None,
+    )
+    assert math.isnan(rec["fill_price"])
 
 
 # --------------------------------------------------------------------------- #

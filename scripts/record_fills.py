@@ -120,6 +120,81 @@ records ``fill_price = NaN`` and prefixes the comment with
 ``"retcode_or_deal_failure: "`` so downstream analysis can distinguish
 "rejected by broker" (raw broker comment) from "filled but deal lookup
 failed" (annotated comment).
+
+2026-05-14 CRITICAL fix v2 — history-cache precondition + loud market lookup failures
+-------------------------------------------------------------------------------------
+
+The fix-v1 (commit ``9dd9af6``) introduced ``_resolve_fill_from_deal``
+calling ``mt5.history_deals_get(ticket=...)`` and
+``mt5.history_deals_get(position=...)``. Short-test capture on the VPS
+(run_id ``a68b59a65e384f4d859d3bf257253d75``, 2026-05-14 16:11 UTC,
+Ctrl-C'd at idx=006 before flush so no parquet landed) revealed that
+those ticket / position keyed lookups returned **empty** for every
+market order — even though the MT5 History tab confirmed real deals
+existed broker-side (~17 round-trip deals, real prices, real tickets,
+balance change of $100,000 -> $99,990.89 matching individual costs).
+Every market fill therefore landed with ``fill_price = NaN``.
+
+Documented fix per MetaQuotes Python integration docs
+(``mt5historydealsget_py``): the function has three call overloads —
+``(date_from, date_to, group=...)``, ``(ticket=...)``, and
+``(position=...)``. The date-range overload is documented as receiving
+"all history deals within a specified period in a single call similar
+to the HistoryDealsTotal and HistoryDealSelect tandem" — i.e. the
+date-range form internally drives the MQL5 ``HistorySelect`` step that
+populates the history cache. So fix v2 uses the **date-range overload
+as the most-robust fallback** when ticket / position lookups return
+empty: query a small window around ``request_time`` and filter by
+symbol + volume + side + ``DEAL_ENTRY_IN``.
+
+Additionally, fix v2 calls ``mt5.history_select(date_from, date_to)``
+defensively as a precondition WHEN the function exists on the loaded
+MT5 build (``hasattr(mt5, "history_select")``). The Python MetaTrader5
+package does not officially document a ``history_select`` function (only
+the MQL5 server-side ``HistorySelect`` is documented), but some
+community-built MT5 client versions expose it; calling it via
+``hasattr`` is safe on all versions and may engage the history cache on
+builds where it is the documented precondition.
+
+The three-path lookup order in ``_resolve_fill_from_deal``:
+
+1. ``mt5.history_deals_get(ticket=result.deal)`` — fast path; works on
+   most MT5 builds when ``deal`` is populated.
+2. ``mt5.history_deals_get(position=result.order)`` filtered to
+   ``DEAL_ENTRY_IN`` — fallback when ``deal`` is 0 but ``order`` is
+   populated.
+3. ``mt5.history_deals_get(date_from=request_time-1s,
+   date_to=now+5s)`` filtered by symbol + volume + side +
+   ``DEAL_ENTRY_IN`` — most-robust documented fallback that drives the
+   history cache via the date-range overload. Picks the deal with
+   ``time`` closest to ``request_time`` on multi-match (logs
+   ``[record_fills:ambiguous_deal_match]`` to stderr). A session-scoped
+   claim set prevents double-attribution when the script fires two
+   same-symbol same-side orders within the time window.
+
+Market-vs-pending lookup-failure distinction
+--------------------------------------------
+
+For ``order_type == "market"`` with ``retcode == 10009``, an empty
+lookup after all three paths is an **error condition** — the deal MUST
+exist (the broker confirmed the fill). Fix v2 emits a stderr log
+``[record_fills:market_lookup_failure] idx=N symbol=S order=M side=D
+request_time=T window=[F,T]`` and increments a session-scoped
+``n_market_lookup_failures`` counter that is propagated into the
+:class:`SessionManifest` as a top-level integer field. Gate 2B's
+harness refuses to consume a manifest whose ratio of market lookup
+failures to filled market rows exceeds 5%.
+
+For ``order_type in ("limit", "stop")`` with ``retcode == 10009``, an
+empty lookup is silent and expected — a pending order returns 10009 to
+acknowledge the placement, not a fill, so no deal exists yet. The
+helper sets ``fill_price = NaN`` (the correct behavior) without
+incrementing the failure counter or emitting a log.
+
+The :class:`SessionManifest` schema bumps to ``"1.1"`` with the new
+``n_market_lookup_failures`` field. The :class:`FillRecord` (parquet
+column) schema is **unchanged** — the parquet column set stays locked
+at v1.0 column names; only the sidecar manifest carries the new field.
 """
 
 from __future__ import annotations
@@ -144,11 +219,24 @@ from pydantic import BaseModel, ConfigDict
 OrderType = Literal["market", "limit", "stop"]
 Side = Literal["buy", "sell"]
 
-SCHEMA_VERSION: Final[str] = "1.0"
+#: Manifest schema version. Bumped to "1.1" on 2026-05-14 fix v2 to add
+#: ``n_market_lookup_failures``. FillRecord (parquet column) schema is
+#: unchanged — only the sidecar JSON manifest gains the new field.
+SCHEMA_VERSION: Final[str] = "1.1"
 LOT_SIZE: Final[float] = 0.01
 MAX_SIMULTANEOUS_POSITIONS: Final[int] = 5
 HARD_TIME_LIMIT_HOURS: Final[float] = 48.0
 ALLOWED_SERVER_PREFIX: Final[str] = "FTMO-Demo"
+
+#: Time window for the date-range deal lookup fallback. ``request_time -
+#: HISTORY_LOOKUP_WINDOW_PAD_BEFORE`` to ``now + HISTORY_LOOKUP_WINDOW_PAD_AFTER``.
+#: 1s before / 5s after is wide enough to absorb broker-clock skew and
+#: late deal commits, narrow enough that ambiguous matches across distinct
+#: orders are rare. Matches the example windows in MetaQuotes' Python
+#: integration docs (``mt5historydealsget_py``) which use datetime ranges
+#: of seconds around ``order_send`` calls.
+HISTORY_LOOKUP_WINDOW_PAD_BEFORE: Final[timedelta] = timedelta(seconds=1)
+HISTORY_LOOKUP_WINDOW_PAD_AFTER: Final[timedelta] = timedelta(seconds=5)
 
 # Session anchor minutes-of-day in UTC. London 07:00, NY am 12:00 (DST safety
 # captured in distribution; we keep a single canonical UTC anchor since FX
@@ -211,7 +299,32 @@ class FillRecord(BaseModel):
 
 
 class SessionManifest(BaseModel):
-    """End-of-session manifest written alongside the parquet."""
+    """End-of-session manifest written alongside the parquet.
+
+    Schema versioning
+    -----------------
+
+    * **1.0** (initial release) — fields: run_id, start_utc, end_utc,
+      n_attempted, n_filled, n_rejected, schema_version, vps_host_redacted.
+    * **1.1** (2026-05-14 fix v2) — added ``n_market_lookup_failures``.
+      Counts the number of ``order_type == "market"`` rows where
+      ``retcode == 10009`` (broker confirmed fill) but the helper's
+      three-path deal lookup (ticket -> position -> time-range) returned
+      empty. The expected value is ``0``; a non-zero value indicates the
+      capture has unreliable ``fill_price`` data for some market rows.
+      Gate 2B's harness refuses to consume a manifest whose ratio
+      ``n_market_lookup_failures / max(n_filled_market, 1) > 0.05``.
+
+    Notes
+    -----
+
+    ``schema_version`` defaults to the current :data:`SCHEMA_VERSION` so
+    every newly-written manifest carries the latest version. Existing
+    on-disk manifests written under v1.0 (e.g. the unusable
+    ``24e00278…`` capture's manifest) are still readable as plain
+    JSON; Gate 2B's loader treats a missing ``n_market_lookup_failures``
+    key as ``0`` (forward-compat).
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -221,6 +334,7 @@ class SessionManifest(BaseModel):
     n_attempted: int
     n_filled: int
     n_rejected: int
+    n_market_lookup_failures: int = 0
     schema_version: str = SCHEMA_VERSION
     vps_host_redacted: bool = True
 
@@ -708,43 +822,147 @@ def parse_fill_into_record(
     }
 
 
+#: Stderr-log prefixes for the helper's three failure / ambiguity surfaces.
+#: Documented so the operator can ``findstr`` / ``grep`` them on the next
+#: VPS capture run.
+_LOG_PREFIX_HISTORY_SELECT_FAILED: Final[str] = "[record_fills:history_select_failed]"
+_LOG_PREFIX_MARKET_LOOKUP_FAILURE: Final[str] = "[record_fills:market_lookup_failure]"
+_LOG_PREFIX_AMBIGUOUS_DEAL_MATCH: Final[str] = "[record_fills:ambiguous_deal_match]"
+
+
 def _resolve_fill_from_deal(  # pragma: no cover - integration path
     mt5: Any,
     order_send_result: Any,
     *,
     success_retcode: int,
+    request_time_utc: datetime,
+    order_type: OrderType,
+    symbol: str,
+    volume_lots: float,
+    side: Side,
+    idx: int | None = None,
+    claimed_deal_tickets: set[int] | None = None,
 ) -> tuple[float | None, datetime | None]:
-    """Resolve the deal-record fill price + time for a successful market order.
+    """Resolve the deal-record fill price + time for a successful order.
 
-    MT5 API summary:
-    * ``mt5.history_deals_get(ticket=<deal_ticket>)`` returns a tuple of
-      ``Deal`` objects matching the deal ticket; typically 1 element.
-    * ``mt5.history_deals_get(position=<position_ticket>)`` returns ALL
-      deals for that position; we filter to the entry-side deal (where
-      ``deal.entry == mt5.DEAL_ENTRY_IN``).
-    * Both calls may return ``None`` (function-level error) or ``()`` on
-      transient history-server failures.
+    Three-path lookup ordering (2026-05-14 fix v2):
+
+    1. ``mt5.history_deals_get(ticket=result.deal)`` — fast path when the
+       broker populated ``OrderSendResult.deal``.
+    2. ``mt5.history_deals_get(position=result.order)`` filtered to
+       ``DEAL_ENTRY_IN`` — fallback when ``deal == 0`` but ``order != 0``.
+    3. ``mt5.history_deals_get(date_from, date_to)`` filtered by
+       ``symbol``, ``volume`` (within float tolerance), ``side``
+       (DEAL_TYPE_BUY / DEAL_TYPE_SELL), and ``entry == DEAL_ENTRY_IN``
+       — most-robust fallback. MetaQuotes docs describe this overload as
+       "receiving all history deals within a specified period in a single
+       call similar to the HistoryDealsTotal and HistoryDealSelect tandem"
+       — i.e. it implicitly drives the MQL5 ``HistorySelect`` step that
+       populates the deal-history cache.
+
+    Before any lookup, the helper attempts a defensive
+    ``mt5.history_select(date_from=..., date_to=...)`` call iff
+    ``hasattr(mt5, "history_select")``. This function is NOT in the
+    documented Python MetaTrader5 API (the docs list only the MQL5
+    server-side ``HistorySelect``), but the call is safe on builds where
+    it is present and a no-op on builds where it is absent. On builds
+    where it returns ``False`` (documented failure signal in MQL5), the
+    helper emits a ``[record_fills:history_select_failed]`` stderr log
+    and returns ``(None, None)`` so the row records ``NaN``.
+
+    Parameters
+    ----------
+    mt5
+        The imported ``MetaTrader5`` module (or a mock in tests).
+    order_send_result
+        Result of ``mt5.order_send(req)``. Carries ``retcode``, ``deal``,
+        ``order``, ``volume``, etc.
+    success_retcode
+        ``mt5.TRADE_RETCODE_DONE`` (10009 on FTMO Demo).
+    request_time_utc
+        Wallclock UTC datetime at the moment ``mt5.order_send`` was
+        called. Used to compute the time-range lookup window:
+        ``[request_time_utc - HISTORY_LOOKUP_WINDOW_PAD_BEFORE,
+        datetime.now(UTC) + HISTORY_LOOKUP_WINDOW_PAD_AFTER]``.
+    order_type
+        ``"market"`` / ``"limit"`` / ``"stop"``. Drives the
+        market-vs-pending lookup-failure distinction (see module docstring
+        "Market-vs-pending lookup-failure distinction" section).
+    symbol
+        Symbol the order targeted; used in the time-range filter.
+    volume_lots
+        Requested volume; used in the time-range filter with a small
+        absolute tolerance to handle broker-side rounding.
+    side
+        ``"buy"`` or ``"sell"``; used in the time-range filter
+        (mapped to ``DEAL_TYPE_BUY`` / ``DEAL_TYPE_SELL``).
+    idx
+        Optional iteration index from ``main()``; included in stderr
+        logs for grep-ability.
+    claimed_deal_tickets
+        Optional session-scoped set of deal tickets that have already
+        been attributed to a row. The time-range fallback skips any
+        candidate whose ticket is in this set, then adds the chosen
+        deal's ticket. Prevents double-attribution when two same-symbol
+        same-side orders fire within the lookup window. The caller
+        owns the set; passing ``None`` disables claim tracking (tests).
 
     Returns
     -------
     tuple[float | None, datetime | None]
         ``(fill_price, fill_time_utc)`` on success;
-        ``(None, None)`` on any soft-failure case so the caller can flag
-        the row via :data:`DEAL_LOOKUP_FAILURE_PREFIX`.
+        ``(None, None)`` on any soft-failure case. The caller distinguishes
+        "market with empty lookup" (loud error, log + counter increment)
+        from "pending with empty lookup" (silent, expected) based on
+        ``order_type``.
     """
     if int(order_send_result.retcode) != success_retcode:
         return (None, None)
 
+    # Build the time-range window once; used both by the optional
+    # ``history_select`` precondition and the time-range fallback below.
+    # ``date_to`` anchors off ``max(now_utc, request_time_utc)`` so the
+    # window stays well-formed even when the caller passes a future
+    # ``request_time_utc`` (test fixtures use future timestamps; in
+    # production ``request_time_utc`` is always just before ``order_send``
+    # and ``now_utc`` is the later anchor).
+    now_utc = datetime.now(tz=UTC)
+    date_from = request_time_utc - HISTORY_LOOKUP_WINDOW_PAD_BEFORE
+    date_to = max(now_utc, request_time_utc) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
+
+    # Defensive history_select precondition. Not officially in the Python
+    # MetaTrader5 API docs (only the MQL5 server-side HistorySelect is
+    # documented), but some MT5 builds expose it as the precondition that
+    # populates the deal-history cache. Calling it via ``hasattr`` is safe
+    # on all versions: present -> engages; absent -> skipped.
+    history_select = getattr(mt5, "history_select", None)
+    if history_select is not None:
+        try:
+            ok = history_select(date_from=date_from, date_to=date_to)
+        except TypeError:
+            # Older builds may use positional-only; retry positionally.
+            try:
+                ok = history_select(date_from, date_to)
+            except Exception:  # pragma: no cover — defensive
+                ok = False
+        if ok is False:
+            print(
+                f"{_LOG_PREFIX_HISTORY_SELECT_FAILED} "
+                f"idx={idx if idx is not None else '?'} symbol={symbol} "
+                f"order_type={order_type} side={side} "
+                f"window=[{date_from.isoformat()},{date_to.isoformat()}]",
+                file=sys.stderr,
+            )
+            return (None, None)
+
     deal_ticket = int(getattr(order_send_result, "deal", 0) or 0)
-    deal = None
+    deal: Any | None = None
     if deal_ticket:
         deals = mt5.history_deals_get(ticket=deal_ticket)
         if deals:
             deal = deals[0]
     if deal is None:
-        # Fall back to position-keyed lookup, filtering to the entry-side
-        # deal (DEAL_ENTRY_IN). Some MT5 builds return only the deal
-        # ticket on the OrderSendResult and require this second hop.
+        # Path 2 — position-keyed lookup, filtered to entry-side.
         order_ticket = int(getattr(order_send_result, "order", 0) or 0)
         if order_ticket:
             deals = mt5.history_deals_get(position=order_ticket)
@@ -754,11 +972,35 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
                     if int(getattr(cand, "entry", -1)) == int(entry_in):
                         deal = cand
                         break
-                if deal is None:
-                    # No entry-side deal yet (could be in transit). Soft-fail.
-                    return (None, None)
+    if deal is None:
+        # Path 3 — time-range fallback. The documented robust path:
+        # MetaQuotes Python docs describe history_deals_get(date_from,
+        # date_to) as receiving "all history deals within a specified
+        # period in a single call similar to the HistoryDealsTotal and
+        # HistoryDealSelect tandem", i.e. it drives the history cache
+        # internally. Filter strictly by (symbol, volume, side, entry).
+        deal = _time_range_fallback_lookup(
+            mt5,
+            date_from=date_from,
+            date_to=date_to,
+            request_time_utc=request_time_utc,
+            symbol=symbol,
+            volume_lots=volume_lots,
+            side=side,
+            idx=idx,
+            order_type=order_type,
+            claimed_deal_tickets=claimed_deal_tickets,
+        )
+
     if deal is None:
         return (None, None)
+
+    # Successful resolution — claim the ticket if tracking is enabled
+    # so a subsequent time-range fallback cannot re-attribute it.
+    if claimed_deal_tickets is not None:
+        chosen_ticket = int(getattr(deal, "ticket", 0) or 0)
+        if chosen_ticket:
+            claimed_deal_tickets.add(chosen_ticket)
 
     price = float(getattr(deal, "price", 0.0) or 0.0)
     if price == 0.0:
@@ -768,11 +1010,127 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
         return (None, None)
     deal_time = getattr(deal, "time", None)
     if deal_time is None or int(deal_time) == 0:
-        # Deal price valid but time missing — record the price, signal the
-        # caller to use the wallclock fallback for the timestamp by
-        # returning the price + None.
         return (price, None)
     return (price, datetime.fromtimestamp(int(deal_time), tz=UTC))
+
+
+def _time_range_fallback_lookup(  # pragma: no cover - integration path
+    mt5: Any,
+    *,
+    date_from: datetime,
+    date_to: datetime,
+    request_time_utc: datetime,
+    symbol: str,
+    volume_lots: float,
+    side: Side,
+    idx: int | None,
+    order_type: OrderType,
+    claimed_deal_tickets: set[int] | None,
+) -> Any | None:
+    """Path-3 fallback: query by date range, filter by request attributes.
+
+    Filter predicate, applied in order:
+
+    * ``deal.symbol == symbol``
+    * ``abs(deal.volume - volume_lots) < 1e-6`` (broker rounds 0.01 lot)
+    * ``deal.entry == DEAL_ENTRY_IN`` (only the entry leg counts; exit
+      legs and balance deals are excluded)
+    * ``deal.type == DEAL_TYPE_BUY if side == "buy" else DEAL_TYPE_SELL``
+    * If ``claimed_deal_tickets`` is provided, ``deal.ticket`` is not
+      already claimed.
+
+    Multi-match: pick the deal whose ``time`` is closest to
+    ``request_time_utc`` and log
+    ``[record_fills:ambiguous_deal_match]`` to stderr. The closest-time
+    heuristic is correct when two consecutive same-symbol same-side
+    market orders fire within the lookup window — the second order's
+    deal will be milliseconds-later than the first.
+
+    Returns
+    -------
+    Any | None
+        The chosen deal, or ``None`` if no candidate matched.
+    """
+    deals = mt5.history_deals_get(date_from=date_from, date_to=date_to)
+    if not deals:
+        return None
+
+    entry_in = int(getattr(mt5, "DEAL_ENTRY_IN", 0))
+    deal_type_buy = int(getattr(mt5, "DEAL_TYPE_BUY", 0))
+    deal_type_sell = int(getattr(mt5, "DEAL_TYPE_SELL", 1))
+    want_type = deal_type_buy if side == "buy" else deal_type_sell
+    request_ts = request_time_utc.timestamp()
+
+    candidates: list[Any] = []
+    for cand in deals:
+        if str(getattr(cand, "symbol", "")) != symbol:
+            continue
+        cand_volume = float(getattr(cand, "volume", 0.0) or 0.0)
+        if abs(cand_volume - float(volume_lots)) > 1e-6:
+            continue
+        if int(getattr(cand, "entry", -1)) != entry_in:
+            continue
+        if int(getattr(cand, "type", -1)) != want_type:
+            continue
+        cand_ticket = int(getattr(cand, "ticket", 0) or 0)
+        if claimed_deal_tickets is not None and cand_ticket in claimed_deal_tickets:
+            continue
+        candidates.append(cand)
+
+    if not candidates:
+        return None
+
+    # Closest-time match. The deal's time is broker-side epoch seconds.
+    def _delta(c: Any) -> float:
+        t = getattr(c, "time", None)
+        if t is None:
+            return float("inf")
+        return abs(float(int(t)) - request_ts)
+
+    candidates.sort(key=_delta)
+    chosen = candidates[0]
+    if len(candidates) > 1:
+        print(
+            f"{_LOG_PREFIX_AMBIGUOUS_DEAL_MATCH} "
+            f"idx={idx if idx is not None else '?'} symbol={symbol} "
+            f"order_type={order_type} side={side} "
+            f"n_candidates={len(candidates)} "
+            f"chosen_delta_s={_delta(chosen):.3f}",
+            file=sys.stderr,
+        )
+    return chosen
+
+
+def emit_market_lookup_failure_log(
+    *,
+    idx: int | None,
+    symbol: str,
+    order_type: OrderType,
+    side: Side,
+    request_time_utc: datetime,
+    date_from: datetime,
+    date_to: datetime,
+) -> None:
+    """Emit the structured stderr log for a market-order lookup failure.
+
+    Extracted so tests can verify the exact format without invoking the
+    full integration path. The format is:
+
+    ``[record_fills:market_lookup_failure] idx=N symbol=S order=M side=D
+    request_time=T window=[F,T]``
+
+    A non-zero count of these logs in a 24h capture indicates the deal
+    history-cache mechanism is not engaging on the broker / build pair,
+    and Gate 2B will refuse the capture if the ratio exceeds 5%.
+    """
+    print(
+        f"{_LOG_PREFIX_MARKET_LOOKUP_FAILURE} "
+        f"idx={idx if idx is not None else '?'} symbol={symbol} "
+        f"order={order_type} side={side} "
+        f"request_time={request_time_utc.isoformat()} "
+        f"window=[{date_from.isoformat()},{date_to.isoformat()}]",
+        file=sys.stderr,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -818,6 +1176,7 @@ def write_recording(
     end_utc: datetime,
     root: pathlib.Path,
     success_retcode: int = 10009,
+    n_market_lookup_failures: int = 0,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Persist ``rows`` to parquet and write the session manifest.
 
@@ -825,6 +1184,15 @@ def write_recording(
     rows are concatenated to the existing dataframe. This makes a crashed-
     mid-session script resumable — the operator re-runs with the same
     ``run_id`` and the new rows append cleanly.
+
+    Manifest schema v1.1 (2026-05-14 fix v2): the manifest carries a
+    ``n_market_lookup_failures`` integer counting ``order_type ==
+    "market"`` rows where ``retcode == 10009`` but the deal-lookup
+    helper returned ``(None, None)``. Gate 2B refuses to consume any
+    capture whose ratio of market lookup failures to filled market rows
+    exceeds 5%. Callers running the integration path should thread the
+    session-scoped counter through every flush so the manifest reflects
+    the cumulative count, not just the post-last-flush slice.
     """
     parquet_path, manifest_path = _output_paths(run_id, root)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -847,6 +1215,7 @@ def write_recording(
         n_attempted=n_attempted,
         n_filled=n_filled,
         n_rejected=n_rejected,
+        n_market_lookup_failures=int(n_market_lookup_failures),
     )
     manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return parquet_path, manifest_path
@@ -987,6 +1356,17 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
         rng = random.Random(int(args.seed) ^ 0xA5A5)  # for inside_spread flips
         n_attempted = 0
         n_exceptions = 0
+        # 2026-05-14 fix v2: session-scoped counter for market-order rows
+        # whose deal lookup returned (None, None). Propagated into the
+        # manifest as `n_market_lookup_failures`; Gate 2B refuses captures
+        # where this exceeds 5% of filled market rows.
+        n_market_lookup_failures = 0
+        # 2026-05-14 fix v2: session-scoped set of deal tickets already
+        # attributed to a row, so the time-range fallback in
+        # `_resolve_fill_from_deal` cannot double-attribute one deal to
+        # two consecutive same-symbol same-side rows fired within the
+        # ~6-second lookup window.
+        claimed_deal_tickets: set[int] = set()
         exception_type_counts: Counter[str] = Counter()
 
         for idx, (target, symbol, order_type, side) in enumerate(
@@ -1056,17 +1436,50 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                 n_attempted += 1
 
                 # Resolve the authoritative fill price + time from the deal
-                # record for successful MARKET orders. Limit / stop pending
-                # orders create no deal until they're triggered; main() cancels
-                # them immediately so `actual_fill_price` will be None and
-                # `parse_fill_into_record` records NaN — the correct behavior
-                # for a cancelled pending order.
-                if order_type == "market":
-                    actual_fill_price, actual_fill_time = _resolve_fill_from_deal(
-                        mt5, result, success_retcode=success_retcode
+                # record for ALL successful orders (2026-05-14 fix v2). For
+                # market orders the deal MUST exist; for limit / stop pending
+                # orders the deal does NOT exist (the order is queued, not
+                # filled) and the helper's empty return is the correct
+                # silent-NaN behavior. The order_type-aware
+                # market_lookup_failure logging below distinguishes the two.
+                actual_fill_price, actual_fill_time = _resolve_fill_from_deal(
+                    mt5,
+                    result,
+                    success_retcode=success_retcode,
+                    request_time_utc=request_time,
+                    order_type=order_type,
+                    symbol=symbol,
+                    volume_lots=float(req["volume"]),
+                    side=side,
+                    idx=idx,
+                    claimed_deal_tickets=claimed_deal_tickets,
+                )
+
+                # Market-vs-pending lookup-failure distinction. A market
+                # order whose deal lookup returned None after all three
+                # paths is a loud error: the broker confirmed the fill
+                # but Python could not retrieve the deal record. A
+                # limit / stop pending order whose lookup returned None
+                # is expected — no fill yet.
+                if (
+                    order_type == "market"
+                    and int(result.retcode) == success_retcode
+                    and actual_fill_price is None
+                ):
+                    n_market_lookup_failures += 1
+                    _window_from = request_time - HISTORY_LOOKUP_WINDOW_PAD_BEFORE
+                    _window_to = (
+                        max(datetime.now(tz=UTC), request_time) + HISTORY_LOOKUP_WINDOW_PAD_AFTER
                     )
-                else:
-                    actual_fill_price, actual_fill_time = (None, None)
+                    emit_market_lookup_failure_log(
+                        idx=idx,
+                        symbol=symbol,
+                        order_type=order_type,
+                        side=side,
+                        request_time_utc=request_time,
+                        date_from=_window_from,
+                        date_to=_window_to,
+                    )
 
                 symbol_info = mt5.symbol_info(symbol)
                 digits = int(symbol_info.digits) if symbol_info is not None else 5
@@ -1122,6 +1535,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                         end_utc=end_utc,
                         root=repo_root,
                         success_retcode=success_retcode,
+                        n_market_lookup_failures=n_market_lookup_failures,
                     )
                     rows = []  # already on disk; avoid double-append next flush
             except SystemExit:
@@ -1136,6 +1550,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                         end_utc=end_utc,
                         root=repo_root,
                         success_retcode=success_retcode,
+                        n_market_lookup_failures=n_market_lookup_failures,
                     )
                 except Exception:  # pragma: no cover — best-effort flush
                     pass
@@ -1169,13 +1584,15 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             end_utc=end_utc,
             root=repo_root,
             success_retcode=success_retcode,
+            n_market_lookup_failures=n_market_lookup_failures,
         )
         # Summary to stderr too, so the operator can confirm completion even
         # if stdout was discarded by the scheduler.
         summary = (
             f"[record_fills] session complete: run_id={run_id} "
             f"scheduled={len(schedule)} attempted={n_attempted} "
-            f"exceptions={n_exceptions} exc_types={dict(exception_type_counts)}"
+            f"exceptions={n_exceptions} exc_types={dict(exception_type_counts)} "
+            f"market_lookup_failures={n_market_lookup_failures}"
         )
         print(summary)
         print(summary, file=sys.stderr)

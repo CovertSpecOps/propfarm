@@ -667,19 +667,35 @@ def _load_fill_record_class() -> type[BaseModel]:
 #: so the guard catches it.
 UNUSABLE_MANIFEST_STATUS: Final[str] = "fill_price-unusable"
 
+#: Maximum tolerable ratio of ``n_market_lookup_failures`` to filled
+#: market rows in the capture manifest (2026-05-14 fix v2). A non-zero
+#: count means the recording script could not retrieve the deal record
+#: for some market orders even after all three lookup paths
+#: (ticket / position / time-range) — those rows carry NaN fill_price
+#: and would inflate the Gate 2B residual quantiles. The 5% threshold is
+#: deliberately conservative: 100 market rows can absorb up to 5 lookup
+#: failures (sub-ceiling p95 effect) but more makes the cost data
+#: unreliable. Comparison is strict-greater-than (``> threshold``) so a
+#: capture sitting exactly at 5% passes — the threshold is the inclusive
+#: tolerance ceiling, not the rejection floor.
+MAX_MARKET_LOOKUP_FAILURE_RATIO: Final[float] = 0.05
+
 
 def _reject_if_unusable_manifest(capture_parquet_path: Path) -> None:
     """Raise ``ValueError`` if the sidecar manifest marks the capture unusable.
 
-    The manifest sits next to the parquet (same stem, ``.json`` suffix) and
-    is written by :func:`scripts.record_fills.write_recording`. If a future
-    bug produces another bad capture, the operator (or the bug-discovery
-    commit) updates the manifest to ``{"status": "fill_price-unusable",
-    "unusable_reason": "..."}`` and Gate 2B refuses to run.
+    Two rejection criteria (2026-05-14 fix v2 adds the second):
 
-    Forward-compat: a manifest WITHOUT a ``status`` key is the normal case
-    (Phase-0 manifests don't include one) and is accepted. Only an explicit
-    :data:`UNUSABLE_MANIFEST_STATUS` triggers the guard.
+    1. ``status == "fill_price-unusable"`` (legacy v1 guard) — the
+       2026-05-13 ``24e00278…`` capture is the canonical instance.
+    2. ``n_market_lookup_failures / max(n_filled, 1) > 0.05`` — at least
+       5% of market fills failed deal lookup. See
+       :data:`MAX_MARKET_LOOKUP_FAILURE_RATIO`.
+
+    Forward-compat: a manifest WITHOUT a ``status`` key OR without a
+    ``n_market_lookup_failures`` key is the normal case (Phase-0
+    manifests pre-v1.1 don't include the field; the loader treats
+    missing as ``0``).
     """
     manifest_path = capture_parquet_path.with_suffix(".json")
     if not manifest_path.exists():
@@ -706,6 +722,29 @@ def _reject_if_unusable_manifest(capture_parquet_path: Path) -> None:
             f"Re-record with the current scripts/record_fills.py before "
             f"running Gate 2B."
         )
+
+    # Market lookup failure ratio guard (2026-05-14 fix v2).
+    # ``n_filled`` mixes market + pending; the v1.1 manifest does not
+    # break it down by order_type. Use ``n_filled`` as the denominator
+    # (a slight underestimate of the actual market-only ratio — bias
+    # is toward rejection, which is the safe direction). Manifests
+    # without the key default to 0 (forward-compat with v1.0).
+    n_market_lookup_failures = int(manifest.get("n_market_lookup_failures", 0))
+    n_filled = int(manifest.get("n_filled", 0))
+    if n_market_lookup_failures > 0:
+        denom = max(n_filled, 1)
+        ratio = n_market_lookup_failures / denom
+        if ratio > MAX_MARKET_LOOKUP_FAILURE_RATIO:
+            raise ValueError(
+                f"capture parquet at {capture_parquet_path} has "
+                f"n_market_lookup_failures={n_market_lookup_failures} "
+                f"over n_filled={n_filled} "
+                f"(ratio={ratio:.4f} > {MAX_MARKET_LOOKUP_FAILURE_RATIO:.4f}); "
+                f"market fill_price data is unreliable. "
+                f"Re-record with the current scripts/record_fills.py "
+                f"and verify [record_fills:market_lookup_failure] stderr "
+                f"entries are absent."
+            )
 
 
 def _validate_schema(df: pl.DataFrame) -> None:
@@ -1151,6 +1190,7 @@ if _MISSING_THRESHOLDS:  # pragma: no cover — import-time invariant
 
 
 __all__ = [
+    "MAX_MARKET_LOOKUP_FAILURE_RATIO",
     "SYMBOL_FILL_PRICE_P95_THRESHOLD_PIPS",
     "SYMBOL_SPREAD_P95_THRESHOLD_PIPS",
     "UNUSABLE_MANIFEST_STATUS",
