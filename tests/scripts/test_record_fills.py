@@ -1522,13 +1522,16 @@ def test_emit_market_lookup_failure_log_format(capsys: pytest.CaptureFixture[str
 # MT5 runs on EET/EEST (UTC+3 in summer); the offset must be applied at
 # the MT5 boundary. The mutation test is the load-bearing check.
 # --------------------------------------------------------------------------- #
-def test_detect_server_time_offset_rounds_to_nearest_hour() -> None:
-    """Sub-hour skew rounds to the closest whole-hour offset.
+def test_detect_server_time_offset_rounds_to_nearest_half_hour() -> None:
+    """Sub-30-min skew rounds away; 30-min broker offsets preserved.
 
-    Real-world timezone offsets are integer hours; broker write latency
-    and clock drift can produce sub-hour skew that should be rounded
-    away. The detection helper rounds (tick.time - utc_now) / 3600 to
-    the nearest integer hour, then multiplies back to seconds.
+    2026-05-14 fix v3 reviewer follow-up changed granularity from 3600s
+    (whole-hour only) to 1800s (30-min) so brokers in India (UTC+5:30),
+    Iran (UTC+3:30), Afghanistan (UTC+4:30), parts of Australia
+    (UTC+9:30), Newfoundland (UTC-3:30), and Nepal (UTC+5:45 — closest
+    30-min) are detected as their actual offsets instead of being
+    silently rounded to the nearest whole hour and then missing every
+    deal by 30 min.
     """
     rf = _load_module()
     # 3 hours minus 55 seconds: still rounds to 3h = 10800s.
@@ -1536,7 +1539,7 @@ def test_detect_server_time_offset_rounds_to_nearest_hour() -> None:
         tick_time_server_unix=1715600000 + 10745,
         utc_now_unix=1715600000,
     )
-    assert detected == 10800, f"sub-hour skew of -55s should round to nearest hour; got {detected}"
+    assert detected == 10800, f"sub-30min skew of -55s should round to 3h; got {detected}"
 
     # Slightly past 3h (3h + 200s): also rounds to 3h.
     detected = rf.detect_server_time_offset_seconds(
@@ -1545,14 +1548,24 @@ def test_detect_server_time_offset_rounds_to_nearest_hour() -> None:
     )
     assert detected == 10800
 
-    # 3h + 31 min = 12660s → rounds UP to 4h (14400).
+    # 3h + 31 min = 12660s → rounds to 3:30h (12600s), NOT to 4h.
+    # This is the v3 reviewer-follow-up behavior change: at 30-min
+    # granularity, 12660s is 60s past the 12600 (=3:30) mark vs 1740s
+    # short of the 14400 (=4h) mark, so 12600 wins.
     detected = rf.detect_server_time_offset_seconds(
         tick_time_server_unix=1715600000 + 12660,
         utc_now_unix=1715600000,
     )
-    assert detected == 14400
+    assert detected == 12600, f"3h31m should round to UTC+3:30 (12600), not 4h; got {detected}"
 
-    # Negative offset: -5h - 30s.
+    # India broker (UTC+5:30) with small jitter: 19815s → rounds to 19800.
+    detected = rf.detect_server_time_offset_seconds(
+        tick_time_server_unix=1715600000 + 19815,
+        utc_now_unix=1715600000,
+    )
+    assert detected == 19800, f"India UTC+5:30 should be detected as 19800; got {detected}"
+
+    # Negative offset: -5h - 30s → rounds to -5h.
     detected = rf.detect_server_time_offset_seconds(
         tick_time_server_unix=1715600000 - 18030,
         utc_now_unix=1715600000,
@@ -1599,34 +1612,123 @@ def test_emit_server_time_offset_logs_at_12h_does_not_warn(
     assert "server_offset_out_of_range" not in captured.err
 
 
-def test_emit_server_time_offset_logs_above_12h_warns(
+def test_emit_server_time_offset_logs_logs_only_does_not_raise_at_out_of_range(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """43201s (just above the threshold) triggers the out-of-range warning.
+    """emit-only logging: 43201s emits the offset line but does NOT raise.
 
-    Pinned to ``43200 + 1`` (and not at exactly ``43200``) per the fix v3
-    spec: the warning fires at ``abs(offset_seconds) > 43200``, strict.
+    The hard-fail behavior lives in :func:`validate_server_time_offset_seconds`
+    (covered separately). Separating logging from validation lets callers
+    log the diagnostic before raising — operators see the out-of-range
+    stderr line first, then the traceback.
+    """
+    rf = _load_module()
+    # Does not raise — the validation step is a separate function.
+    rf.emit_server_time_offset_logs(43201)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=43201]" in captured.err
+
+
+def test_emit_server_time_offset_logs_non_hourly_offset_informs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """India broker (UTC+5:30 = 19800s) gets an "unusual but legal" info line.
+
+    2026-05-14 fix v3 reviewer follow-up: 30-min broker offsets are
+    detected accurately rather than rounded to the nearest hour, and
+    the operator sees an INFO line confirming the detection so a
+    surprised reader can verify it was deliberate (vs a clock issue).
+    """
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(19800)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=19800]" in captured.err
+    assert "[record_fills:non_hourly_server_offset_detected]" in captured.err
+    assert "offset_seconds=19800" in captured.err
+    # Hourly offsets do NOT get the info line.
+    assert "unusual broker timezone" in captured.err
+
+
+def test_emit_server_time_offset_logs_whole_hour_does_not_emit_non_hourly_line(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """UTC+3 (10800s, the FTMO case) emits ONLY the offset line, no info."""
+    rf = _load_module()
+    rf.emit_server_time_offset_logs(10800)
+    captured = capsys.readouterr()
+    assert "[record_fills:server_time_offset_seconds=10800]" in captured.err
+    assert "[record_fills:non_hourly_server_offset_detected]" not in captured.err
+
+
+def test_validate_server_time_offset_seconds_raises_above_12h() -> None:
+    """43201s (just above 12h) raises ValueError per user mandate.
+
+    The user-mandated behavior (2026-05-14 fix v3 reviewer follow-up):
+    *"refuse to record (raise, with a clear error pointing to clock
+    skew on the VPS or unexpected broker timezone)."*
+    """
+    rf = _load_module()
+    with pytest.raises(ValueError, match="exceeds the sanity bound"):
+        rf.validate_server_time_offset_seconds(43201)
+
+
+def test_validate_server_time_offset_seconds_accepts_at_12h_boundary() -> None:
+    """Exactly 43200s (12h) is at the boundary and does NOT raise.
+
+    The sanity bound check is ``abs(offset) > 12h`` (strict greater).
+    Some legitimate locales sit right at the boundary (Kiribati's Line
+    Islands are UTC+14, however, so the realistic concern is +/- 12h).
+    """
+    rf = _load_module()
+    # No assertion needed — the call must not raise.
+    rf.validate_server_time_offset_seconds(43200)
+    rf.validate_server_time_offset_seconds(-43200)
+    rf.validate_server_time_offset_seconds(10800)  # normal FTMO case
+    rf.validate_server_time_offset_seconds(0)
+
+
+def test_validate_server_time_offset_seconds_raises_negative_extreme() -> None:
+    """Negative offsets > 12h in magnitude also raise."""
+    rf = _load_module()
+    with pytest.raises(ValueError, match="exceeds the sanity bound"):
+        rf.validate_server_time_offset_seconds(-43201)
+
+
+def test_emit_server_time_offset_logs_above_12h_does_not_raise(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """43201s (just above the threshold) NO LONGER WARNS — validate raises.
+
+    Pre-2026-05-14-reviewer-follow-up the emit function carried a
+    soft warning line. That line moved to ``validate_server_time_offset_seconds``
+    which raises. This test pins the post-follow-up contract: emit
+    is logging-only.
     """
     rf = _load_module()
     rf.emit_server_time_offset_logs(43201)
     captured = capsys.readouterr()
     assert "[record_fills:server_time_offset_seconds=43201]" in captured.err
-    assert "[record_fills:server_offset_out_of_range]" in captured.err
-    assert "offset_seconds=43201" in captured.err
-    assert "VPS clock may be misconfigured" in captured.err
-    # Continues, does not abort — caller invariant. The function returns None
-    # rather than raising; we already got here, so the invariant holds.
+    # The legacy soft-warning line is gone; the new hard-fail lives in
+    # validate_server_time_offset_seconds (see its own tests).
+    assert "[record_fills:server_offset_out_of_range]" not in captured.err
 
 
-def test_emit_server_time_offset_logs_negative_extreme_also_warns(
+def test_emit_server_time_offset_logs_negative_extreme_does_not_raise(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Negative offsets > 12h in magnitude also trigger the warning."""
+    """Negative offsets > 12h in magnitude: emit logs but does NOT raise.
+
+    Post-2026-05-14-reviewer-follow-up: the hard-fail moved to
+    ``validate_server_time_offset_seconds`` (see its own negative-extreme
+    test). The emit function is logging-only and surfaces the offset
+    line; the legacy soft-warning ``server_offset_out_of_range`` line
+    is gone.
+    """
     rf = _load_module()
     rf.emit_server_time_offset_logs(-43201)
     captured = capsys.readouterr()
     assert "[record_fills:server_time_offset_seconds=-43201]" in captured.err
-    assert "[record_fills:server_offset_out_of_range]" in captured.err
+    assert "[record_fills:server_offset_out_of_range]" not in captured.err
 
 
 def test_resolve_fill_from_deal_engages_when_server_time_offset_applied() -> None:

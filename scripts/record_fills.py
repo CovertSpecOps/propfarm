@@ -244,7 +244,11 @@ Fix v3:
   canonical, not a workaround. Internal datetimes in the helper
   stay UTC; translation lives at the MT5 call-site boundary only.
 * Sanity check: if ``abs(offset_seconds) > 43200`` (12 hours), the
-  script emits a loud ``[record_fills:server_offset_out_of_range]``
+  script RAISES ``ValueError`` (was a soft warning in the initial fix v3
+  drop; promoted to hard-fail on reviewer follow-up to protect captures
+  from VPS clock skew). See :func:`validate_server_time_offset_seconds`.
+  Legacy stderr-prefix reference (no longer emitted):
+  ``[record_fills:server_offset_out_of_range]``
   warning to stderr but does NOT abort (the VPS might be on an odd
   timezone on purpose; just warn).
 
@@ -314,9 +318,10 @@ HISTORY_LOOKUP_WINDOW_PAD_AFTER_SECONDS: Final[int] = 5
 
 #: Maximum plausible absolute server-time offset in seconds. 12h = 43200s.
 #: Anything wider suggests a clock issue on the VPS rather than a real
-#: timezone offset. The script logs ``[record_fills:server_offset_out_of_range]``
-#: but does NOT abort (the user might be running this in an odd timezone
-#: on purpose — e.g. a manually-set test clock).
+#: timezone offset. The script raises ``ValueError`` via
+#: :func:`validate_server_time_offset_seconds` (the initial fix v3 drop
+#: emitted a soft ``[record_fills:server_offset_out_of_range]`` line and
+#: continued; the reviewer follow-up promoted it to hard-fail).
 SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS: Final[int] = 12 * 3600
 
 # Session anchor minutes-of-day in UTC. London 07:00, NY am 12:00 (DST safety
@@ -919,7 +924,9 @@ _LOG_PREFIX_MARKET_LOOKUP_FAILURE: Final[str] = "[record_fills:market_lookup_fai
 _LOG_PREFIX_AMBIGUOUS_DEAL_MATCH: Final[str] = "[record_fills:ambiguous_deal_match]"
 #: 2026-05-14 fix v3 — startup diagnostic emitted after offset detection.
 _LOG_PREFIX_SERVER_TIME_OFFSET: Final[str] = "[record_fills:server_time_offset_seconds"
-_LOG_PREFIX_SERVER_OFFSET_OUT_OF_RANGE: Final[str] = "[record_fills:server_offset_out_of_range]"
+_LOG_PREFIX_NON_HOURLY_SERVER_OFFSET: Final[str] = (
+    "[record_fills:non_hourly_server_offset_detected]"
+)
 
 
 def detect_server_time_offset_seconds(
@@ -939,9 +946,16 @@ def detect_server_time_offset_seconds(
     (server-time Unix seconds per the MQL5 ``TimeCurrent`` doc:
     "the time value is formed on a trade server and does not depend
     on the time settings on your computer") against the UTC Unix
-    wallclock. Round to the nearest hour because real-world timezone
-    offsets are integer hours; sub-hour skew is just clock noise
-    plus broker-side write latency.
+    wallclock. Round to the nearest 30 minutes — most broker timezones
+    are whole hours (EET/EEST is the FTMO default), but several real
+    broker locales use 30-minute offsets (India UTC+5:30, Iran UTC+3:30,
+    Afghanistan UTC+4:30, parts of Australia UTC+9:30, Newfoundland
+    UTC-3:30) and a script that force-rounds to the nearest hour would
+    silently mis-query history by 30 minutes for those brokers.
+
+    Sub-30-minute skew (clock drift + broker-side write latency) gets
+    rounded away. A non-whole-hour 30-min offset is "unusual but legal"
+    and surfaces as an INFO line in :func:`emit_server_time_offset_logs`.
 
     Parameters
     ----------
@@ -955,12 +969,12 @@ def detect_server_time_offset_seconds(
     Returns
     -------
     int
-        Server-time offset in seconds, rounded to the nearest hour
-        (``round((tick - utc) / 3600) * 3600``). Positive means the
+        Server-time offset in seconds, rounded to the nearest 30 min
+        (``round((tick - utc) / 1800) * 1800``). Positive means the
         server is ahead of UTC.
     """
     delta_seconds = float(tick_time_server_unix) - float(utc_now_unix)
-    return int(round(delta_seconds / 3600.0) * 3600)
+    return int(round(delta_seconds / 1800.0) * 1800)
 
 
 def emit_server_time_offset_logs(
@@ -972,10 +986,13 @@ def emit_server_time_offset_logs(
 
     Always emits ``[record_fills:server_time_offset_seconds=N]`` plus a
     human-readable ``server_tz_offset_hours=±H`` companion. If the
-    absolute offset exceeds :data:`SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS`
-    (12 h), also emits ``[record_fills:server_offset_out_of_range]`` —
-    not an abort, just a warning. The VPS might be on an odd timezone
-    on purpose, but a > 12 h offset most often indicates a clock issue.
+    detected offset is a 30-minute multiple but NOT a whole-hour
+    multiple (e.g., India UTC+5:30 = 19800s), additionally emits
+    ``[record_fills:non_hourly_server_offset_detected]`` as an INFO
+    line — unusual but legal; the script does not refuse to record on
+    it. The hard sanity check (out-of-range) is in the separate
+    :func:`validate_server_time_offset_seconds` so a caller can choose
+    whether to raise; ``main()`` invokes both in sequence.
 
     Parameters
     ----------
@@ -995,12 +1012,59 @@ def emit_server_time_offset_logs(
         f"{_LOG_PREFIX_SERVER_TIME_OFFSET}={offset_seconds}] server_tz_offset_hours={hours_repr}",
         file=target,
     )
-    if abs(offset_seconds) > SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS:
+    # 30-min multiple but not a whole-hour multiple → unusual but legal
+    # broker locale (India / Iran / Afghanistan / Newfoundland / etc.).
+    # The detector rounds to 1800-second granularity so this branch is
+    # the way operators see "yes that 30-min part was deliberate, not
+    # a clock issue."
+    if offset_seconds != 0 and offset_seconds % 3600 != 0:
         print(
-            f"{_LOG_PREFIX_SERVER_OFFSET_OUT_OF_RANGE} "
-            f"offset_seconds={offset_seconds} — "
-            f"VPS clock may be misconfigured, but continuing.",
+            f"{_LOG_PREFIX_NON_HOURLY_SERVER_OFFSET} "
+            f"offset_seconds={offset_seconds} "
+            f"(={hours_repr}h) — unusual broker timezone (e.g. India "
+            f"UTC+5:30, Iran UTC+3:30), continuing.",
             file=target,
+        )
+
+
+def validate_server_time_offset_seconds(offset_seconds: int) -> None:
+    """Hard-fail if the detected offset is implausibly large.
+
+    Raises :class:`ValueError` when ``abs(offset_seconds) >
+    SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS`` (12h). A magnitude
+    above 12 hours almost always indicates VPS clock skew or an
+    unexpected broker-side configuration, not a legitimate timezone;
+    refusing to record is safer than producing a capture whose
+    ``broker_fill_time_utc`` column is silently off by ~24h.
+
+    Per user mandate (2026-05-14 fix v3 reviewer follow-up):
+    *"refuse to record (raise, with a clear error pointing to clock
+    skew on the VPS or unexpected broker timezone)."*
+
+    ``main()`` calls this immediately after
+    :func:`emit_server_time_offset_logs` so the operator sees the
+    out-of-range stderr line first, then the traceback.
+
+    Parameters
+    ----------
+    offset_seconds
+        The integer-second offset returned by
+        :func:`detect_server_time_offset_seconds`.
+
+    Raises
+    ------
+    ValueError
+        When ``abs(offset_seconds) > 43200``.
+    """
+    if abs(offset_seconds) > SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS:
+        raise ValueError(
+            f"server-time offset {offset_seconds}s "
+            f"(={offset_seconds / 3600:+.2f}h) exceeds the sanity bound "
+            f"of ±{SERVER_TIME_OFFSET_SANITY_BOUND_SECONDS}s (±12h). "
+            f"Refusing to record: this almost certainly indicates VPS "
+            f"clock skew or an unexpected broker-side timezone, not a "
+            f"legitimate locale. Check the VPS clock (`w32tm /query /status`) "
+            f"and confirm the FTMO MT5 server timezone before re-running."
         )
 
 
@@ -1632,6 +1696,12 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                 file=sys.stderr,
             )
         emit_server_time_offset_logs(server_time_offset_seconds)
+        # Hard-fail on implausible offset BEFORE any order_send.
+        # User mandate: refuse to record if the offset exceeds ±12h —
+        # this protects the capture from VPS clock skew or a broker
+        # timezone surprise that would silently corrupt every
+        # broker_fill_time_utc value.
+        validate_server_time_offset_seconds(server_time_offset_seconds)
 
         constants = {
             "TRADE_ACTION_DEAL": mt5.TRADE_ACTION_DEAL,
