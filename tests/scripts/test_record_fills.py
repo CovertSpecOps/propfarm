@@ -1018,3 +1018,76 @@ def test_iteration_exception_is_logged_to_stderr_and_loop_continues(
     assert "idx=005" in captured.err
     assert "RuntimeError" in captured.err
     assert "simulated bad row" in captured.err
+
+
+def test_main_except_clauses_match_documented_crash_hardening_contract() -> None:
+    """AST regression: lock the structure of ``main()``'s exception handlers.
+
+    The 2026-05-14 crash-hardening commit added a per-iteration
+    ``try / except KeyboardInterrupt / except Exception`` block so the
+    capture loop survives transient broker errors. The smoke test
+    ``test_iteration_exception_is_logged_to_stderr_and_loop_continues``
+    recreates the *pattern* locally, but does NOT bind to ``main()``'s
+    actual source — a regression that broadened to ``except BaseException``
+    (swallowing ``KeyboardInterrupt`` / ``SystemExit``) or removed the
+    dedicated ``except KeyboardInterrupt: raise`` clause would not fail
+    that smoke test.
+
+    This AST test parses the script and asserts the contract directly:
+
+    * ``main()`` MUST have at least one ``except`` handler.
+    * No bare ``except:`` clauses.
+    * No ``except BaseException`` clauses.
+    * A dedicated ``except KeyboardInterrupt`` handler exists whose body
+      re-raises (so Ctrl-C on the VPS RDP still kills the capture).
+    * An ``except Exception`` handler exists (the per-iteration soft-fail).
+    """
+    import ast
+
+    script_path = Path(__file__).resolve().parents[2] / "scripts" / "record_fills.py"
+    tree = ast.parse(script_path.read_text())
+    main_fn = next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        ),
+        None,
+    )
+    assert main_fn is not None, "scripts/record_fills.py has no main() function"
+
+    handlers = [node for node in ast.walk(main_fn) if isinstance(node, ast.ExceptHandler)]
+    assert handlers, "main() has no exception handlers — crash-hardening regressed"
+
+    def handler_type_name(h: ast.ExceptHandler) -> str | None:
+        if h.type is None:
+            return None  # bare except:
+        if isinstance(h.type, ast.Name):
+            return h.type.id
+        if isinstance(h.type, ast.Attribute):
+            return h.type.attr
+        return None
+
+    type_names = [handler_type_name(h) for h in handlers]
+
+    assert None not in type_names, (
+        "main() has a bare `except:` clause — swallows BaseException incl. KeyboardInterrupt"
+    )
+    assert "BaseException" not in type_names, (
+        "main() catches BaseException; this swallows KeyboardInterrupt and SystemExit. "
+        "Use `except Exception` with a separate `except KeyboardInterrupt: raise` block."
+    )
+
+    kbi_handlers = [h for h in handlers if handler_type_name(h) == "KeyboardInterrupt"]
+    assert kbi_handlers, (
+        "main() has no dedicated `except KeyboardInterrupt` handler — "
+        "Ctrl-C on the VPS RDP would fall through to `except Exception` and be swallowed."
+    )
+    for h in kbi_handlers:
+        assert any(isinstance(stmt, ast.Raise) for stmt in h.body), (
+            "KeyboardInterrupt handler in main() does not re-raise"
+        )
+
+    assert "Exception" in type_names, (
+        "main() has no `except Exception` handler — per-iteration crash-hardening regressed"
+    )

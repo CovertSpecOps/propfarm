@@ -7,7 +7,9 @@ session open.
 
 **This runbook is operator-facing**: you execute it on the Windows VPS;
 the script does the work. The pure helpers it relies on are
-locked by `tests/scripts/test_record_fills.py` (18 tests, all green).
+locked by `tests/scripts/test_record_fills.py` (30 tests, all green; see
+the 2026-05-14 fix-up section at the end of this runbook before any
+re-record).
 
 ## Why pre-record (not capture during the gate)
 
@@ -242,13 +244,13 @@ contents into a STATUS.md update.
 |---|---|---|
 | `run_id` | utf8 | identical across every row from one recording session |
 | `request_time_utc` | timestamp (tz=UTC) | when `order_send` was called |
-| `broker_fill_time_utc` | timestamp (tz=UTC) | from `result.time`, or `after_send` if zero |
+| `broker_fill_time_utc` | timestamp (tz=UTC) | from the deal record's `time` field (via `mt5.history_deals_get(ticket=result.deal)`); `after_send` only on rejected fills or soft-fail deal lookup. See 2026-05-14 fix-up section |
 | `symbol` | utf8 | EURUSD / GBPUSD / USDJPY / etc |
 | `order_type` | utf8 | `market` / `limit` / `stop` |
 | `side` | utf8 | `buy` / `sell` |
 | `volume_lots` | float64 | always 0.01 |
 | `requested_price` | float64 | price field of the request |
-| `fill_price` | float64 | `result.price` if filled; NaN if rejected |
+| `fill_price` | float64 | from the deal record (NOT `result.price` — that is 0 for MT5 market orders); NaN on reject or soft-fail deal lookup. See 2026-05-14 fix-up section |
 | `spread_at_request_pips` | float64 | `(ask - bid) / pip` from the tick at request |
 | `slippage_observed_pips` | float64 | signed adverse — positive = bad for trader |
 | `broker_latency_ms` | float64 | `(after_send - request_time) * 1000` |
@@ -323,9 +325,95 @@ Before disconnecting RDP:
 
 - Schema validated by `scripts/record_fills.py::FillRecord`
   (pydantic, frozen).
-- Pure helpers locked by `tests/scripts/test_record_fills.py` (18 tests).
+- Pure helpers locked by `tests/scripts/test_record_fills.py` (30 tests).
 - Day-1 spike infrastructure (VPS + FTMO demo + secrets file) is
   documented in `docs/runbooks/mt5-spike-runbook.md`; do not duplicate
   that here — this runbook assumes the spike host is intact.
 - Gate 2B comparison itself (parquet → divergence analysis) is
   Task 14.3 of the Phase 0 plan.
+
+## 2026-05-14 fix-up — `OrderSendResult.price = 0` lesson (READ BEFORE RE-RECORDING)
+
+The 2026-05-13 ~15h capture (`data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.parquet`,
+110 rows / 107 filled / 3 rejected) landed with `fill_price = 0.0` on
+**every** retcode=10009 row and `slippage_observed_pips` in the ±11,700
+to ±13,500 range — the bug's signature. Sidecar: `…UNUSABLE.md`.
+
+### Root cause
+
+The pre-fix `parse_fill_into_record` read `fill_price` from
+`mt5.OrderSendResult.price` directly. **MT5 returns `result.price = 0`
+for market deals in most cases**; the executed fill price lives in the
+subsequent deal record, retrieved via `mt5.history_deals_get(...)`.
+The existing 18 unit tests passed because their mocked
+`OrderSendResult` set `price` to a non-zero value — the
+semantically-clean shape, NOT the pathological one a real broker
+returns. Bug introduced in commit `450873c` (2026-05-13 "feat(scripts):
+Gate 2B fill-recording protocol") and persisted unchanged through
+`130ab28`.
+
+### Fix (commit `9dd9af6`, 2026-05-14)
+
+* `_resolve_fill_from_deal` helper: tries `mt5.history_deals_get(ticket=result.deal)`
+  first, falls back to `position=result.order` filtered to `DEAL_ENTRY_IN`,
+  treats a returned `deal.price == 0` as soft-failure.
+* `parse_fill_into_record` now takes `actual_fill_price` /
+  `actual_fill_time_utc` keyword-only args (helper stays pure; never
+  imports MT5).
+* Soft-failure (retcode=10009 but deal lookup returned `None` or
+  `price == 0`): the record's `comment` is prefixed
+  `retcode_or_deal_failure:` so downstream consumers distinguish a
+  broker reject from a successful send with no deal yet.
+* Per-iteration `try / except KeyboardInterrupt / except Exception` in
+  `main()`: a transient broker error on one bad row no longer kills
+  the session (the 2026-05-13 run exited with `LastTaskResult=1` at
+  iteration 110/200 — unknown specific cause, but the loop is now
+  resilient regardless). Exceptions log to `sys.stderr` with prefix
+  `[record_fills:exception]` so Task Scheduler hidden jobs surface
+  failures. End-of-loop summary `[record_fills] session complete: …`
+  reports `scheduled / attempted / exceptions / exc_types`.
+* AST regression test locks the exception-handler contract against
+  future broadening to `BaseException` or bare `except:`.
+
+### Short-test capture protocol (do this BEFORE any future 24h run)
+
+The user-mandated gate before relaunching a 24h Task Scheduler run is a
+**short-test capture** to verify the fix populates `fill_price`
+correctly against the live broker. Working invocation (both flags
+confirmed against `python scripts/record_fills.py --help`):
+
+```powershell
+python scripts/record_fills.py --duration-hours 1 --n-samples 10
+```
+
+Then:
+
+1. Read the first 5 rows of `data/raw/fill_recordings/{new_run_id}.parquet`
+   via polars (e.g. `pl.read_parquet(...).head(5)`).
+2. Paste the `fill_price` column values back to the orchestrator.
+3. **All five values must be non-zero.** If any are zero, the fix did
+   not engage on the live broker — STOP and investigate. Do not
+   proceed to a 24h run.
+4. Once the short-test gate passes, the operator can kick off the 24h
+   Task Scheduler run per §1A above.
+
+### Salvage from the 2026-05-13 capture
+
+The bad capture is preserved (not deleted) for partial salvage. Per
+the sidecar UNUSABLE.md:
+
+* **VALID** downstream uses (allowed): spread model recalibration
+  (W3 follow-up), latency baseline for fill engine, retcode
+  distribution under normal conditions.
+* **INVALID** uses (blocked): Gate 2B fill comparison. The harness
+  `src/propfarm/gates/gate_2b.py::_reject_if_unusable_manifest`
+  refuses any capture whose sibling manifest carries
+  `"status": "fill_price-unusable"`, with regression test
+  `tests/gates/test_gate_2b.py::test_run_gate_2b_rejects_unusable_manifest_status`.
+
+### Cross-links
+
+* Fix commit: `9dd9af6`. Follow-ups: `a91ccbf`, `09bf313`.
+* Sidecar: `data/raw/fill_recordings/24e00278d0024a98beb009b75762adb6.UNUSABLE.md`.
+* Manifest: same dir, `.json` extension, has `"status": "fill_price-unusable"`.
+* Playbook entry: STATUS.md "Pathological-vendor-response catch pattern".
