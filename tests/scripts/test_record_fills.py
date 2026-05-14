@@ -1645,7 +1645,10 @@ def test_emit_server_time_offset_logs_non_hourly_offset_informs(
     assert "[record_fills:server_time_offset_seconds=19800]" in captured.err
     assert "[record_fills:non_hourly_server_offset_detected]" in captured.err
     assert "offset_seconds=19800" in captured.err
-    # Hourly offsets do NOT get the info line.
+    # The INFO line's descriptive suffix mentions example locales so the
+    # operator can verify the detection is deliberate without consulting
+    # external docs. (The hourly-vs-non-hourly negative check lives in
+    # the separate _whole_hour_does_not_emit_non_hourly_line test.)
     assert "unusual broker timezone" in captured.err
 
 

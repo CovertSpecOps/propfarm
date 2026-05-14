@@ -597,17 +597,26 @@ UTC in the mock fixtures). Tests passed; live broker failed.
 ### Fix v3 (this commit)
 
 * **`detect_server_time_offset_seconds(tick_time_server_unix, utc_now_unix)`**
-  helper: rounds `(tick.time - utc) / 3600` to the nearest integer
-  hour. Real-world timezone offsets are integer hours; sub-hour skew
-  is clock noise plus broker-side write latency.
+  helper: rounds `(tick.time - utc) / 1800` to the nearest 30 minutes.
+  Most broker timezones are whole hours (FTMO EET/EEST), but several
+  real locales use 30-min offsets — India UTC+5:30, Iran UTC+3:30,
+  Afghanistan UTC+4:30, parts of Australia UTC+9:30, Newfoundland
+  UTC-3:30 — and a force-round to the nearest hour would silently
+  miss those captures' history by 30 min. Sub-30-min skew (clock
+  drift + broker-side write latency) rounds away.
 * **`main()` startup**: after `mt5.initialize()` and before the first
   `order_send`, the script reads `mt5.symbol_info_tick("EURUSD").time`,
   detects the offset, and emits
   `[record_fills:server_time_offset_seconds=N] server_tz_offset_hours=+H`
-  to stderr. If `abs(offset) > 43200` (12 h), also emits
-  `[record_fills:server_offset_out_of_range] offset_seconds=N — VPS clock
-  may be misconfigured, but continuing.` and CONTINUES (does not abort —
-  the user might be running this in an odd timezone on purpose).
+  to stderr. A non-whole-hour 30-min multiple (e.g. India UTC+5:30 =
+  19800s) additionally emits `[record_fills:non_hourly_server_offset_detected]`
+  as an INFO line so the operator can confirm the unusual locale is
+  deliberate. If `abs(offset) > 43200` (12 h), the script RAISES
+  `ValueError` via `validate_server_time_offset_seconds(...)` with a
+  message naming VPS clock skew and broker timezone as the canonical
+  causes — refusing to record protects the capture from silently
+  misclassifying every `broker_fill_time_utc` by an implausible
+  amount.
 * **`_resolve_fill_from_deal`** gains keyword-only
   `server_time_offset_seconds: int = 0`. Internal datetimes stay UTC;
   translation lives at the MT5 call-site boundary only. The helper
@@ -654,32 +663,52 @@ broker), the line will read `=0]` with `+0` — that is fine, document
 it. The first non-zero `fill_price` value is only meaningful AFTER you
 confirm this line.
 
-If the line reads `[record_fills:server_offset_out_of_range]`, the
-VPS clock is likely misconfigured (or the broker is in an odd
-timezone). The script continues regardless; investigate before
-running the 24h capture.
+If `validate_server_time_offset_seconds` raises a `ValueError` with
+the "exceeds the sanity bound" message at startup, the VPS clock is
+likely misconfigured (or the broker is in an odd timezone). The
+script REFUSES to record (hard-fail at startup, no parquet written);
+fix the clock or confirm the broker locale before re-running.
+
+If you see `[record_fills:non_hourly_server_offset_detected]`,
+confirm the broker IS on a 30-min-offset timezone (India, Iran,
+Afghanistan, Newfoundland, etc.). FTMO MT5 is EET/EEST (whole hours)
+so this line on an FTMO run almost certainly means VPS clock drift
+> ±14m59s — the 30-min granularity narrows the clock-drift tolerance
+from the old ±29m59s (under hour-granularity) to ±14m59s. Verify
+`w32tm /query /status` reports < 1s drift before running 24h.
 
 ### Stderr log prefixes (extended cheat sheet)
 
 | Prefix | Meaning |
 |---|---|
 | `[record_fills:server_time_offset_seconds=N]` | (fix v3) Detected MT5 server-time offset on session startup. Companion line: `server_tz_offset_hours=+H`. |
-| `[record_fills:server_offset_out_of_range]` | (fix v3) `abs(offset_seconds) > 43200` (12 h). Warning only; script continues. |
+| `[record_fills:non_hourly_server_offset_detected]` | (fix v3 reviewer-delta) Offset is a 30-min multiple but NOT a whole hour. Legal for India / Iran / Afghanistan / Newfoundland brokers; **suspect clock drift on an FTMO run**. |
 | `[record_fills:server_time_offset_detection_failed]` | (fix v3) `symbol_info_tick` failed or `tick.time` was 0; offset defaults to 0. Investigate before running 24h. |
+
+Pre-`378d1ae` reviewer-delta only: the soft
+`[record_fills:server_offset_out_of_range]` warning line is GONE —
+its role moved to a hard-fail `ValueError` from
+`validate_server_time_offset_seconds(...)` per user mandate.
 
 ### Updated short-test gate
 
-After re-running the short test, the user must paste:
+After re-running the short test, the user must paste THREE items
+(the third was missing from the initial v3 runbook and added on the
+reviewer follow-up, since the fix v2 manifest counter is the load-
+bearing diagnostic if the offset is wrong):
 
 1. The full `[record_fills:server_time_offset_seconds=N]` line from
    stderr.
-2. The first 5 `fill_price` values from
+2. The first 5 **non-zero** `fill_price` values from
    `data/raw/fill_recordings/{run_id}.parquet`.
+3. The `n_market_lookup_failures` value from the sibling JSON
+   manifest. **Must be `0`.** A non-zero value means the offset
+   translation is not engaging — re-investigate before any 24h run.
 
-The first non-zero `fill_price` is only meaningful if (a) the offset
-detection logged a non-zero N matching the broker's real timezone,
-OR (b) it logged N=0 with a documented reason (broker on UTC, VPS
-clock matches broker).
+The non-zero `fill_price` values are only meaningful if (a) the
+offset detection logged a non-zero N matching the broker's real
+timezone, OR (b) it logged N=0 with a documented reason (broker on
+UTC, VPS clock matches broker).
 
 If `[record_fills:market_lookup_failure]` appears in stderr for any
 market row, STOP — the offset translation is not engaging on the
@@ -689,7 +718,10 @@ re-check the doc reading).
 
 ### Cross-links
 
-* Fix v3 commit: `1fa8013` (this commit).
+* Fix v3 commits: `1fa8013` (impl) + `ba5f5ec` (hash backfill) +
+  `378d1ae` (reviewer-mandated deltas: WARN→RAISE on out-of-range,
+  30-min detection granularity, `non_hourly_server_offset_detected`
+  INFO line, short-test gate now requires `n_market_lookup_failures=0`).
 * Failed short-test session: run_id `ef34a234bf1649418d3735c3b930ca8c`
   (no parquet flushed; stdout transcript only).
 * Playbook addendum: STATUS.md "Pathological-vendor-response catch

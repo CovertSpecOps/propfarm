@@ -228,8 +228,11 @@ Fix v3:
   seconds; the MQL5-side ``TimeCurrent`` doc clarifies that
   "the time value is formed on a trade server and does not depend
   on the time settings on your computer") against ``time.time()``
-  (UTC Unix seconds). The difference, rounded to the nearest hour,
-  is the ``server_time_offset_seconds``. Logged as
+  (UTC Unix seconds). The difference, rounded to the nearest 30
+  minutes (so 30-min broker locales — India UTC+5:30, Iran UTC+3:30,
+  Afghanistan UTC+4:30, Newfoundland UTC-3:30, etc. — are detected
+  exactly rather than silently rounded to a whole hour), is the
+  ``server_time_offset_seconds``. Logged as
   ``[record_fills:server_time_offset_seconds=<N>]`` to stderr
   (plus a human-readable ``server_tz_offset_hours=+<H>`` companion).
 * The detected offset is threaded into ``_resolve_fill_from_deal``
@@ -244,11 +247,12 @@ Fix v3:
   canonical, not a workaround. Internal datetimes in the helper
   stay UTC; translation lives at the MT5 call-site boundary only.
 * Sanity check: if ``abs(offset_seconds) > 43200`` (12 hours), the
-  script RAISES ``ValueError`` (was a soft warning in the initial fix v3
-  drop; promoted to hard-fail on reviewer follow-up to protect captures
-  from VPS clock skew). See :func:`validate_server_time_offset_seconds`.
-  Legacy stderr-prefix reference (no longer emitted):
-  ``[record_fills:server_offset_out_of_range]``
+  script RAISES ``ValueError`` via
+  :func:`validate_server_time_offset_seconds` (was a soft
+  ``[record_fills:server_offset_out_of_range]`` warning line in the
+  initial fix v3 drop and continued; the reviewer follow-up promoted
+  to hard-fail to protect captures from VPS clock skew). The legacy
+  prefix is no longer emitted at runtime.
   warning to stderr but does NOT abort (the VPS might be on an odd
   timezone on purpose; just warn).
 
