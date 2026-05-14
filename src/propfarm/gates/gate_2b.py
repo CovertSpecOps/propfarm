@@ -723,22 +723,38 @@ def _reject_if_unusable_manifest(capture_parquet_path: Path) -> None:
             f"running Gate 2B."
         )
 
-    # Market lookup failure ratio guard (2026-05-14 fix v2).
-    # ``n_filled`` mixes market + pending; the v1.1 manifest does not
-    # break it down by order_type. Use ``n_filled`` as the denominator
-    # (a slight underestimate of the actual market-only ratio — bias
-    # is toward rejection, which is the safe direction). Manifests
-    # without the key default to 0 (forward-compat with v1.0).
+    # Market lookup failure ratio guard (2026-05-14 fix v2 + reviewer
+    # follow-up: market-only denominator).
+    #
+    # Prefer the v1.2 ``n_filled_market`` denominator when present, since
+    # ``n_market_lookup_failures`` is by construction a count over
+    # ``order_type == "market"`` rows. The v1.1 manifest only published
+    # ``n_filled`` (market + pending), which DILUTES the ratio and lets
+    # the guard tolerate roughly twice the market-only failure rate it
+    # documents — the opposite of safe. v1.2 manifests get the strict
+    # check; v1.1/v1.0 manifests fall back to the lenient n_filled
+    # denominator with the rejection message naming the denominator so
+    # the operator knows which path triggered.
+    #
+    # Forward-compat: manifests without ``n_market_lookup_failures``
+    # default to 0 (v1.0); manifests without ``n_filled_market`` (also v1.0
+    # and v1.1) fall back to ``n_filled``.
     n_market_lookup_failures = int(manifest.get("n_market_lookup_failures", 0))
     n_filled = int(manifest.get("n_filled", 0))
+    n_filled_market_raw = manifest.get("n_filled_market")
     if n_market_lookup_failures > 0:
-        denom = max(n_filled, 1)
+        if n_filled_market_raw is not None and int(n_filled_market_raw) > 0:
+            denom = int(n_filled_market_raw)
+            denom_field = "n_filled_market"
+        else:
+            denom = max(n_filled, 1)
+            denom_field = "n_filled (v1.0/1.1 fallback — lenient)"
         ratio = n_market_lookup_failures / denom
         if ratio > MAX_MARKET_LOOKUP_FAILURE_RATIO:
             raise ValueError(
                 f"capture parquet at {capture_parquet_path} has "
                 f"n_market_lookup_failures={n_market_lookup_failures} "
-                f"over n_filled={n_filled} "
+                f"over {denom_field}={denom} "
                 f"(ratio={ratio:.4f} > {MAX_MARKET_LOOKUP_FAILURE_RATIO:.4f}); "
                 f"market fill_price data is unreliable. "
                 f"Re-record with the current scripts/record_fills.py "

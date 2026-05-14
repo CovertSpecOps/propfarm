@@ -222,7 +222,7 @@ Side = Literal["buy", "sell"]
 #: Manifest schema version. Bumped to "1.1" on 2026-05-14 fix v2 to add
 #: ``n_market_lookup_failures``. FillRecord (parquet column) schema is
 #: unchanged — only the sidecar JSON manifest gains the new field.
-SCHEMA_VERSION: Final[str] = "1.1"
+SCHEMA_VERSION: Final[str] = "1.2"
 LOT_SIZE: Final[float] = 0.01
 MAX_SIMULTANEOUS_POSITIONS: Final[int] = 5
 HARD_TIME_LIMIT_HOURS: Final[float] = 48.0
@@ -306,6 +306,13 @@ class SessionManifest(BaseModel):
 
     * **1.0** (initial release) — fields: run_id, start_utc, end_utc,
       n_attempted, n_filled, n_rejected, schema_version, vps_host_redacted.
+    * **1.2** (2026-05-14 fix v2 reviewer follow-up) — added
+      ``n_filled_market`` so Gate 2B's market-lookup-failure ratio uses a
+      market-only denominator, not the all-fills (market + pending)
+      denominator that mathematically dilutes the signal. The 1.1 ratio
+      n_market_lookup_failures / n_filled was lenient by ~2x for typical
+      mixes (60% market / 40% pending); the 1.2 denominator gives the
+      market-only failure rate the guard's threshold actually documents.
     * **1.1** (2026-05-14 fix v2) — added ``n_market_lookup_failures``.
       Counts the number of ``order_type == "market"`` rows where
       ``retcode == 10009`` (broker confirmed fill) but the helper's
@@ -333,6 +340,7 @@ class SessionManifest(BaseModel):
     end_utc: datetime
     n_attempted: int
     n_filled: int
+    n_filled_market: int = 0
     n_rejected: int
     n_market_lookup_failures: int = 0
     schema_version: str = SCHEMA_VERSION
@@ -937,30 +945,50 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     # on all versions: present -> engages; absent -> skipped.
     history_select = getattr(mt5, "history_select", None)
     if history_select is not None:
+        ok = True
+        select_exc_type: str | None = None
         try:
             ok = history_select(date_from=date_from, date_to=date_to)
         except TypeError:
             # Older builds may use positional-only; retry positionally.
             try:
                 ok = history_select(date_from, date_to)
-            except Exception:  # pragma: no cover — defensive
+            except Exception as exc:  # pragma: no cover — defensive
                 ok = False
+                select_exc_type = type(exc).__name__
         if ok is False:
+            # Disambiguate "returned False" from "raised <Exc>" so the
+            # operator can grep stderr and tell whether the broker is
+            # reporting a select-failure or whether some other exception
+            # short-circuited the call.
+            raised_suffix = f" raised={select_exc_type}" if select_exc_type else ""
             print(
                 f"{_LOG_PREFIX_HISTORY_SELECT_FAILED} "
                 f"idx={idx if idx is not None else '?'} symbol={symbol} "
                 f"order_type={order_type} side={side} "
-                f"window=[{date_from.isoformat()},{date_to.isoformat()}]",
+                f"window=[{date_from.isoformat()},{date_to.isoformat()}]"
+                f"{raised_suffix}",
                 file=sys.stderr,
             )
             return (None, None)
 
+    # Claim-tracking applies to ALL three paths, not just the time-range
+    # fallback. A path-1 (ticket=) or path-2 (position=) hit that returns
+    # an already-claimed deal would silently double-attribute one broker
+    # deal across two synthetic-order rows; force fall-through to the
+    # next path in that case so the second row soft-fails honestly.
+    def _is_claimed(ticket: int) -> bool:
+        return claimed_deal_tickets is not None and ticket in claimed_deal_tickets
+
     deal_ticket = int(getattr(order_send_result, "deal", 0) or 0)
     deal: Any | None = None
-    if deal_ticket:
+    if deal_ticket and not _is_claimed(deal_ticket):
         deals = mt5.history_deals_get(ticket=deal_ticket)
         if deals:
-            deal = deals[0]
+            cand = deals[0]
+            cand_ticket = int(getattr(cand, "ticket", deal_ticket) or deal_ticket)
+            if not _is_claimed(cand_ticket):
+                deal = cand
     if deal is None:
         # Path 2 — position-keyed lookup, filtered to entry-side.
         order_ticket = int(getattr(order_send_result, "order", 0) or 0)
@@ -969,9 +997,13 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
             if deals:
                 entry_in = getattr(mt5, "DEAL_ENTRY_IN", 0)
                 for cand in deals:
-                    if int(getattr(cand, "entry", -1)) == int(entry_in):
-                        deal = cand
-                        break
+                    if int(getattr(cand, "entry", -1)) != int(entry_in):
+                        continue
+                    cand_ticket = int(getattr(cand, "ticket", 0) or 0)
+                    if _is_claimed(cand_ticket):
+                        continue
+                    deal = cand
+                    break
     if deal is None:
         # Path 3 — time-range fallback. The documented robust path:
         # MetaQuotes Python docs describe history_deals_get(date_from,
@@ -1206,7 +1238,9 @@ def write_recording(
     df.write_parquet(parquet_path)
 
     n_attempted = df.height
-    n_filled = int(df.filter(pl.col("retcode") == success_retcode).height)
+    filled_mask = pl.col("retcode") == success_retcode
+    n_filled = int(df.filter(filled_mask).height)
+    n_filled_market = int(df.filter(filled_mask & (pl.col("order_type") == "market")).height)
     n_rejected = n_attempted - n_filled
     manifest = SessionManifest(
         run_id=run_id,
@@ -1214,6 +1248,7 @@ def write_recording(
         end_utc=end_utc,
         n_attempted=n_attempted,
         n_filled=n_filled,
+        n_filled_market=n_filled_market,
         n_rejected=n_rejected,
         n_market_lookup_failures=int(n_market_lookup_failures),
     )

@@ -546,12 +546,16 @@ def test_write_recording_round_trip(tmp_path: Path) -> None:
     assert manifest["n_attempted"] == 2
     assert manifest["n_filled"] == 1
     assert manifest["n_rejected"] == 1
-    # Schema bumped to 1.1 on 2026-05-14 fix v2 (history_select precondition +
-    # market-lookup-failure tracking).
-    assert manifest["schema_version"] == "1.1"
+    # Schema bumped to 1.2 on 2026-05-14 fix v2 reviewer follow-up
+    # (market-only denominator for the Gate 2B threshold).
+    assert manifest["schema_version"] == "1.2"
     assert manifest["vps_host_redacted"] is True
     # Default `n_market_lookup_failures` when no failures supplied: 0.
     assert manifest["n_market_lookup_failures"] == 0
+    # `n_filled_market` counts retcode=success AND order_type=='market' rows.
+    # The fixture in this test writes one market sell at retcode=success and
+    # one limit at retcode=reject, so the market-fills count is 1.
+    assert manifest["n_filled_market"] == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -1422,10 +1426,16 @@ def test_emit_market_lookup_failure_log_format(capsys: pytest.CaptureFixture[str
 # --------------------------------------------------------------------------- #
 # Manifest schema v1.1 — n_market_lookup_failures field.
 # --------------------------------------------------------------------------- #
-def test_session_manifest_schema_version_bumped_to_1_1() -> None:
-    """SCHEMA_VERSION constant + manifest default must be '1.1'."""
+def test_session_manifest_schema_version_bumped_to_1_2() -> None:
+    """SCHEMA_VERSION constant + manifest default must be '1.2'.
+
+    Bumped from 1.1 → 1.2 on the 2026-05-14 fix v2 reviewer follow-up,
+    when ``n_filled_market`` was added so Gate 2B's market-lookup-failure
+    ratio uses a market-only denominator instead of the all-fills
+    denominator (which mixed market + pending and was lenient by ~2x).
+    """
     rf = _load_module()
-    assert rf.SCHEMA_VERSION == "1.1"
+    assert rf.SCHEMA_VERSION == "1.2"
     manifest = rf.SessionManifest(
         run_id="test",
         start_utc=datetime(2026, 5, 14, 0, 0, tzinfo=UTC),
@@ -1434,8 +1444,9 @@ def test_session_manifest_schema_version_bumped_to_1_1() -> None:
         n_filled=0,
         n_rejected=0,
     )
-    assert manifest.schema_version == "1.1"
+    assert manifest.schema_version == "1.2"
     assert manifest.n_market_lookup_failures == 0
+    assert manifest.n_filled_market == 0
 
 
 def test_write_recording_persists_n_market_lookup_failures(tmp_path: Path) -> None:
@@ -1472,7 +1483,9 @@ def test_write_recording_persists_n_market_lookup_failures(tmp_path: Path) -> No
 
     manifest = _json.loads(mf.read_text())
     assert manifest["n_market_lookup_failures"] == 3
-    assert manifest["schema_version"] == "1.1"
+    assert manifest["schema_version"] == "1.2"
+    # The single row above is order_type="market" + retcode=10009 → counted.
+    assert manifest["n_filled_market"] == 1
 
 
 # --------------------------------------------------------------------------- #

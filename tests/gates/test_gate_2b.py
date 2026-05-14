@@ -664,6 +664,92 @@ def test_run_gate_2b_accepts_manifest_at_market_lookup_failure_threshold(
     assert report.n_rows_captured == 20
 
 
+def test_run_gate_2b_uses_n_filled_market_denominator_when_present(
+    tmp_path: Path,
+) -> None:
+    """v1.2 manifest: ratio uses ``n_filled_market`` (market-only), not ``n_filled``.
+
+    Reviewer-flagged MEDIUM (2026-05-14 fix v2 follow-up): the v1.1
+    ``n_filled`` denominator mixed market + pending fills, which
+    DILUTED the market-only failure rate. For a typical 60% market /
+    40% pending capture mix, the v1.1 guard tolerated ~2x the
+    market-only failure rate it documented. v1.2 publishes
+    ``n_filled_market`` and the guard prefers it.
+
+    Scenario: 4 lookup failures across 100 filled trades total, but
+    only 20 of those are market (the rest are limit/stop fills).
+    v1.1 would compute 4/100 = 4% PASS; v1.2 computes 4/20 = 20% REJECT.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import MAX_MARKET_LOOKUP_FAILURE_RATIO, run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(100)]
+    capture = tmp_path / "v12_market_denom.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "v12-market-denom",
+                "n_attempted": 110,
+                "n_filled": 100,  # diluted v1.1 denominator: 4/100=4% would PASS
+                "n_filled_market": 20,  # strict v1.2 denominator: 4/20=20% REJECTS
+                "n_rejected": 10,
+                "n_market_lookup_failures": 4,
+                "schema_version": "1.2",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Sanity-check the numerics so the test is self-documenting.
+    assert MAX_MARKET_LOOKUP_FAILURE_RATIO < 4 / 20  # 20% > 5% → reject expected
+    assert MAX_MARKET_LOOKUP_FAILURE_RATIO > 4 / 100  # 4% would have passed under v1.1
+    with pytest.raises(ValueError, match="n_filled_market=20"):
+        run_gate_2b(capture_parquet_path=capture)
+
+
+def test_run_gate_2b_falls_back_to_n_filled_denominator_for_v11_manifests(
+    tmp_path: Path,
+) -> None:
+    """v1.1 manifest (no ``n_filled_market`` key) falls back to ``n_filled``.
+
+    Forward-compat: v1.1 captures predate the market-only denominator
+    and have no way to surface it without re-reading the parquet. The
+    guard falls back to ``n_filled`` and the rejection message labels
+    the denominator as ``v1.0/1.1 fallback — lenient`` so an auditor
+    can trace why an old capture passed where the same numbers in v1.2
+    would fail.
+    """
+    import json
+
+    from propfarm.gates.gate_2b import run_gate_2b
+
+    rows = [_make_row(idx=i) for i in range(20)]
+    capture = tmp_path / "v11_fallback.parquet"
+    _write_capture(rows, capture)
+    manifest_path = capture.with_suffix(".json")
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "run_id": "v11-fallback",
+                "n_attempted": 25,
+                "n_filled": 20,
+                "n_rejected": 5,
+                "n_market_lookup_failures": 4,  # 4/20=20% > 5% → reject
+                "schema_version": "1.1",
+                # NO n_filled_market key — pre-v1.2 manifest.
+            }
+        ),
+        encoding="utf-8",
+    )
+    # The rejection message must surface the lenient-fallback denominator
+    # so an auditor knows the v1.1 numbers were used (and that re-recording
+    # under v1.2 would produce a stricter ratio for typical mixes).
+    with pytest.raises(ValueError, match=r"n_filled .v1\.0/1\.1 fallback"):
+        run_gate_2b(capture_parquet_path=capture)
+
+
 def test_run_gate_2b_accepts_manifest_without_n_market_lookup_failures_key(
     tmp_path: Path,
 ) -> None:
