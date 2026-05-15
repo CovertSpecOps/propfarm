@@ -1845,7 +1845,16 @@ def test_resolve_fill_from_deal_returns_empty_when_offset_misapplied_signals_mar
     passes because it's testing the bug condition exactly.
     """
     rf = _load_module()
-    request_time = datetime(2026, 5, 14, 18, 4, 34, tzinfo=UTC)
+    # 2026-05-15 fix-up: pinned to a FAR-FUTURE date so the test stays
+    # deterministic regardless of system clock. The helper's
+    # ``date_to_unix_server = max(now_utc, request_time_utc).timestamp() + 5 + offset``
+    # widens the lookup window to "now" when now > request_time; with the
+    # original date (2026-05-14, the day this test was written), a test
+    # run a day later would widen the window to span the deal's
+    # server-time timestamp (request + 10800), bypass _is_covered's
+    # rejection, and falsely pass path 1. Using a future request_time
+    # forces ``max(now, request) == request`` permanently.
+    request_time = datetime(2099, 5, 14, 18, 4, 34, tzinfo=UTC)
     # The deal sits at server-time UTC+3.
     deal_server_time_unix = int(request_time.timestamp()) + 10800
     deal = SimpleNamespace(
