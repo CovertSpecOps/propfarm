@@ -2060,24 +2060,29 @@ def test_resolve_fill_from_deal_path_0_netting_does_not_engage(
 def test_resolve_fill_from_deal_path_0_falls_through_on_no_match(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Path 0 falls through to paths 1-3 when no position ticket matches.
+    """Path 0 falls through when neither ticket nor volume+side matches.
 
-    A hedging-account session where positions_get returns positions for
-    other concurrent orders but NOT the one we just sent (e.g., the
-    matching position hasn't been registered yet, or the order ticket
-    differs from the position ticket somehow). Path 0 walks the list
-    looking for ``ticket == order_ticket`` and falls through if no
-    match. The helper then tries paths 1-3 as a safety net.
+    A hedging-account session where positions_get returns positions
+    that don't correspond to the order we just sent. Under v7 path 0
+    has TWO matchers: strict ticket match + symbol+volume+side
+    fallback. This test ensures both miss (different ticket AND
+    different volume), so the helper exhausts the retry loop and
+    falls through to paths 1-3.
     """
     rf = _load_module()
     request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
-    # Position fixture for a DIFFERENT order — ticket doesn't match.
+    # Position fixture for a different order — ticket AND volume
+    # differ so neither path-0 matcher (strict ticket / fallback
+    # volume+side) succeeds. 2026-05-15 v7 fix-up: the original
+    # fixture had volume=0.01 matching the request, so the new
+    # volume+side fallback would (correctly) match it. Bumping volume
+    # to 0.05 preserves the test's "no match" semantic.
     unrelated_position = SimpleNamespace(
         ticket=999999999,  # ≠ our order ticket
         symbol="EURUSD",
         price_open=1.17089,
         time=int(request_time.timestamp()) + 10800,
-        volume=0.01,
+        volume=0.05,  # ≠ our request's volume (0.01)
         type=0,
     )
     mock_mt5 = _make_mock_mt5(
@@ -2089,29 +2094,241 @@ def test_resolve_fill_from_deal_path_0_falls_through_on_no_match(
         account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
     )
     result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+    # Patch the retry sleep to a no-op so the test runs in ~0ms.
+    import unittest.mock as _m
 
-    price, fill_time = rf._resolve_fill_from_deal(
-        mock_mt5,
-        result,
-        success_retcode=10009,
-        server_time_offset_seconds=10800,
-        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
-        **_resolve_kwargs(
-            request_time_utc=request_time,
-            symbol="EURUSD",
-            order_type="market",
-            side="buy",
-            idx=2,
-        ),
-    )
+    with _m.patch.object(rf.time, "sleep", lambda _: None):
+        price, fill_time = rf._resolve_fill_from_deal(
+            mock_mt5,
+            result,
+            success_retcode=10009,
+            server_time_offset_seconds=10800,
+            account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+            **_resolve_kwargs(
+                request_time_utc=request_time,
+                symbol="EURUSD",
+                order_type="market",
+                side="buy",
+                idx=2,
+            ),
+        )
     # Path 0 didn't match; paths 1-3 also empty; soft-fail.
     assert price is None
     assert fill_time is None
-    # Path 0 was tried (positions_get called) but found no match.
-    assert mock_mt5.positions_get_calls == [{"symbol": "EURUSD"}]
-    # Probe block fires because paths 1-3 all returned empty.
+    # Path 0 was tried PATH0_MAX_ATTEMPTS times (retry loop).
+    assert mock_mt5.positions_get_calls == [
+        {"symbol": "EURUSD"} for _ in range(rf.PATH0_MAX_ATTEMPTS)
+    ]
     captured = capsys.readouterr()
+    # Path-0 probe block fires (retries exhausted with no match).
+    assert "[record_fills:lookup_probe_path0_args]" in captured.err
+    assert "[record_fills:lookup_probe_path0_match_result] matched=False" in captured.err
+    assert "no candidate ticket==449043873" in captured.err
+    # Path-3 probe block also fires (paths 1-3 fell through too).
     assert "[record_fills:lookup_probe_args_passed]" in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_fallback_matches_by_volume_and_side(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """2026-05-15 fix v7: path 0 fallback matches by symbol+volume+side+recent-time.
+
+    On hedging accounts some MT5 builds may not populate
+    ``pos.ticket == result.order``; the v7 fallback handles that by
+    matching the position whose ``(symbol, volume, type)`` matches
+    the request and whose ``time`` is closest to ``request_time_utc``.
+    This preserves path 0's "use positions_get" strategy even when
+    the strict ticket match misses.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    # Position has DIFFERENT ticket from result.order, but matching
+    # symbol + volume + side. The recent-time match must pick it.
+    matching_position = SimpleNamespace(
+        ticket=88888888,  # ≠ result.order
+        symbol="EURUSD",
+        price_open=1.17089,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,  # = request volume
+        type=0,  # POSITION_TYPE_BUY = side "buy"
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (matching_position,)},
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+    import unittest.mock as _m
+
+    with _m.patch.object(rf.time, "sleep", lambda _: None):
+        price, fill_time = rf._resolve_fill_from_deal(
+            mock_mt5,
+            result,
+            success_retcode=10009,
+            server_time_offset_seconds=10800,
+            account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+            **_resolve_kwargs(
+                request_time_utc=request_time,
+                symbol="EURUSD",
+                order_type="market",
+                side="buy",
+                idx=2,
+            ),
+        )
+    # Fallback matched — returns position's price_open.
+    assert price == 1.17089
+    assert fill_time is not None
+    # Only ONE positions_get call (fallback succeeded on first attempt).
+    assert mock_mt5.positions_get_calls == [{"symbol": "EURUSD"}]
+    # No path-0 probe block (path 0 succeeded via fallback).
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_path0_match_result]" not in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_retries_then_succeeds_on_second_attempt(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """2026-05-15 fix v7: path 0 retry loop catches the order_send → positions_get race.
+
+    On hedging accounts the broker may not register a freshly-filled
+    position in time for the first positions_get call. v7 adds a
+    3x50ms retry loop. This test simulates that race by staging the
+    mock to return empty on call #1 and the matching position on
+    call #2.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    matching_position = SimpleNamespace(
+        ticket=449043873,  # = result.order (strict ticket match)
+        symbol="EURUSD",
+        price_open=1.17089,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,
+        type=0,
+    )
+
+    # Mock that returns empty on the first positions_get call, the
+    # matching position from the second call onward. Mimics the race
+    # between order_send returning and the broker registering the
+    # position in the active-positions list.
+    class _RaceMt5(_MockMt5):
+        def __init__(self, **kw: Any) -> None:
+            super().__init__(**kw)
+            self._first_call = True
+
+        def positions_get(self, symbol: str | None = None) -> tuple[Any, ...]:
+            self.positions_get_calls.append({"symbol": symbol})
+            if self._first_call:
+                self._first_call = False
+                return ()
+            return tuple(self._positions_by_symbol.get(symbol or "EURUSD", ()))
+
+    mock_mt5 = _RaceMt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (matching_position,)},
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=449043873, position=0)
+    import unittest.mock as _m
+
+    with _m.patch.object(rf.time, "sleep", lambda _: None):
+        price, fill_time = rf._resolve_fill_from_deal(
+            mock_mt5,
+            result,
+            success_retcode=10009,
+            server_time_offset_seconds=10800,
+            account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+            **_resolve_kwargs(
+                request_time_utc=request_time,
+                symbol="EURUSD",
+                order_type="market",
+                side="buy",
+                idx=6,
+            ),
+        )
+    assert price == 1.17089
+    assert fill_time is not None
+    # Second attempt won; no path-0 probe block.
+    assert len(mock_mt5.positions_get_calls) == 2
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_path0_match_result]" not in captured.err
+
+
+def test_resolve_fill_from_deal_path_2_no_entry_filter_returns_match_by_volume_side(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """2026-05-15 fix v7: path 2 dropped DEAL_ENTRY_IN filter; matches volume+side.
+
+    v5/v6 probe data showed probe_h=1 / probe_h_in=0 on the failing
+    hedging-account orders — the raw history_deals_get(position=...)
+    query found the deal, but the entry filter rejected it (the deal's
+    ``entry`` value didn't equal the assumed DEAL_ENTRY_IN). v7 drops
+    the entry filter and uses volume+side instead. This test stages a
+    deal with a NON-STANDARD entry value (entry=999) plus matching
+    volume + side; the helper must still return it.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 5, tzinfo=UTC)
+    weird_entry_deal = SimpleNamespace(
+        ticket=10,
+        price=1.10011,
+        time=int(request_time.timestamp()),
+        entry=999,  # ≠ DEAL_ENTRY_IN; v6 would have rejected this
+        symbol="EURUSD",
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(deals_by_position={777: (weird_entry_deal,)})
+    result = SimpleNamespace(retcode=10009, deal=0, order=777)
+    price, _ = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
+    # Match by volume+side regardless of entry value.
+    assert price == pytest.approx(1.10011)
+    _ = capsys.readouterr()
+
+
+def test_resolve_fill_from_deal_path_2_volume_mismatch_falls_through(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Path 2 still skips deals whose volume doesn't match the request.
+
+    The volume+side gate replaces the entry filter; a deal at the
+    same position but with a different volume (e.g. a partial fill
+    or a corrupted record) must be skipped, not returned. Sanity-
+    check that v7's filter still discriminates.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 5, tzinfo=UTC)
+    wrong_volume_deal = SimpleNamespace(
+        ticket=10,
+        price=1.10011,
+        time=int(request_time.timestamp()),
+        entry=0,
+        symbol="EURUSD",
+        volume=0.10,  # ≠ request's 0.01
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(deals_by_position={777: (wrong_volume_deal,)})
+    result = SimpleNamespace(retcode=10009, deal=0, order=777)
+    price, _ = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        **_resolve_kwargs(request_time_utc=request_time),
+    )
+    # Path 2 skipped (volume mismatch); path 3 has no time-range stage.
+    assert price is None
+    _ = capsys.readouterr()
 
 
 def test_resolve_fill_from_deal_emits_probes_when_called_directly_on_market_failure(

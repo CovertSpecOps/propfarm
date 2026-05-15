@@ -1037,6 +1037,33 @@ _LOG_PREFIX_ORDER_SEND_RESULT_FIELDS: Final[str] = "[record_fills:order_send_res
 #: FTMO Free Trial demo is hedging; funded / Phase B accounts are also
 #: hedging per the FTMO defaults.
 _LOG_PREFIX_ACCOUNT_MARGIN_MODE: Final[str] = "[record_fills:account_margin_mode]"
+#: 2026-05-15 fix v7 — path-0 (positions_get) diagnostic probes. v6 lived
+#: 5/7 (71%) on FTMO hedging; the 2 failures fell through to paths 1-3
+#: with no path-0 visibility. These probes emit AFTER path 0's retry
+#: loop exhausts and BEFORE the helper falls through to paths 1-3, so
+#: the operator can see whether positions_get returned empty (race
+#: condition / position not yet visible) or returned positions but no
+#: candidate matched by ticket / volume / side.
+_LOG_PREFIX_LOOKUP_PROBE_PATH0_ARGS: Final[str] = "[record_fills:lookup_probe_path0_args]"
+_LOG_PREFIX_LOOKUP_PROBE_PATH0_POSITIONS_RETURNED: Final[str] = (
+    "[record_fills:lookup_probe_path0_positions_returned]"
+)
+_LOG_PREFIX_LOOKUP_PROBE_PATH0_MATCH_ATTEMPTS: Final[str] = (
+    "[record_fills:lookup_probe_path0_match_attempts]"
+)
+_LOG_PREFIX_LOOKUP_PROBE_PATH0_MATCH_RESULT: Final[str] = (
+    "[record_fills:lookup_probe_path0_match_result]"
+)
+
+#: 2026-05-15 fix v7 — path-0 retry loop tuning. The 2 failed market
+#: orders in the v6 LIVE test (idx=006, 008 on run eda7c16b) likely hit
+#: a race: ``mt5.order_send`` returned ``retcode=10009`` but
+#: ``mt5.positions_get(symbol)`` queried before the broker registered
+#: the new position. 3 attempts x 50ms (= 150ms max per row) is well
+#: under the latency budget (~160ms per the v6 LIVE) and gives the
+#: broker time to register without measurably slowing the script.
+PATH0_MAX_ATTEMPTS: Final[int] = 3
+PATH0_RETRY_SLEEP_SECONDS: Final[float] = 0.05
 
 
 def detect_server_time_offset_seconds(
@@ -1303,27 +1330,152 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     if account_margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
         order_ticket_p0 = int(getattr(order_send_result, "order", 0) or 0)
         if order_ticket_p0:
-            positions = mt5.positions_get(symbol=symbol) or ()
-            for pos in positions:
-                if int(getattr(pos, "ticket", 0) or 0) != order_ticket_p0:
-                    continue
-                price_open = float(getattr(pos, "price_open", 0.0) or 0.0)
-                if price_open == 0.0:
-                    # Position exists but no price yet (race vs broker write);
-                    # fall through to paths 1-3.
-                    break
-                time_unix_server = int(getattr(pos, "time", 0) or 0)
-                if time_unix_server:
-                    return (
-                        price_open,
-                        datetime.fromtimestamp(
-                            time_unix_server - int(server_time_offset_seconds),
-                            tz=UTC,
-                        ),
+            # 2026-05-15 fix v7 — retry loop + symbol/volume/side fallback.
+            # v6 LIVE was 5/7 (71%) on path 0; the 2 failures very likely
+            # hit a visibility race between ``order_send`` returning and
+            # the position being registered in ``positions_get``. 3
+            # attempts x 50ms gives the broker time to register without
+            # measurably slowing the script. Within each attempt we
+            # first try the strict ticket match (``pos.ticket ==
+            # order_ticket``, the v6 path); if no candidate matches and
+            # the broker DID return positions for this symbol, we fall
+            # back to a symbol-keyed match by ``volume + side`` choosing
+            # the most-recent-time candidate (handles MT5 builds where
+            # the position ticket may not equal the order ticket on
+            # hedging accounts).
+            side_to_position_type = (
+                int(getattr(mt5, "POSITION_TYPE_BUY", 0))
+                if side == "buy"
+                else int(getattr(mt5, "POSITION_TYPE_SELL", 1))
+            )
+            attempts_diagnostics: list[dict[str, Any]] = []
+            last_positions: tuple[Any, ...] = ()
+            for attempt in range(PATH0_MAX_ATTEMPTS):
+                if attempt > 0:
+                    time.sleep(PATH0_RETRY_SLEEP_SECONDS)
+                positions = mt5.positions_get(symbol=symbol) or ()
+                last_positions = tuple(positions)
+                attempt_record: dict[str, Any] = {
+                    "attempt": attempt,
+                    "count": len(last_positions),
+                    "matched_by": None,
+                }
+                attempts_diagnostics.append(attempt_record)
+
+                # First try: strict ticket match.
+                for pos in last_positions:
+                    if int(getattr(pos, "ticket", 0) or 0) != order_ticket_p0:
+                        continue
+                    price_open = float(getattr(pos, "price_open", 0.0) or 0.0)
+                    if price_open == 0.0:
+                        # Position exists but no price yet — keep retrying.
+                        break
+                    attempt_record["matched_by"] = "ticket"
+                    time_unix_server = int(getattr(pos, "time", 0) or 0)
+                    if time_unix_server:
+                        return (
+                            price_open,
+                            datetime.fromtimestamp(
+                                time_unix_server - int(server_time_offset_seconds),
+                                tz=UTC,
+                            ),
+                        )
+                    return (price_open, None)
+
+                # Second try (same attempt, fallback): symbol+volume+side
+                # match, picking the candidate whose ``time`` is closest
+                # to ``request_time_utc``. Defensive guard against
+                # claimed_deal_tickets so a previously-attributed
+                # position isn't double-claimed.
+                candidates = [
+                    p
+                    for p in last_positions
+                    if abs(float(getattr(p, "volume", 0.0) or 0.0) - volume_lots) < 1e-6
+                    and int(getattr(p, "type", -1)) == side_to_position_type
+                    and (
+                        claimed_deal_tickets is None
+                        or int(getattr(p, "ticket", 0) or 0) not in claimed_deal_tickets
                     )
-                # Position has price but no time — record price + signal
-                # caller to use wallclock fallback for the timestamp.
-                return (price_open, None)
+                ]
+                if candidates:
+                    request_ts_server = int(request_time_utc.timestamp()) + int(
+                        server_time_offset_seconds
+                    )
+                    candidates.sort(
+                        key=lambda p: abs(int(getattr(p, "time", 0) or 0) - request_ts_server)
+                    )
+                    chosen = candidates[0]
+                    price_open = float(getattr(chosen, "price_open", 0.0) or 0.0)
+                    if price_open == 0.0:
+                        # Race vs broker write — keep retrying.
+                        continue
+                    attempt_record["matched_by"] = "volume_side_recent"
+                    if claimed_deal_tickets is not None:
+                        chosen_ticket = int(getattr(chosen, "ticket", 0) or 0)
+                        if chosen_ticket:
+                            claimed_deal_tickets.add(chosen_ticket)
+                    time_unix_server = int(getattr(chosen, "time", 0) or 0)
+                    if time_unix_server:
+                        return (
+                            price_open,
+                            datetime.fromtimestamp(
+                                time_unix_server - int(server_time_offset_seconds),
+                                tz=UTC,
+                            ),
+                        )
+                    return (price_open, None)
+
+            # All retries exhausted — emit the path-0 probe block so the
+            # operator can see exactly what happened, then fall through.
+            print(
+                f"{_LOG_PREFIX_LOOKUP_PROBE_PATH0_ARGS} "
+                f"symbol={symbol} order_ticket={order_ticket_p0} "
+                f"attempts={PATH0_MAX_ATTEMPTS} sleep_s={PATH0_RETRY_SLEEP_SECONDS}",
+                file=sys.stderr,
+            )
+            counts_repr = ",".join(str(a["count"]) for a in attempts_diagnostics)
+            print(
+                f"{_LOG_PREFIX_LOOKUP_PROBE_PATH0_POSITIONS_RETURNED} "
+                f"per_attempt_counts=[{counts_repr}]",
+                file=sys.stderr,
+            )
+            # Cap the candidate list to the last attempt's positions (up
+            # to 5) so the stderr line stays a single line.
+            cand_reprs: list[str] = []
+            for pos in last_positions[:5]:
+                cand_reprs.append(
+                    "ticket={t} price_open={p} time={ts} volume={v} type={ty}".format(
+                        t=int(getattr(pos, "ticket", 0) or 0),
+                        p=float(getattr(pos, "price_open", 0.0) or 0.0),
+                        ts=int(getattr(pos, "time", 0) or 0),
+                        v=float(getattr(pos, "volume", 0.0) or 0.0),
+                        ty=int(getattr(pos, "type", -1)),
+                    )
+                )
+            extra = f" (+{len(last_positions) - 5} more)" if len(last_positions) > 5 else ""
+            cand_block = "; ".join(cand_reprs) if cand_reprs else "(no positions)"
+            print(
+                f"{_LOG_PREFIX_LOOKUP_PROBE_PATH0_MATCH_ATTEMPTS} candidates=[{cand_block}]{extra}",
+                file=sys.stderr,
+            )
+            if not last_positions:
+                reason = "no positions returned (race: position not yet visible)"
+            elif not any(
+                int(getattr(p, "ticket", 0) or 0) == order_ticket_p0 for p in last_positions
+            ):
+                reason = (
+                    f"no candidate ticket=={order_ticket_p0} "
+                    f"(returned tickets did not include order_ticket)"
+                )
+            else:
+                reason = (
+                    "ticket match found but price_open == 0 on every attempt "
+                    "(race: broker registered position before writing price)"
+                )
+            print(
+                f'{_LOG_PREFIX_LOOKUP_PROBE_PATH0_MATCH_RESULT} matched=False reason="{reason}"',
+                file=sys.stderr,
+            )
 
     # Build the time-range window once; used both by the optional
     # ``history_select`` precondition and the time-range fallback below.
@@ -1418,14 +1570,29 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
             if not _is_claimed(cand_ticket):
                 deal = cand
     if deal is None:
-        # Path 2 — position-keyed lookup, filtered to entry-side.
+        # Path 2 — position-keyed lookup. 2026-05-15 fix v7: dropped the
+        # ``entry == DEAL_ENTRY_IN`` filter (was over-restrictive on
+        # hedging accounts — v5/v6 probe data confirmed probe_h=1 and
+        # probe_h_in=0, meaning the raw query returned the deal but the
+        # filter rejected it). The deals returned by
+        # ``history_deals_get(position=order_ticket)`` are by definition
+        # for that one position; between ``order_send`` and the
+        # round-trip close there is one deal (the open). Confirm by
+        # ``volume + side`` instead of by entry value, so non-standard
+        # entry values (build-dependent) don't drop a valid match.
         order_ticket = int(getattr(order_send_result, "order", 0) or 0)
         if order_ticket:
             deals = mt5.history_deals_get(position=order_ticket)
             if deals:
-                entry_in = getattr(mt5, "DEAL_ENTRY_IN", 0)
+                want_deal_type = (
+                    int(getattr(mt5, "DEAL_TYPE_BUY", 0))
+                    if side == "buy"
+                    else int(getattr(mt5, "DEAL_TYPE_SELL", 1))
+                )
                 for cand in deals:
-                    if int(getattr(cand, "entry", -1)) != int(entry_in):
+                    if abs(float(getattr(cand, "volume", 0.0) or 0.0) - volume_lots) > 1e-6:
+                        continue
+                    if int(getattr(cand, "type", -1)) != want_deal_type:
                         continue
                     cand_ticket = int(getattr(cand, "ticket", 0) or 0)
                     if _is_claimed(cand_ticket):
@@ -1843,7 +2010,7 @@ def emit_market_lookup_failure_probes(  # pragma: no cover - integration path
         """Count deals whose ``entry`` field equals ``DEAL_ENTRY_IN``."""
         if not deals:
             return 0
-        return sum(1 for d in deals if int(getattr(d, "entry", -1) or -1) == entry_in_const)
+        return sum(1 for d in deals if int(getattr(d, "entry", -1)) == entry_in_const)
 
     # probe_g — path 1: history_deals_get(ticket=result.deal).
     if osr_deal:
