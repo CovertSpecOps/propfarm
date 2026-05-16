@@ -39,6 +39,68 @@ recording protocol owns the live-broker side.
       (`python -m pip install polars pydantic pyarrow`). The recording
       script imports these at module-load time.
 
+## 0.5 Timing — when to start the 24h capture (READ THIS, learned 2026-05-15)
+
+FX is **closed on weekends**: Friday close → Sunday open. Specifically:
+
+* **Close**: Friday ~21:00 UTC (NY 17:00 EDT during US summer DST,
+  March → November); Friday ~22:00 UTC during US winter (NY 17:00
+  EST, November → March). The FTMO MT5 demo behaves accordingly:
+  every `mt5.order_send` after the Friday close returns
+  `retcode=10018` ("Market closed") until the Sunday reopen.
+* **Open**: Sunday ~22:00 UTC (consistently across DST observances;
+  Sydney's open at 22:00 UTC is the canonical "start of trading
+  week" anchor that brokers honor).
+
+Because the schedule built by `record_fills.py --duration-hours 24`
+draws samples uniformly across a 24h window, **starting on Friday or
+Saturday is wasted**: most attempted orders will retcode 10018 and
+not count toward `n_filled_market`. The 100-filled-market Gate 2B
+threshold can't be reached on a weekend-overlapping window.
+
+### Operator rule
+
+Start a 24h capture so the **entire window** falls within Sunday
+~22:00 UTC → Friday ~21:00 UTC. Concretely:
+
+* **Earliest safe start**: Sunday ~22:00 UTC (anchor at the Sydney
+  open). Capture runs Sun 22:00 → Mon 22:00 UTC.
+* **Latest safe start for a 24h window**: Thursday ~21:00 UTC.
+  Capture runs Thu 21:00 → Fri 21:00 UTC, completing right at the
+  US summer Friday close.
+* **Latest safe start for a 48h window** (if you ever bump
+  `--duration-hours 48`): Wednesday ~21:00 UTC. Capture runs Wed
+  21:00 → Fri 21:00 UTC.
+
+### Lesson from the 2026-05-15 capture interruption
+
+A 24h run kicked off Friday 14:00 UTC was interrupted by the Friday
+close at ~21:00 UTC. Result: **53 market orders attempted, only 28
+filled cleanly; 25 rejected with retcode 10018**. The
+`n_filled_market` count of 28 is well below the 100-filled threshold
+Gate 2B requires.
+
+That partial capture is salvageable for **spread-model calibration
+during pre-close widening (14:00-21:00 UTC Friday)** but NOT for
+Gate 2B. Marked in the deferred ledger as
+`PARTIAL_WEEKEND_INTERRUPTED`.
+
+### Pre-launch checklist (timing layer)
+
+Before running the Task Scheduler PowerShell block in §1A:
+
+- [ ] Confirm the start time is at or after Sunday 22:00 UTC of the
+      current trading week.
+- [ ] Confirm the start time is at or before Thursday 21:00 UTC of
+      the current trading week (for a 24h window).
+- [ ] If unsure, prefer Sunday 22:00 UTC start — the entire 24h
+      window lands in the lowest-volatility / no-event-risk window
+      and finishes by Monday 22:00 UTC with the most session
+      coverage (Asia + London + early NY).
+- [ ] If the FTMO calendar shows a documented session change for the
+      week (DST transition, central-bank-holiday early close,
+      end-of-year half-days), shift the start back to compensate.
+
 ## 1. Start the session
 
 **You must NOT need to keep an RDP session open for 24-48 hours.**
@@ -226,7 +288,7 @@ If you can't find the `run_id`: it's the filename of the latest
 | retcode 10027 on every order | Algo Trading disabled | toggle the Algo Trading button in the terminal |
 | retcode 10030 on every order | unsupported filling mode | edit `type_filling` in the template from `ORDER_FILLING_IOC` to `ORDER_FILLING_FOK` |
 | `position cap reached; session aborted` | something failed to close 5 positions | inspect MT5 Trade tab, close manually, re-run |
-| retcode 10018 (Market closed) on weekends | FX closes Fri 22:00 UTC | wait for Sun 22:00 UTC; expected on weekends |
+| retcode 10018 (Market closed) on weekends | FX closes Fri ~21:00 UTC (US summer DST) / ~22:00 UTC (US winter); reopens Sun ~22:00 UTC. **See §0.5 "Timing" for the scheduling rules.** | wait for Sun 22:00 UTC; expected on weekends |
 
 ## 4. Where the data lands
 
