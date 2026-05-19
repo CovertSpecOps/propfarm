@@ -47,3 +47,14 @@ markers = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# PEP 561 — include the ``py.typed`` marker in the wheel if/when the
+# project is ever distributed externally. Editable installs already
+# pick it up via the filesystem; this declaration is forward-defensive.
+# Added 2026-05-19 per the α reviewer NIT (the broader mypy-hook switch
+# from isolated venv to language=system surfaced the PEP-561 marker
+# requirement; without `package-data`, an external wheel-consumer would
+# silently fall back to untyped behaviour even though the in-tree
+# annotations are intentional).
+[tool.setuptools.package-data]
+propfarm = ["py.typed"]
