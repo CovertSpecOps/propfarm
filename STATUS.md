@@ -675,6 +675,22 @@ result.order`) FIRST on hedging accounts.
     surfaced the actual failure shape (paths 1-3 all returning empty
     with `deal=0 position=0`) instead of another speculative guess.
 
+14. **Retry logic on a network-fetching path MUST catch the full
+    network-error class** — `(OSError, urllib.error.URLError)` in
+    addition to whatever domain-specific exception the module defines.
+    The most common failure mode for long-running HTTP fetches is
+    `TimeoutError` or `ConnectionResetError`; both are `OSError`-derived,
+    not domain-specific. Adversarial reviewer tests MUST include a
+    `TimeoutError`-injection mock for any retry-equipped fetch helper.
+    Added 2026-05-19 after user's overnight `bulk_fetch_dukascopy.py`
+    fetch crashed at ~6 minutes on `TimeoutError` from
+    `ssl.SSLSocket.read`. The original `fa65fe4` retry block caught
+    only `DukascopyError`; the reviewer's adversarial pass missed the
+    `OSError`/`URLError` surface. Fix at commit (this entry); regression
+    test `test_bulk_fetch_retries_on_network_error_class` parametrizes
+    across `TimeoutError`, `ConnectionResetError`, `BrokenPipeError`,
+    bare `OSError`, and `urllib.error.URLError`.
+
 Cross-link to this entry's commit: see the 2026-05-14 #5 session-log
 entry at the top of this file for the fix-v6 commit hash.
 

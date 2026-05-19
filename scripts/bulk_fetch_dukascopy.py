@@ -43,6 +43,7 @@ import logging
 import re
 import sys
 import time
+import urllib.error
 from calendar import monthrange
 from datetime import UTC, datetime
 from pathlib import Path
@@ -216,19 +217,38 @@ def fetch_one_hour_with_retries(
     Returns:
 
     * ``bytes`` (possibly empty) on the first successful call.
-    * ``None`` after ``max_retries`` consecutive :class:`DukascopyError`s.
+    * ``None`` after ``max_retries`` consecutive retryable exceptions.
       The caller logs this as ``failed=1`` and moves on; the next run will
       pick up the missing hour (no on-disk marker is written for failures).
 
     The ``sleep_ms`` parameter is applied **between retry attempts** (not the
     initial attempt). The caller is responsible for the inter-hour sleep so
     that successful first-attempts also throttle.
+
+    Retryable exception classes
+    ---------------------------
+    The except clause must cover the full network-error surface, not just
+    the domain-specific :class:`DukascopyError`:
+
+    * :class:`DukascopyError` — module-level parse / decompression failure.
+    * :class:`OSError` (parent of :class:`TimeoutError`,
+      :class:`ConnectionError`, :class:`ConnectionResetError`,
+      :class:`BrokenPipeError`) — the most common long-running-HTTP-fetch
+      failure mode. Originally missed in commit ``fa65fe4``; user's first
+      overnight ``--year-min 2015 --year-max 2025`` fetch crashed at ~6
+      minutes on a ``TimeoutError`` from ``ssl.SSLSocket.read``. Captured
+      as reviewer playbook rule #15 (STATUS.md ``Pathological-vendor-
+      response catch pattern`` addendum #5).
+    * :class:`urllib.error.URLError` — urllib wrapping of socket errors.
+      Distinct from raw ``OSError`` on some platforms; covers redirect
+      loops, DNS failures, and TLS-handshake aborts that urllib catches
+      before they propagate as ``OSError``.
     """
     last_exc: BaseException | None = None
     for attempt in range(1, max_retries + 1):
         try:
             return fetch_hour_bi5(symbol, ts_hour, http_client=http_client)
-        except DukascopyError as exc:
+        except (DukascopyError, OSError, urllib.error.URLError) as exc:
             last_exc = exc
             if attempt < max_retries:
                 # Sleep before the next retry, not after the final failure.

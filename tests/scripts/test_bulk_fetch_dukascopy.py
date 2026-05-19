@@ -279,6 +279,85 @@ def test_bulk_fetch_retries_on_transient_error(tmp_path: Path) -> None:
     assert final_path.read_bytes() == raw_bytes
 
 
+@pytest.mark.parametrize(
+    "exc_factory",
+    [
+        pytest.param(lambda: TimeoutError("read timeout"), id="TimeoutError"),
+        pytest.param(lambda: ConnectionResetError("peer reset"), id="ConnectionResetError"),
+        pytest.param(lambda: BrokenPipeError("broken pipe"), id="BrokenPipeError"),
+        pytest.param(lambda: OSError("generic socket failure"), id="OSError"),
+        pytest.param(
+            lambda: __import__("urllib.error").error.URLError("DNS lookup failed"),
+            id="URLError",
+        ),
+    ],
+)
+def test_bulk_fetch_retries_on_network_error_class(
+    tmp_path: Path,
+    exc_factory: Any,
+) -> None:
+    """Retry catches the FULL network-error class (OSError, URLError), not just DukascopyError.
+
+    2026-05-19 follow-up to `fa65fe4`: the user's first overnight
+    ``--year-min 2015 --year-max 2025`` fetch crashed at ~6 minutes
+    on a ``TimeoutError`` from ``ssl.SSLSocket.read``. The original
+    ``except DukascopyError`` clause caught only the domain-specific
+    parse failures; ``TimeoutError`` (OSError-derived) propagated
+    past the retry block and crashed the whole script. The reviewer's
+    adversarial-test pass missed this entirely.
+
+    This parametrized test pins the regression by injecting one of:
+
+    * ``TimeoutError`` — the exact class the user hit (sub-OSError).
+    * ``ConnectionResetError`` — sub-OSError; common mid-fetch.
+    * ``BrokenPipeError`` — sub-OSError; common on long-running sessions.
+    * ``OSError`` — the parent class; covers everything else socket-y.
+    * ``urllib.error.URLError`` — urllib-level wrapping (not always OSError).
+
+    Each variant raises twice, then succeeds — the retry helper must
+    catch all 5 classes and converge on the success. If the except
+    clause regresses to ``DukascopyError``-only, every variant of
+    this test will surface the bug immediately.
+    """
+    bf = _load_module()
+    raw_root = tmp_path / "raw"
+
+    raw_bytes = _one_record_bi5()
+    target_hour = datetime(2020, 3, 15, 10, tzinfo=UTC)
+    target_url = _build_url("EURUSD", target_hour)
+    state = {"calls": 0}
+
+    def flaky() -> bytes:
+        state["calls"] += 1
+        if state["calls"] <= 2:
+            raise exc_factory()
+        return raw_bytes
+
+    stub = _StubHttpClient({target_url: flaky})
+
+    bf.run_bulk_fetch(
+        symbols=["EURUSD"],
+        year_min=2020,
+        year_max=2020,
+        raw_root=raw_root,
+        sleep_ms=50,
+        max_retries=3,
+        http_client=stub,
+    )
+
+    # 2 failures (network class) + 1 success = 3 attempts; file written.
+    assert state["calls"] == 3, (
+        f"retry did not catch the injected exception class ({exc_factory.__name__}); "
+        f"state['calls']={state['calls']} (expected 3)"
+    )
+    final_path = raw_root / "EURUSD" / "2020" / "02" / "15" / "10h_ticks.bi5"
+    assert final_path.is_file(), (
+        f"file not written after retry recovery on {exc_factory.__name__}; "
+        "retry clause likely did not catch the exception class"
+    )
+    assert final_path.read_bytes() == raw_bytes
+
+
 def test_bulk_fetch_gives_up_after_max_retries(tmp_path: Path) -> None:
     """Stub always raises → no file written for that hour; fetch loop continues."""
     bf = _load_module()
