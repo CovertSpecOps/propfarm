@@ -917,15 +917,31 @@ def evaluate(
 #      same 24h capture (4 outlier rows in 21:00-22:00 UTC). Linear ramp
 #      60 min before the 22:00 UTC FTMO rollover anchor. Peak=15.0 on
 #      both symbols (the smallest round-numbered value that meets the
-#      PASS criterion p95 ≤ 1.0 AND t-test p ≥ 0.01). The 21:18 EURUSD
-#      outlier (live=6.7 pip at t=42min)
-#      remains the worst single residual at +4.23 pip; the linear ramp
-#      does not catch it cleanly because the actual broker widening is
-#      closer to a step function than a ramp, but at the global p95 / p99
-#      level the row is invisible (p95=0.53, p99=0.73). A future capture
-#      with denser pre-rollover sampling could justify replacing the
-#      linear ramp with a fitted piecewise curve (e.g. flat-at-peak
-#      across the whole window) — flagged as round-2 deferred follow-up.
+#      PASS criterion p95 ≤ 1.0 AND t-test p ≥ 0.01).
+#
+#      **Slice fit honesty (round-2 reviewer correction, 2026-05-18)**:
+#      the round-2 calibration agent reported "3 of 4 outlier rows reduce
+#      to |residual| ≤ 0.79 pip"; the round-2 reviewer's independent
+#      recompute showed this is empirically wrong. Slice residuals on
+#      the 5 rows in hour-21 (one is retcode=10018 rejected, one is a
+#      stop-order activation; 3 are clean market activations): absolute
+#      residuals {0.31, 1.76, 1.80, 1.84, 4.94}. **Only 1 of 5 sits below
+#      0.79 pip post-cal; the other 4 are above 1.0 pip.** The PASS
+#      verdict is still genuine because the global p95 = 0.527 pip
+#      (these 5 rows are 2.5% of n=200; they fall in p99-rank territory,
+#      not p95). But the slice fit is significantly worse than the agent
+#      reported.
+#
+#      The implied peak factors on the 4 large-residual rows cluster
+#      tightly around 17 (15.7, 16.3, 17.1, 19.8) — geometrically
+#      consistent with a **step function** (flat at peak across the
+#      window), NOT a linear ramp. Reviewer's geometry: with a
+#      step P=18, max|residual| drops to 0.78 pip and ALL 4 outliers
+#      land below the 1.0 pip threshold. The linear-ramp choice
+#      satisfies the global PASS criterion but is provably suboptimal
+#      at the slice level. **Round 3 should replace the linear ramp
+#      with a step function (peak ~17-18) once a second capture lands
+#      to validate the shape.** Flagged in the deferred ledger.
 #
 #   2. Session-open over-shoot — round-1 left session_open_multiplier at
 #      Wave-6b seed values (5.0 EURUSD, 6.0 GBPUSD). The round-1 reviewer
@@ -1017,21 +1033,25 @@ CALIBRATIONS: Final[dict[str, SpreadCalibrationEntry]] = {
         decay_half_life_min=10.0,
         news_multiplier=20.0,
         weekend_reopen_multiplier=15.0,
-        # Gate-2B round 2 (2026-05-18): pre_rollover_multiplier=15.0 fits the
-        # 21:00-22:00 UTC pre-rollover slice (4 outlier rows). Linear ramp
-        # 60 min before the 22:00 UTC FTMO rollover anchor. The peak value
-        # is the smallest round-numbered multiplier that brings the global
-        # spread_p95 ≤ 1.0 pip AND keeps the t-test p-value ≥ 0.01 (the
-        # INVESTIGATE-band lower bound). After the round-2 calibration the
-        # slice's worst residual drops from +6.36 pip to ~+4.23 pip (the
-        # 21:18 EURUSD row, which the linear ramp partially catches but
-        # cannot fully reach because the actual broker widening is closer
-        # to a step function than a ramp); the other 3 outlier rows reduce
-        # to |residual| ≤ 0.79 pip and the global p95 drops from 1.4275
-        # pip to ~0.43 pip. The round-2 confidence flag is "medium" on the
-        # pre_rollover_multiplier field (real-capture-derived but n=4 too
-        # thin for split-half cross-validation); the entry's overall
-        # confidence stays "uncertain" until a second capture lands.
+        # Gate-2B round 2 (2026-05-18): pre_rollover_multiplier=15.0 fits
+        # the global p95 PASS criterion (1.4275 → 0.527 pip) on the
+        # 21:00-22:00 UTC pre-rollover slice. Linear ramp 60 min before
+        # the 22:00 UTC FTMO rollover anchor. Peak is the smallest
+        # round-numbered multiplier that meets PASS (p95 ≤ 1.0 AND t-test
+        # p ≥ 0.01). The 21:18 EURUSD outlier's residual is **+4.94 pip**
+        # post-cal (round-2 reviewer corrected the impl agent's mis-stated
+        # +4.23 pip; recomputed from residuals parquet). **Only 1 of 5
+        # slice rows sits below 0.79 pip post-cal**; the other 4 are in
+        # 1.76-4.94 pip range — slice fit is worse than the impl agent
+        # reported, but the PASS verdict is genuine because the slice is
+        # 2.5% of n=200 (these 4-5 rows fall in p99-rank territory, not
+        # p95). The implied peak factors on the 4 outliers cluster tightly
+        # around 17, geometrically favoring a step function (flat-at-peak)
+        # over linear ramp — **round-3 candidate**: replace with step at
+        # peak ~17-18. Confidence: "medium" on the field (real-capture
+        # derived but n=4 too thin for split-half cross-validation);
+        # entry's overall confidence stays "uncertain" until a second
+        # capture lands.
         pre_rollover_multiplier=15.0,
         server_time_offset_seconds=_FTMO_SERVER_TIME_OFFSET_SECONDS,
         confidence="uncertain",

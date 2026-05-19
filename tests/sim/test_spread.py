@@ -978,6 +978,78 @@ def test_pre_rollover_does_not_double_count_at_session_overlap() -> None:
         )
 
 
+def test_pre_rollover_uses_max_not_product_when_both_windows_fire_above_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine forced-overlap regression for the MAX-vs-product rule.
+
+    The companion test above tries to construct a real-anchor overlap via
+    exotic ``server_time_offset_seconds`` values but ends up with one
+    factor at 1.0 in every realistic combination — its guarded ``if s > 1.0
+    and p > 1.0`` branch never fires, so the MAX-vs-product invariant is
+    untested. Reviewer-flagged MEDIUM at round-2 follow-up.
+
+    This test monkeypatches ``session_open_window`` and ``pre_rollover_window``
+    inside the ``propfarm.sim.spread`` module so BOTH return non-trivial
+    "this is the current session" results at the chosen timestamp. Then
+    ``evaluate()`` computes a session_factor and pre_rollover_factor BOTH
+    well above 1.0, and the combined factor must equal max(s, p), NOT
+    s * p. If a future refactor switches the combination rule to a
+    product (or sum, or any non-max), the failed assertion below names
+    the regression directly.
+    """
+    from propfarm.sim import spread as _spread
+
+    monkeypatch.setattr(
+        _spread,
+        "session_open_window",
+        lambda symbol, ts_utc: ("london", 0.0),  # peak of session_open decay
+    )
+    monkeypatch.setattr(
+        _spread,
+        "pre_rollover_window",
+        lambda symbol, ts_utc, *, server_time_offset_seconds: ("pre_rollover", 0.0),
+    )
+
+    cal = SpreadCalibrationEntry(
+        symbol="EURUSD",
+        baseline_bps=0.10,
+        session_open_multiplier=8.0,  # so session_factor = 8.0 at decay t=0
+        decay_half_life_min=10.0,
+        news_multiplier=1.0,
+        weekend_reopen_multiplier=30.0,
+        pre_rollover_multiplier=12.0,  # so pre_rollover_factor = 12.0 at ramp t=0
+        server_time_offset_seconds=10800,
+        confidence="medium",
+        snapshot_date=CALIBRATIONS["EURUSD"].snapshot_date,
+        snapshot_source=CALIBRATIONS["EURUSD"].snapshot_source,
+    )
+    state = MarketState(symbol="EURUSD", ts_utc=datetime(2026, 5, 18, 10, 0, tzinfo=UTC))
+    res = evaluate(state, None, calibration=cal)
+    s = res.components["session_factor"]
+    p = res.components["pre_rollover_factor"]
+    combined = res.components["session_or_pre_rollover_factor"]
+
+    # Sanity: both factors are genuinely above 1.0 (8.0 and 12.0 at peak).
+    assert s > 1.0, f"monkeypatch failed to push session_factor above 1.0; got {s}"
+    assert p > 1.0, f"monkeypatch failed to push pre_rollover_factor above 1.0; got {p}"
+
+    # MAX rule: combined == max(s, p) == 12.0 (NOT 8.0 * 12.0 = 96.0).
+    assert combined == pytest.approx(max(s, p)), (
+        f"combined must be MAX(session={s}, pre_rollover={p})={max(s, p)}; got {combined}"
+    )
+    assert combined != pytest.approx(s * p), (
+        f"combined must NOT be product s * p = {s * p}; got {combined}. "
+        "Combination rule has regressed from MAX to product."
+    )
+
+    # And the spread_bps must scale with the MAX, not the product.
+    expected_spread = cal.baseline_bps * max(s, p) * res.components["news_factor"]
+    assert res.spread_bps == pytest.approx(expected_spread), (
+        f"spread_bps used wrong combination rule: expected {expected_spread}, got {res.spread_bps}"
+    )
+
+
 def test_calibration_entry_accepts_medium_confidence() -> None:
     """SpreadCalibrationEntry(confidence="medium") constructs successfully.
 
