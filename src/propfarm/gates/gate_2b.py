@@ -1116,6 +1116,15 @@ def _format_markdown(report: Gate2BReport) -> str:
             "",
             "## Residual distributions",
             "",
+            "_Note: the table below summarizes ALL retcode-matched rows "
+            "(market + limit + stop activations). The verdict's per-symbol "
+            "p95 check (B1 reviewer follow-up) filters to "
+            "``order_type=='market'`` separately; aggregate p99 values here "
+            "may inherit non-market outliers (e.g. the v7 session-start "
+            "anomaly logged in STATUS.md deferred ledger), so do NOT use "
+            "this table to diagnose cost-model fit. The verdict + per-side "
+            "bias panes below are the load-bearing diagnostics._",
+            "",
             "| field | n | p50 | p95 | p99 | mean | std | t_stat | p_value | bias? |",
             "|---|---|---|---|---|---|---|---|---|---|",
         ]

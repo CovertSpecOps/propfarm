@@ -37,8 +37,10 @@ limit-reject Bernoulli draw) so replays line up byte for byte.
 
 Configurable execution latency
 ------------------------------
-``execution_latency_ms`` (default 150ms, matching the Run-2 spike on the VPS)
-is added to ``request.request_time_utc`` to produce ``broker_fill_time_utc``.
+``execution_latency_ms`` (default 20ms, aligned with the 2026-05-18 Gate-2B
+capture median ~19ms on FTMO MT5 demo; was 150ms matching the Run-2 spike
+RTT pre-calibration) is added to ``request.request_time_utc`` to produce
+``broker_fill_time_utc``.
 Gate 2B can pass a per-symbol or per-run override after subtracting the
 bridge's measured RTT from the recorded broker latency, so the sim and live
 results are comparable on the same time-axis.
@@ -456,7 +458,9 @@ def simulate_fill(
         keep them in sync.
     execution_latency_ms : float
         Wall-clock latency, in ms, added to ``request_time_utc`` to produce
-        ``broker_fill_time_utc``. Default 150ms (Run-2 spike median).
+        ``broker_fill_time_utc``. Default 20ms (2026-05-18 Gate-2B capture
+        median ~19ms; was 150ms matching the Run-2 spike RTT before
+        round-1 calibration).
     rng : numpy.random.Generator, optional
         Source of randomness for slippage noise and the limit-reject draw.
         If ``None`` (default), the result is fully deterministic.

@@ -339,6 +339,139 @@ def test_run_gate_2b_is_deterministic(tmp_path: Path) -> None:
     assert r1.failure_reasons == r2.failure_reasons
 
 
+def test_per_row_rng_seed_uses_stable_sha256_not_pythonhash() -> None:
+    """Lock the cross-process rng determinism fix from Gate-2B round-1 calibration.
+
+    2026-05-18 reviewer follow-up (MEDIUM): the round-1 calibration agent
+    caught a load-bearing bug — the harness's per-row rng seed was derived
+    from ``hash((run_id_str, idx)) & 0xFFFFFFFF``, but Python salts
+    ``hash()`` per-process via ``PYTHONHASHSEED``. Within-process determinism
+    passed the test above but cross-process residuals diverged
+    (``n_retcode_matches`` fluctuated 196-199 across runs of the same
+    parquet). The fix replaced ``hash(...)`` with ``hashlib.sha256(...)``
+    — byte-stable across processes regardless of PYTHONHASHSEED.
+
+    This test pins the SHA256-based seeding with golden (run_id, idx) →
+    row_seed values. A future refactor that silently reverts to ``hash()``
+    or any other per-process-salted hash function would FAIL this test.
+    The golden values are computed from the documented seed formula:
+
+        row_seed = int.from_bytes(
+            hashlib.sha256(f"{run_id}|{idx}".encode()).digest()[:4],
+            "big", signed=False,
+        )
+
+    Computed once at test-write time with the locked-in SHA256 algorithm;
+    any deviation means the seed function changed.
+    """
+    import hashlib
+
+    def _expected_row_seed(run_id: str, idx: int) -> int:
+        return int.from_bytes(
+            hashlib.sha256(f"{run_id}|{idx}".encode()).digest()[:4],
+            "big",
+            signed=False,
+        )
+
+    # Golden values: locked at 2026-05-18 from the SHA256 implementation.
+    # If any of these change, the per-row rng has been silently reseeded
+    # and the cross-process determinism fix has regressed.
+    golden = {
+        ("bbf710b335f84e94af21b74cc3b5d725", 0): 3742651435,
+        ("bbf710b335f84e94af21b74cc3b5d725", 1): 3814003939,
+        ("bbf710b335f84e94af21b74cc3b5d725", 119): 1226128793,
+        ("synthetic", 0): 2149436816,
+        ("synthetic", 100): 1394940783,
+    }
+    for (run_id, idx), expected in golden.items():
+        assert _expected_row_seed(run_id, idx) == expected, (
+            f"SHA256 seed function output drifted for ({run_id!r}, {idx}); "
+            f"expected {expected}, got {_expected_row_seed(run_id, idx)}. "
+            "Verify scripts/gate_2b.py:1319-1323 still uses "
+            "hashlib.sha256(f'{run_id}|{idx}'.encode()).digest()[:4]."
+        )
+
+    # The actual seed in production code must be byte-equivalent to what
+    # this test asserts. Read the source to confirm SHA256 is in the
+    # production code path (catches a refactor that introduces a NEW
+    # deterministic hash but isn't the one this golden table locks).
+    import inspect
+
+    from propfarm.gates import gate_2b as _g
+
+    src = inspect.getsource(_g)
+    assert "hashlib.sha256" in src, (
+        "production code no longer uses hashlib.sha256 for per-row seeding; "
+        "the cross-process determinism guard has regressed"
+    )
+    assert "hash((" not in src, (
+        "production code reintroduced a tuple-hash that PYTHONHASHSEED salts; "
+        "cross-process determinism guard has regressed"
+    )
+
+
+def test_run_gate_2b_residuals_byte_stable_across_pythonhashseed(
+    tmp_path: Path,
+) -> None:
+    """Cross-process residuals parquet bytes match across PYTHONHASHSEED values.
+
+    Spawns two subprocesses with different ``PYTHONHASHSEED`` env values
+    and runs the harness CLI on the same synthetic capture; the resulting
+    residuals parquet must be byte-identical. This is the higher-level
+    counterpart to the golden-seed test above — it locks the END-TO-END
+    determinism, not just the seed function in isolation.
+
+    Reference: 2026-05-18 round-1 calibration agent flagged that the
+    capture SHA256 pin only guarded input bytes, not row-level rng. With
+    the SHA256 fix in place, the residuals parquet itself becomes
+    byte-stable across processes.
+    """
+    import os
+    import subprocess
+    import sys
+
+    # Build a synthetic capture in tmp_path.
+    rows = [_make_row(idx=i) for i in range(8)]
+    capture = tmp_path / "cross_process.parquet"
+    _write_capture(rows, capture)
+
+    # Each run writes its residuals parquet to an explicit path so we can
+    # compare bytes across subprocesses.
+    runs: list[bytes] = []
+    for label, seed in (("a", "0"), ("b", "12345")):
+        out_parquet = tmp_path / f"residuals_{label}.parquet"
+        runner = (
+            "from pathlib import Path; "
+            "from propfarm.gates.gate_2b import run_gate_2b; "
+            f"run_gate_2b(capture_parquet_path=Path({str(capture)!r}), "
+            f"output_parquet_path=Path({str(out_parquet)!r}))"
+        )
+        env = os.environ.copy()
+        env["PYTHONHASHSEED"] = seed
+        proc = subprocess.run(
+            [sys.executable, "-c", runner],
+            env=env,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if proc.returncode != 0:
+            pytest.fail(
+                f"harness invocation failed (PYTHONHASHSEED={seed}): "
+                f"rc={proc.returncode} stderr={proc.stderr.decode()[:500]}"
+            )
+        assert out_parquet.exists(), (
+            f"harness did not produce residuals parquet (PYTHONHASHSEED={seed})"
+        )
+        runs.append(out_parquet.read_bytes())
+
+    assert runs[0] == runs[1], (
+        "residuals parquet bytes diverge across PYTHONHASHSEED values; "
+        "the per-row rng is still salted per-process. The SHA256 fix at "
+        "gate_2b.py:1319-1323 has regressed."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Reviewer follow-ups (Gate 2B fresh-review pass)
 # --------------------------------------------------------------------------- #

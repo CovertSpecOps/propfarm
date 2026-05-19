@@ -626,11 +626,18 @@ def evaluate(
 # session-open over-shoot, the session_open_multiplier can be tuned down.
 #
 # Two structural residuals NOT addressed by this calibration:
-#   1. Pre-Sunday-reopen widening (~21:00 UTC NY close). The live broker
-#      widens before the rollover; the sim does not. Three 2026-05-18
-#      21:18-21:55 rows showed live spreads 5-10 pips that the model
-#      cannot reproduce. These remain p95-inflating outliers until the
-#      spread model gains a pre-rollover widening term.
+#   1. NY-close / pre-rollover widening (~21:00 UTC weekdays). The live
+#      broker widens at the end of the NY session, before the brief
+#      pre-Asia liquidity lull. The capture window was Mon 2026-05-18
+#      01:48 → Tue 2026-05-19 01:04 UTC (NOT a Sunday-reopen window);
+#      ~4 rows in the 21:18-21:55 UTC band showed live spreads 5-10 pips
+#      that the model cannot reproduce. The same phenomenon occurs at
+#      Sun ~22:00 UTC pre-reopen widening on weekend-spanning captures,
+#      but the round-1 capture only contained the weekday NY-close case.
+#      These remain p95-inflating outliers until the spread model gains
+#      a session-aware pre-rollover widening term (mirror the existing
+#      session-open machinery but apply to ~21:00 UTC instead of session
+#      opens). Reviewer-flagged 2026-05-18 round-1 follow-up.
 #   2. Tokyo-open over-shoot. At hour 23 UTC the sim's session_open
 #      multiplier produces ~1.5 pips for GBPUSD while the live capture
 #      shows ~0.44 pips. The next round can tune session_open_multiplier
