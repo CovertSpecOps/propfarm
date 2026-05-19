@@ -255,11 +255,16 @@ class SlippageCalibrationEntry(BaseModel):
         extreme never reached the limit price, or the broker did not
         honor the touch). The Task 7.2 fill engine consumes this as a
         Bernoulli draw against an rng.
-    confidence : Literal["high", "uncertain"]
+    confidence : Literal["high", "medium", "uncertain"]
         Runtime marker for whether the calibration values came from a
         primary, verified source (``"high"``) or are placeholders
-        awaiting calibration (``"uncertain"``). Every shipped entry is
-        ``"uncertain"`` until Gate-2B live recording fills the gap.
+        awaiting calibration (``"uncertain"``). The intermediate
+        ``"medium"`` tier was added Gate-2B round 2 (2026-05-18) to mark
+        fields calibrated from a real capture but pending a second-capture
+        cross-validation. Every shipped entry in slippage.py is currently
+        ``"uncertain"`` until Gate-2B live recording fills the gap; the
+        slippage Literal is extended in step with the spread Literal so
+        the cost-model tier system stays consistent across modules.
     snapshot_date : datetime.date
         The date of the underlying calibration data — for placeholder
         entries, the date the placeholder was committed.
@@ -276,7 +281,7 @@ class SlippageCalibrationEntry(BaseModel):
     size_coef: float
     stress_multiplier: float
     limit_reject_at_baseline: float
-    confidence: Literal["high", "uncertain"]
+    confidence: Literal["high", "medium", "uncertain"]
     snapshot_date: date
     snapshot_source: str
 
@@ -317,7 +322,7 @@ class SlippageResult(BaseModel):
         no-noise path): ``slippage_pips == (base + vol_term + size_term +
         minute_term) * stress_factor + noise`` for market and stop orders;
         ``slippage_pips == 0`` for limit orders regardless of components.
-    calibration_confidence : Literal["high", "uncertain"]
+    calibration_confidence : Literal["high", "medium", "uncertain"]
         Echoes ``calibration.confidence`` so consumers can gate downstream
         decisions on it without re-fetching the calibration entry.
     """
@@ -330,7 +335,7 @@ class SlippageResult(BaseModel):
     slippage_pips: float
     reject_probability: float
     components: dict[str, float]
-    calibration_confidence: Literal["high", "uncertain"]
+    calibration_confidence: Literal["high", "medium", "uncertain"]
 
 
 # --------------------------------------------------------------------------- #
