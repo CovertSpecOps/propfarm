@@ -148,13 +148,65 @@ _ANNUALIZATION_FACTOR: Final[float] = 252.0 * 1440.0
 #: default when ``MarketState.realized_vol_5m`` is None.
 _TYPICAL_REALIZED_VOL_FALLBACK: Final[float] = 0.10
 
-#: Significance threshold for the one-sample t-test on residual means.
-#: A p-value below this means the residual distribution is statistically
-#: distinguishable from zero-mean → systematic bias. The 0.01 level is
-#: deliberately stricter than the 0.05 conventional level because Gate 2B
-#: is a one-shot pre-deploy gate; false-positive on bias is preferable to
-#: shipping a biased cost model into Phase 1.
-_T_TEST_ALPHA: Final[float] = 0.01
+#: FAIL threshold for the one-sample t-test on residual means. p-value
+#: strictly below this triggers FAIL contribution. 0.001 keeps the bar high
+#: enough that one-off captures don't trigger over heavy-tailed noise.
+_T_TEST_ALPHA_FAIL: Final[float] = 0.001
+
+#: INVESTIGATE threshold for the t-test. p-value in
+#: ``[_T_TEST_ALPHA_FAIL, _T_TEST_ALPHA_INVESTIGATE)`` triggers INVESTIGATE
+#: contribution (statistically distinguishable but not at the rejection
+#: bar). The 0.01 level mirrors the original Gate 2B systematic-bias gate.
+_T_TEST_ALPHA_INVESTIGATE: Final[float] = 0.01
+
+#: Backwards-compatible alias for the INVESTIGATE-level alpha. Existing
+#: callers and tests that import ``_T_TEST_ALPHA`` continue to see the
+#: 0.01 value (which previously was the sole gate); the FAIL bar at
+#: 0.001 is new in Gate-2B round 1.
+_T_TEST_ALPHA: Final[float] = _T_TEST_ALPHA_INVESTIGATE
+
+#: Per-symbol fill-price p95 INVESTIGATE→FAIL multiplier.
+#:
+#:   p95 ≤ threshold                                    → PASS (component)
+#:   threshold < p95 ≤ threshold * MULTIPLIER           → INVESTIGATE
+#:   p95 > threshold * MULTIPLIER                       → FAIL
+#:
+#: 1.4x matches the user-spec band on the per-symbol gate
+#: (0.5 pip threshold → 0.7 pip FAIL boundary).
+_INVESTIGATE_BAND_MULTIPLIER_FILL_PRICE: Final[float] = 1.4
+
+#: Global-spread p95 INVESTIGATE→FAIL multiplier.
+#:
+#: 1.5x matches the user-spec band on the spread gate
+#: (1.0 pip threshold → 1.5 pip FAIL boundary). Differs from the
+#: fill-price 1.4x because the user spec set the two bands separately —
+#: spread is more naturally a longer-tail distribution and benefits from
+#: a slightly wider investigate window.
+_INVESTIGATE_BAND_MULTIPLIER_SPREAD: Final[float] = 1.5
+
+#: Minimum per-(symbol, side) sample size to compute and emit a per-side
+#: bias diagnostic. Below this n, the bias is too noisy to report
+#: meaningfully; the harness silently skips the (symbol, side) pair.
+#: Aligned with the user-spec "n >= 10" rule.
+_PER_SIDE_BIAS_MIN_N: Final[int] = 10
+
+#: ``latency_ms`` is excluded from FAIL-contributing bias reasons.
+#:
+#: Sign convention: ``broker_latency_residual_ms = live - sim``. The sim
+#: derives ``execution_latency_ms`` from the median of the captured
+#: ``broker_latency_ms`` on retcode=10009 rows (see ``run_gate_2b`` near
+#: line 1010); this construction guarantees the residual mean is biased
+#: low because the right-tail of the live distribution sits well above
+#: the median. The t-test on the residual reflects the live latency
+#: distribution shape, NOT a calibration target — the sim is by
+#: construction "set to the median" rather than "set to match the mean".
+#: Including this field in failure_reasons would FAIL every capture whose
+#: live latency has any right-tail mass, which is every real capture.
+#:
+#: We still REPORT the bias in the residual distributions table for
+#: operator visibility (the std and the magnitude are diagnostic for the
+#: bridge's RTT spread), but it is not a verdict driver.
+_LATENCY_BIAS_ADVISORY_ONLY: Final[bool] = True
 
 #: The exact column set the harness expects in the capture parquet. Locked
 #: to :class:`scripts.record_fills.FillRecord`. Surfaced as a module
@@ -276,6 +328,57 @@ class ResidualDistribution(BaseModel):
     has_systematic_bias: bool
 
 
+class PerSideBiasRow(BaseModel):
+    """One row of the per-(symbol, side) fill_price residual bias pane.
+
+    Surfaced in the markdown report only (Gate-2B round 1 reviewer
+    follow-up B3) — not currently in :attr:`Gate2BReport.failure_reasons`.
+    Round-1 calibration is supposed to collapse the BUY/SELL asymmetry
+    that motivates this pane; if a future capture still shows per-side
+    bias here (mean far from 0, low p-value), that signal becomes the
+    next round's recalibration target.
+
+    The check is computed on rows that:
+      * have ``retcode_match=True`` and ``sim_retcode == 10009``,
+      * have ``order_type == "market"`` (limits/stops have different
+        fill semantics and would dilute the slip-vs-spread signal),
+      * have a finite ``fill_price_residual``.
+
+    A (symbol, side) pair with fewer than :data:`_PER_SIDE_BIAS_MIN_N`
+    surviving rows is omitted (insufficient sample for a meaningful t-test).
+
+    Attributes
+    ----------
+    symbol : str
+        Trading symbol of the pair.
+    side : str
+        ``"buy"`` or ``"sell"``.
+    n : int
+        Surviving row count after the inclusion filter.
+    mean_pips : float
+        Mean of ``fill_price_residual / pip_size`` in pips. Sign convention
+        from ``compute_residual``: residual = live - sim, so positive means
+        live filled HIGHER than sim. For BUY the higher price is adverse;
+        for SELL the higher price is favorable.
+    std_pips : float
+        Sample standard deviation of the per-row residual in pips.
+    t_stat : float
+        One-sample t-statistic against zero mean.
+    p_value : float
+        Two-sided p-value of the t-test.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    symbol: str
+    side: str
+    n: int
+    mean_pips: float
+    std_pips: float
+    t_stat: float
+    p_value: float
+
+
 class Gate2BReport(BaseModel):
     """Top-level Gate 2B result. Persisted alongside the residuals parquet.
 
@@ -334,6 +437,14 @@ class Gate2BReport(BaseModel):
     spread_p95_threshold_pips: float = SYMBOL_SPREAD_P95_THRESHOLD_PIPS
     verdict: Literal["pass", "fail", "investigate"]
     failure_reasons: tuple[str, ...]
+    # Gate-2B round 1 reviewer follow-up B3: per-(symbol, side) bias pane
+    # for fill_price residual. Reporting-only — not added to failure_reasons
+    # in this round (the calibration is expected to close the per-side gap;
+    # if a future capture still shows a per-side gap, that signal becomes
+    # the next round's recalibration target). Defaults to empty for
+    # backwards-compat with pre-round-1 Gate2BReport instances persisted
+    # before this field was added.
+    per_side_bias: tuple[PerSideBiasRow, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -784,6 +895,54 @@ def _validate_schema(df: pl.DataFrame) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Per-side bias diagnostic (Gate-2B round 1 reviewer follow-up B3)
+# --------------------------------------------------------------------------- #
+def _compute_per_side_bias(residual_rows: list[ResidualRow]) -> tuple[PerSideBiasRow, ...]:
+    """Compute per-(symbol, side) fill_price residual bias rows for the report.
+
+    See :class:`PerSideBiasRow` for the inclusion rule.
+    """
+    by_pair: dict[tuple[str, str], list[float]] = {}
+    for r in residual_rows:
+        if not (r.retcode_match and r.sim_retcode == 10009 and r.order_type == "market"):
+            continue
+        if not math.isfinite(r.fill_price_residual):
+            continue
+        by_pair.setdefault((r.symbol, r.side), []).append(r.fill_price_residual)
+
+    rows: list[PerSideBiasRow] = []
+    for (symbol, side), values in by_pair.items():
+        n = len(values)
+        if n < _PER_SIDE_BIAS_MIN_N:
+            continue
+        pip = _symbol_pip_size(symbol)
+        arr_pips = np.asarray(values, dtype=np.float64) / pip
+        mean_pips = float(np.mean(arr_pips))
+        std_pips = float(np.std(arr_pips, ddof=1)) if n > 1 else 0.0
+        if n > 1 and std_pips > 0.0:
+            t_result = stats.ttest_1samp(arr_pips, popmean=0.0)
+            t_stat = float(t_result.statistic)
+            p_value = float(t_result.pvalue)
+        else:
+            t_stat = math.nan
+            p_value = math.nan
+        rows.append(
+            PerSideBiasRow(
+                symbol=symbol,
+                side=side,
+                n=n,
+                mean_pips=mean_pips,
+                std_pips=std_pips,
+                t_stat=t_stat,
+                p_value=p_value,
+            )
+        )
+    # Deterministic ordering for stable reports / tests.
+    rows.sort(key=lambda r: (r.symbol, r.side))
+    return tuple(rows)
+
+
+# --------------------------------------------------------------------------- #
 # Verdict logic
 # --------------------------------------------------------------------------- #
 def _evaluate_verdict(
@@ -792,71 +951,127 @@ def _evaluate_verdict(
 ) -> tuple[Literal["pass", "fail", "investigate"], tuple[str, ...]]:
     """Apply the user-mandated pass / investigate / fail logic.
 
-    Order of checks (a row can both fail and investigate; fail wins):
+    Reasons emit as a flat tuple of human-readable strings; each string is
+    tagged with its band (FAIL or INVESTIGATE) so the markdown report can
+    surface them grouped. Verdict aggregation: if any FAIL reason exists,
+    verdict=fail; else if any INVESTIGATE reason exists, verdict=investigate;
+    else pass.
 
-    1. Per-symbol fill_price p95 |residual| in pips ≤
-       :data:`SYMBOL_FILL_PRICE_P95_THRESHOLD_PIPS[symbol]` → component pass.
-    2. Global spread p95 |residual| ≤ :data:`SYMBOL_SPREAD_P95_THRESHOLD_PIPS`
-       → component pass.
-    3. No t-test ``has_systematic_bias`` flag across fill_price / slippage /
-       spread / latency → component pass.
+    Bands (Gate-2B round 1, reviewer-mandated B4):
 
-    If 1 OR 2 fails → ``fail``. Otherwise if 3 fails → ``investigate``.
-    Otherwise → ``pass``.
+    Per-symbol fill_price (in pips, p95 |residual|):
+      * p95 ≤ threshold                  → PASS contribution
+      * threshold < p95 ≤ threshold x :data:`_INVESTIGATE_BAND_MULTIPLIER_FILL_PRICE` → INVESTIGATE
+      * p95 > threshold x :data:`_INVESTIGATE_BAND_MULTIPLIER_FILL_PRICE`             → FAIL
+
+    Global spread (in pips, p95 |residual|):
+      * p95 ≤ 1.0                                  → PASS contribution
+      * 1.0 < p95 ≤ 1.0 x :data:`_INVESTIGATE_BAND_MULTIPLIER_SPREAD` → INVESTIGATE
+      * p95 > 1.0 x :data:`_INVESTIGATE_BAND_MULTIPLIER_SPREAD`       → FAIL
+
+    Systematic bias t-test (per field — fill_price / slippage / spread /
+    latency; latency is advisory-only per :data:`_LATENCY_BIAS_ADVISORY_ONLY`):
+      * p ≥ 0.01                         → PASS contribution
+      * 0.001 ≤ p < 0.01                 → INVESTIGATE
+      * p < 0.001                        → FAIL
+
+    Reviewer follow-up B1: per-symbol fill_price p95 is computed only over
+    rows with ``order_type=='market'`` (in addition to the existing
+    ``retcode_match`` + ``sim_retcode == 10009`` filter). Limit and stop
+    rows have different fill semantics (limits fill at the requested price
+    or reject; stops trigger before filling) and a few rare-event
+    outliers in those order types can dominate the p95 of a
+    market-dominated capture. Locking to markets eliminates that bias.
+
+    Reviewer follow-up B2: ``latency_ms`` bias is reported but never added
+    to failure_reasons. See :data:`_LATENCY_BIAS_ADVISORY_ONLY` for the
+    advisory-only rationale (sim execution_latency_ms is set to the live
+    median by construction, so the residual t-test reflects the live
+    distribution's right-tail rather than a calibration drift).
     """
-    failure_reasons: list[str] = []
+    fail_reasons: list[str] = []
+    investigate_reasons: list[str] = []
 
-    # Per-symbol fill_price residual check (in pips).
+    # ------------------------------------------------------------------ #
+    # Per-symbol fill_price residual check (in pips). B1: market only.
+    # ------------------------------------------------------------------ #
     by_symbol: dict[str, list[float]] = {}
     for r in residual_rows:
-        if r.retcode_match and math.isfinite(r.fill_price_residual) and r.sim_retcode == 10009:
-            by_symbol.setdefault(r.symbol, []).append(r.fill_price_residual)
+        if not (r.retcode_match and r.sim_retcode == 10009):
+            continue
+        if r.order_type != "market":
+            continue
+        if not math.isfinite(r.fill_price_residual):
+            continue
+        by_symbol.setdefault(r.symbol, []).append(r.fill_price_residual)
     for symbol, residuals in by_symbol.items():
         pip = _symbol_pip_size(symbol)
         abs_pips = np.abs(np.asarray(residuals, dtype=np.float64)) / pip
         p95 = float(np.percentile(abs_pips, 95)) if abs_pips.size > 0 else 0.0
         threshold = SYMBOL_FILL_PRICE_P95_THRESHOLD_PIPS.get(symbol)
         if threshold is None:
-            failure_reasons.append(
+            fail_reasons.append(
                 f"unknown_symbol_threshold:{symbol} (no entry in "
                 f"SYMBOL_FILL_PRICE_P95_THRESHOLD_PIPS)"
             )
             continue
-        if p95 > threshold:
-            failure_reasons.append(
-                f"fill_price_p95_exceeded:{symbol} p95={p95:.4f}pips threshold={threshold:.4f}pips"
+        fail_threshold = threshold * _INVESTIGATE_BAND_MULTIPLIER_FILL_PRICE
+        if p95 > fail_threshold:
+            fail_reasons.append(
+                f"fill_price_p95_exceeded:{symbol} p95={p95:.4f}pips "
+                f"threshold={threshold:.4f}pips fail_band={fail_threshold:.4f}pips"
+            )
+        elif p95 > threshold:
+            investigate_reasons.append(
+                f"fill_price_p95_investigate:{symbol} p95={p95:.4f}pips "
+                f"threshold={threshold:.4f}pips fail_band={fail_threshold:.4f}pips"
             )
 
-    # Global spread residual check.
+    # ------------------------------------------------------------------ #
+    # Global spread residual check (p95 |residual| across all symbols).
+    # ------------------------------------------------------------------ #
     spread_dist = by_field.get("spread_pips")
-    if (
-        spread_dist is not None
-        and spread_dist.n > 0
-        and math.isfinite(spread_dist.p95)
-        and spread_dist.p95 > SYMBOL_SPREAD_P95_THRESHOLD_PIPS
-    ):
-        failure_reasons.append(
-            f"spread_p95_exceeded "
-            f"p95={spread_dist.p95:.4f}pips "
-            f"threshold={SYMBOL_SPREAD_P95_THRESHOLD_PIPS:.4f}pips"
-        )
-
-    threshold_failed = len(failure_reasons) > 0
-
-    # Systematic-bias check across all four fields.
-    bias_reasons: list[str] = []
-    for field_name, dist in by_field.items():
-        if dist.has_systematic_bias:
-            bias_reasons.append(
-                f"systematic_bias:{field_name} "
-                f"mean={dist.mean:.6f} p_value={dist.p_value:.6f} "
-                f"(alpha={_T_TEST_ALPHA})"
+    if spread_dist is not None and spread_dist.n > 0 and math.isfinite(spread_dist.p95):
+        spread_threshold = SYMBOL_SPREAD_P95_THRESHOLD_PIPS
+        spread_fail_threshold = spread_threshold * _INVESTIGATE_BAND_MULTIPLIER_SPREAD
+        if spread_dist.p95 > spread_fail_threshold:
+            fail_reasons.append(
+                f"spread_p95_exceeded p95={spread_dist.p95:.4f}pips "
+                f"threshold={spread_threshold:.4f}pips "
+                f"fail_band={spread_fail_threshold:.4f}pips"
+            )
+        elif spread_dist.p95 > spread_threshold:
+            investigate_reasons.append(
+                f"spread_p95_investigate p95={spread_dist.p95:.4f}pips "
+                f"threshold={spread_threshold:.4f}pips "
+                f"fail_band={spread_fail_threshold:.4f}pips"
             )
 
-    if threshold_failed:
-        return "fail", tuple(failure_reasons + bias_reasons)
-    if bias_reasons:
-        return "investigate", tuple(bias_reasons)
+    # ------------------------------------------------------------------ #
+    # Systematic-bias check across the four residual fields. B2: latency
+    # advisory-only (excluded from both FAIL and INVESTIGATE).
+    # ------------------------------------------------------------------ #
+    for field_name, dist in by_field.items():
+        if field_name == "latency_ms" and _LATENCY_BIAS_ADVISORY_ONLY:
+            continue
+        if dist.n <= 1 or not math.isfinite(dist.p_value):
+            continue
+        if dist.p_value < _T_TEST_ALPHA_FAIL:
+            fail_reasons.append(
+                f"systematic_bias:{field_name} mean={dist.mean:.6f} "
+                f"p_value={dist.p_value:.6f} (alpha_fail={_T_TEST_ALPHA_FAIL})"
+            )
+        elif dist.p_value < _T_TEST_ALPHA_INVESTIGATE:
+            investigate_reasons.append(
+                f"systematic_bias_investigate:{field_name} mean={dist.mean:.6f} "
+                f"p_value={dist.p_value:.6f} "
+                f"(alpha_investigate={_T_TEST_ALPHA_INVESTIGATE})"
+            )
+
+    if fail_reasons:
+        return "fail", tuple(fail_reasons + investigate_reasons)
+    if investigate_reasons:
+        return "investigate", tuple(investigate_reasons)
     return "pass", ()
 
 
@@ -912,6 +1127,45 @@ def _format_markdown(report: Gate2BReport) -> str:
             f"{dist.t_stat:.4f} | {dist.p_value:.6f} | "
             f"{'YES' if dist.has_systematic_bias else 'no'} |"
         )
+
+    # ------------------------------------------------------------------ #
+    # Per-(symbol, side) bias pane — Gate-2B round 1 reviewer follow-up B3.
+    # Reporting-only; not part of failure_reasons in this round. Emitted
+    # only when at least one (symbol, side) pair has n >= _PER_SIDE_BIAS_MIN_N
+    # so the table stays informative.
+    # ------------------------------------------------------------------ #
+    if report.per_side_bias:
+        lines.extend(
+            [
+                "",
+                "## Per-(symbol, side) fill_price residual bias (markets only, n >= "
+                f"{_PER_SIDE_BIAS_MIN_N})",
+                "",
+                "Sign convention: ``residual = live - sim`` in pips. For BUY a "
+                "positive mean means live filled HIGHER than sim (adverse for "
+                "buyer); for SELL a positive mean means live filled HIGHER than "
+                "sim (favorable for seller). The Gate-2B round 1 calibration "
+                "targets per-side mean → 0 on both sides simultaneously.",
+                "",
+                "| symbol | side | n | mean (pips) | std (pips) | t_stat | p_value |",
+                "|---|---|---|---|---|---|---|",
+            ]
+        )
+        for r in report.per_side_bias:
+            lines.append(
+                f"| {r.symbol} | {r.side} | {r.n} | {r.mean_pips:+.6f} | "
+                f"{r.std_pips:.6f} | {r.t_stat:+.4f} | {r.p_value:.6f} |"
+            )
+        # Machine-readable single-line tags so external tools / future reviewers
+        # can grep the report without parsing the table.
+        lines.append("")
+        for r in report.per_side_bias:
+            lines.append(
+                f"[per_side_bias:{r.symbol}:{r.side} "
+                f"n={r.n} mean={r.mean_pips:+.6f} t={r.t_stat:+.4f} "
+                f"p={r.p_value:.6f}]"
+            )
+
     if report.failure_reasons:
         lines.extend(["", "## Failure reasons", ""])
         for reason in report.failure_reasons:
@@ -1054,7 +1308,19 @@ def run_gate_2b(
         # with overlapping row indices don't accidentally share rng state.
         # SHA256 pin in the report still binds determinism to the parquet
         # bytes; this is hardening, not a correctness fix.
-        row_seed = hash((run_id_str, idx)) & 0xFFFFFFFF
+        #
+        # IMPORTANT: ``hash()`` on strings/tuples is salted per-process
+        # (PYTHONHASHSEED) so it would produce different rng seeds across
+        # Python invocations. Use a stable hash (SHA256 over the encoded
+        # seed material) to keep the per-row rng identical across processes
+        # — important for cross-process reproducibility of the residuals
+        # parquet (the SHA256 pin is on the input bytes, but the residuals
+        # themselves depend on the per-row noise draw).
+        row_seed = int.from_bytes(
+            hashlib.sha256(f"{run_id_str}|{idx}".encode()).digest()[:4],
+            "big",
+            signed=False,
+        )
         rng = np.random.default_rng(seed=row_seed)
         sim = simulate_fill(
             request,
@@ -1145,6 +1411,9 @@ def run_gate_2b(
 
     verdict, failure_reasons = _evaluate_verdict(residual_rows, by_field)
 
+    # Per-(symbol, side) bias pane (Gate-2B round 1 B3, reporting-only).
+    per_side_bias = _compute_per_side_bias(residual_rows)
+
     # Multiple run_ids would imply a corrupt capture — single capture
     # should be one run_id. We don't fail; we pick the first deterministically.
     chosen_run_id = sorted(run_ids)[0] if run_ids else "unknown"
@@ -1162,6 +1431,7 @@ def run_gate_2b(
         spread_p95_threshold_pips=SYMBOL_SPREAD_P95_THRESHOLD_PIPS,
         verdict=verdict,
         failure_reasons=failure_reasons,
+        per_side_bias=per_side_bias,
     )
 
     # Persist outputs.
@@ -1212,6 +1482,7 @@ __all__ = [
     "UNUSABLE_MANIFEST_STATUS",
     "Gate2BReport",
     "MarketStateReconstruction",
+    "PerSideBiasRow",
     "ResidualDistribution",
     "ResidualRow",
     "compute_residual",

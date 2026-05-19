@@ -190,11 +190,22 @@ RETCODE_REJECT: Final[int] = 10031
 # --------------------------------------------------------------------------- #
 # Default execution latency
 # --------------------------------------------------------------------------- #
-#: Default round-trip execution latency, ms. Calibrated to the Run-2 spike
-#: median measured on the production Windows VPS (Day-1 spike report). Gate
-#: 2B can override this per-run by subtracting the live bridge's measured
-#: RTT, so sim and live latencies live on the same time axis.
-DEFAULT_EXECUTION_LATENCY_MS: Final[float] = 150.0
+#: Default round-trip execution latency, ms.
+#:
+#: Gate-2B round 1 (2026-05-18) lowered this from **150.0** to **20.0** to
+#: align with the live FTMO MT5 demo broker latency observed on the
+#: 2026-05-18 capture (median 19 ms over 199 retcode-matched rows). The
+#: old value tracked the bridge's round-trip-time spike but treated that
+#: spike as the steady-state default, which produced a ~-46 ms residual
+#: against live (sim too slow). 20 ms is the round-number conservative
+#: choice: slightly above the live median to keep the sim a worst-case
+#: estimator without overshooting into the bridge-spike regime.
+#:
+#: Gate 2B's harness still derives an empirical override from the median
+#: of the captured ``broker_latency_ms`` column (see ``run_gate_2b``);
+#: this constant is the fallback used by every non-harness caller and by
+#: the harness when no successful rows are present.
+DEFAULT_EXECUTION_LATENCY_MS: Final[float] = 20.0
 
 
 # --------------------------------------------------------------------------- #

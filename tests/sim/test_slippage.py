@@ -195,9 +195,29 @@ def test_size_scaling_monotonic() -> None:
 # Vol-scaling axis
 # --------------------------------------------------------------------------- #
 def test_vol_scaling() -> None:
-    """High realized_vol (0.5) → strictly more slip than low (0.05)."""
-    low_vol = evaluate(_eurusd_state(vol=0.05), _req())
-    high_vol = evaluate(_eurusd_state(vol=0.5), _req())
+    """High realized_vol (0.5) → strictly more slip than low (0.05).
+
+    Structural-model property test: locks that the slippage formula's
+    ``vol_coef`` axis still scales monotonically. Uses an override
+    calibration with a non-zero ``vol_coef`` so the deployed FX-major
+    calibration (which Gate-2B round 1 zeroed out — see CALIBRATIONS
+    docstring) does not collapse this test to "high == low". A separate
+    test (``test_deployed_fx_majors_have_zero_vol_coef_after_gate_2b_r1``)
+    pins the deployed calibration's zero-slope choice.
+    """
+    override = SlippageCalibrationEntry(
+        symbol="EURUSD",
+        base_pips=0.3,
+        vol_coef=2.0,
+        size_coef=0.5,
+        stress_multiplier=15.0,
+        limit_reject_at_baseline=0.02,
+        confidence="uncertain",
+        snapshot_date=date(2026, 5, 12),
+        snapshot_source="test-vol-scaling-override",
+    )
+    low_vol = evaluate(_eurusd_state(vol=0.05), _req(), calibration=override)
+    high_vol = evaluate(_eurusd_state(vol=0.5), _req(), calibration=override)
     assert high_vol.slippage_pips > low_vol.slippage_pips, (
         f"vol scaling broken: high={high_vol.slippage_pips}, low={low_vol.slippage_pips}"
     )
@@ -226,11 +246,31 @@ def test_stress_mode_amplifies() -> None:
 
     The Task 10.2 stress-replay library replays the Lehman / SNB /
     GBP-flash / COVID / UK-gilts / SVB event windows with this flag set.
-    A typical-regime EURUSD slip is ~0.5 pip; the spec band for stress
-    is 5-20 pips, so 5 pips is the lower bound the test checks.
+    The spec band for stress is 5-20 pips on EURUSD; this test locks the
+    formula's amplification behavior.
+
+    Structural-model test (post-Gate-2B-round-1): uses an override
+    calibration with the original Wave-6b base/vol coefficients so the
+    test exercises the stress-multiplier branch on a non-zero typical-
+    regime slip. The deployed EURUSD calibration was zeroed for base_pips
+    and vol_coef (single-day capture produced near-zero live slip); under
+    that calibration stress amplification produces ``15 * 0.005 ≈ 0.075``
+    pips which is mathematically correct but does not exercise the
+    [5, 20] spec band. The override re-exposes the spec band test.
     """
+    override = SlippageCalibrationEntry(
+        symbol="EURUSD",
+        base_pips=0.3,
+        vol_coef=2.0,
+        size_coef=0.5,
+        stress_multiplier=15.0,
+        limit_reject_at_baseline=0.02,
+        confidence="uncertain",
+        snapshot_date=date(2026, 5, 12),
+        snapshot_source="test-stress-amplify-override",
+    )
     stress_state = _eurusd_state(stress=True)
-    result = evaluate(stress_state, _req())
+    result = evaluate(stress_state, _req(), calibration=override)
     assert result.slippage_pips >= 5.0, f"stress slip = {result.slippage_pips}; expected >= 5 pips"
     assert result.slippage_pips <= 20.0, (
         f"stress slip = {result.slippage_pips}; expected <= 20 pips for EURUSD"
@@ -452,9 +492,49 @@ def test_xauusd_base_pips_in_spec_band() -> None:
 
 
 def test_fx_majors_base_pips_in_spec_band() -> None:
-    """FX majors base ~0.3 pips. Spec lock."""
-    for sym in ("EURUSD", "GBPUSD", "USDJPY"):
-        assert 0.2 <= CALIBRATIONS[sym].base_pips <= 0.6, f"{sym} base_pips outside [0.2, 0.6]"
+    """FX-major base_pips lock.
+
+    Post Gate-2B round 1 (2026-05-18): EURUSD and GBPUSD are calibrated
+    against live 24h FTMO MT5 demo capture and their ``base_pips`` was
+    driven to 0.0 (the live distribution showed no per-row average slip
+    above noise). USDJPY remains at the original Wave-6b seed (~0.3 pips)
+    because the round 1 capture did not cover it.
+
+    The acceptable band per symbol is set by what the empirical
+    calibration produced:
+
+    * EURUSD/GBPUSD: ``[0.0, 0.1]`` — the calibrated value is exactly 0.0;
+      the upper tolerance leaves room for a future modest non-zero
+      re-calibration from a longer-window capture without forcing a test
+      update on every micro-tweak.
+    * USDJPY: ``[0.2, 0.6]`` — the original Wave-6b seed band (untouched).
+    """
+    eurusd = CALIBRATIONS["EURUSD"]
+    gbpusd = CALIBRATIONS["GBPUSD"]
+    usdjpy = CALIBRATIONS["USDJPY"]
+    assert 0.0 <= eurusd.base_pips <= 0.1, "EURUSD base_pips outside [0.0, 0.1]"
+    assert 0.0 <= gbpusd.base_pips <= 0.1, "GBPUSD base_pips outside [0.0, 0.1]"
+    assert 0.2 <= usdjpy.base_pips <= 0.6, "USDJPY base_pips outside [0.2, 0.6]"
+
+
+def test_deployed_fx_majors_have_zero_vol_coef_after_gate_2b_r1() -> None:
+    """Locks the Gate-2B round 1 zero-slope choice on the vol axis for
+    EURUSD/GBPUSD.
+
+    The single 24h capture's live slip distribution was too thin to
+    estimate a non-zero ``vol_coef`` (per-row vol-correlation indistinguishable
+    from noise at n=119). Round 1 zeroed it; any future calibration that
+    re-introduces a non-zero ``vol_coef`` on the FX majors must remove
+    this lock with a docstring update justifying the new evidence. USDJPY
+    is exempt because it was not in the round 1 capture.
+    """
+    for sym in ("EURUSD", "GBPUSD"):
+        assert CALIBRATIONS[sym].vol_coef == 0.0, (
+            f"{sym} vol_coef = {CALIBRATIONS[sym].vol_coef!r}; "
+            f"expected 0.0 after Gate-2B round 1. If a re-calibration "
+            f"re-introduces a non-zero slope, drop this lock with a "
+            f"docstring update naming the round/source."
+        )
 
 
 def test_limit_reject_in_valid_probability_range() -> None:
@@ -509,9 +589,26 @@ def test_limit_order_slippage_zero_regardless_of_components() -> None:
     The components dict tells diagnostics "what would the slip have been
     if this were a market order" — useful for debugging — but the slip
     field is 0 by the order-type contract.
+
+    Post Gate-2B round 1 (2026-05-18): the deployed EURUSD ``base_pips``
+    is 0.0, so we use an override calibration with a non-zero base to
+    keep the test exercising the "components populated even on limit"
+    invariant. The stress-factor invariant is preserved regardless
+    (stress_multiplier is unchanged at 15.0).
     """
+    override = SlippageCalibrationEntry(
+        symbol="EURUSD",
+        base_pips=0.3,
+        vol_coef=2.0,
+        size_coef=0.5,
+        stress_multiplier=15.0,
+        limit_reject_at_baseline=0.02,
+        confidence="uncertain",
+        snapshot_date=date(2026, 5, 12),
+        snapshot_source="test-limit-components-override",
+    )
     state = _eurusd_state(stress=True)  # would produce ~7+ pips if market
-    result = evaluate(state, _req(order_type="limit"))
+    result = evaluate(state, _req(order_type="limit"), calibration=override)
     assert result.slippage_pips == 0.0
     # But components reflect the hypothetical market slip:
     assert result.components["base"] > 0.0

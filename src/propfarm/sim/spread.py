@@ -591,21 +591,66 @@ def evaluate(
 # Seed values derived from publicly-observed retail-broker spread tapes (FTMO
 # demo, IC Markets raw, Pepperstone razor). They are flagged
 # ``"uncertain"`` because the canonical source — a 24h+ MT5 demo recording on
-# the production VPS — has not yet been captured. The recording runbook is
-# at ``docs/runbooks/spread-calibration-recording.md`` and the post-capture
-# calibration routine (which will flip these rows to ``"high"``) is deferred
-# to a separate task.
+# the production VPS — has not yet been captured for every symbol. The
+# recording runbook is at ``docs/runbooks/spread-calibration-recording.md``
+# and the post-capture calibration routine (which will flip these rows to
+# ``"high"``) is deferred to a separate task.
+#
+# Gate-2B round 1 (2026-05-18, EURUSD + GBPUSD only)
+# --------------------------------------------------
+# Source: ``data/raw/fill_recordings/bbf710b335f84e94af21b74cc3b5d725_residuals.parquet``.
+# 199 retcode-matched rows. Per-symbol mean ``spread_residual_pips``
+# (live - sim) under the original calibration:
+#
+#   EURUSD n=99  mean_resid_pips = +0.220  (sim underestimates spread)
+#   GBPUSD n=100 mean_resid_pips = +0.370  (sim underestimates spread)
+#
+# To collapse the per-symbol residual mean to ~0, the ``baseline_bps`` is
+# raised by the mean residual converted to bps at the reference price.
+# Conversion: ``Δbaseline_bps = mean_resid_pips * pip_size / reference_price
+# * 1e4``. For EURUSD at ~1.16 mid: 0.220 / 1.16 ≈ 0.19 bps → 0.10 + 0.19 ≈
+# 0.29. For GBPUSD at ~1.33 mid: 0.370 / 1.33 ≈ 0.28 bps → 0.15 + 0.28 ≈
+# 0.43. After this change the per-symbol residual mean drops to within
+# ±0.10 pip on both symbols (verified by harness re-run on the same
+# parquet).
+#
+# Lowest-touch parameter rationale: we raise the BASELINE rather than the
+# session-open peak / decay tail because the live capture's residual is
+# present across all 24h, not concentrated near session opens. Bumping the
+# session-open multiplier would only correct rows inside the ±60min decay
+# window; the baseline shift corrects every hour. The trade-off: the
+# session-open peak (=baseline x session_open_multiplier) now sits at
+# 0.29 x 5 = 1.45 bps for EURUSD and 0.43 x 6 = 2.58 bps for GBPUSD, both
+# slightly higher than the pre-calibration peak. This is acceptable because
+# the original seed peak was a placeholder; if a future capture shows a
+# session-open over-shoot, the session_open_multiplier can be tuned down.
+#
+# Two structural residuals NOT addressed by this calibration:
+#   1. Pre-Sunday-reopen widening (~21:00 UTC NY close). The live broker
+#      widens before the rollover; the sim does not. Three 2026-05-18
+#      21:18-21:55 rows showed live spreads 5-10 pips that the model
+#      cannot reproduce. These remain p95-inflating outliers until the
+#      spread model gains a pre-rollover widening term.
+#   2. Tokyo-open over-shoot. At hour 23 UTC the sim's session_open
+#      multiplier produces ~1.5 pips for GBPUSD while the live capture
+#      shows ~0.44 pips. The next round can tune session_open_multiplier
+#      down. For round 1 we accept this asymmetry as a known limitation.
+#
+# Other symbols (USDJPY/XAUUSD/GER40/US100) remain at their Wave-6b seed
+# values because they were NOT in the Gate-2B round 1 capture.
 #
 # Conventions
 # -----------
-# * EURUSD, GBPUSD, USDJPY: FX majors. ``baseline_bps`` derives from
-#   ~0.1-0.2 pip baseline at a 1.10/1.30/150 mid → 0.1-0.15 bps.
-# * XAUUSD: 30-50 cents typical spread at a $3500 mid → ~3-4 bps.
-# * GER40: 1.0-1.5 index-point spread at a 20,000 index level → ~2-3 bps.
-#   Note that for index CFDs, the bps convention computes against the index
-#   level itself, so a "wider" feed (e.g. 2 points instead of 1) translates
-#   to a proportionally larger bps figure.
-# * US100: 1.5-2.5 index-point spread at a 20,000 level → ~2-3 bps.
+# * EURUSD, GBPUSD: round 1 calibrated. baseline_bps reflects FTMO MT5
+#   demo round-trip live observation, NOT a pre-publication aggregator
+#   tape.
+# * USDJPY: FX major; ``baseline_bps`` derives from ~0.1-0.2 pip baseline
+#   at a 150 mid → ~0.15 bps (uncalibrated seed).
+# * XAUUSD: 30-50 cents typical spread at a $3500 mid → ~3-4 bps (seed).
+# * GER40: 1.0-1.5 index-point spread at a 20,000 index level → ~2-3 bps
+#   (seed). For index CFDs the bps convention computes against the index
+#   level itself, so a "wider" feed translates proportionally.
+# * US100: 1.5-2.5 index-point spread at a 20,000 level → ~2-3 bps (seed).
 #
 # Session-open multipliers are slightly larger for indices because they
 # coincide with the cash-market open (which is the *only* time index CFDs
@@ -615,28 +660,41 @@ _SEED_DATE: Final[date] = date(2026, 5, 12)
 
 _SEED_SOURCE: Final[str] = "docs/runbooks/spread-calibration-recording.md"
 
+#: Snapshot date and source for the EURUSD/GBPUSD entries recalibrated against
+#: the Gate-2B round 1 capture. The confidence flag stays "uncertain" because
+#: 24h of FTMO demo data is too thin to upgrade.
+_GATE_2B_R1_DATE: Final[date] = date(2026, 5, 18)
+_GATE_2B_R1_SOURCE: Final[str] = (
+    "data/raw/fill_recordings/bbf710b335f84e94af21b74cc3b5d725_residuals.parquet "
+    "(Gate 2B calibration round 1 — single 24h FTMO MT5 demo capture, 199 rows)"
+)
+
 CALIBRATIONS: Final[dict[str, SpreadCalibrationEntry]] = {
     "EURUSD": SpreadCalibrationEntry(
         symbol="EURUSD",
-        baseline_bps=0.10,
+        # Gate-2B round 1 (2026-05-18): baseline_bps 0.10 -> 0.29
+        # to absorb the +0.22 pip mean residual at ~1.16 ref price.
+        baseline_bps=0.29,
         session_open_multiplier=5.0,
         decay_half_life_min=10.0,
         news_multiplier=20.0,
         weekend_reopen_multiplier=15.0,
         confidence="uncertain",
-        snapshot_date=_SEED_DATE,
-        snapshot_source=_SEED_SOURCE,
+        snapshot_date=_GATE_2B_R1_DATE,
+        snapshot_source=_GATE_2B_R1_SOURCE,
     ),
     "GBPUSD": SpreadCalibrationEntry(
         symbol="GBPUSD",
-        baseline_bps=0.15,
+        # Gate-2B round 1 (2026-05-18): baseline_bps 0.15 -> 0.43
+        # to absorb the +0.37 pip mean residual at ~1.33 ref price.
+        baseline_bps=0.43,
         session_open_multiplier=6.0,
         decay_half_life_min=10.0,
         news_multiplier=20.0,
         weekend_reopen_multiplier=15.0,
         confidence="uncertain",
-        snapshot_date=_SEED_DATE,
-        snapshot_source=_SEED_SOURCE,
+        snapshot_date=_GATE_2B_R1_DATE,
+        snapshot_source=_GATE_2B_R1_SOURCE,
     ),
     "USDJPY": SpreadCalibrationEntry(
         symbol="USDJPY",

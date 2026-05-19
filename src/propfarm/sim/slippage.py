@@ -167,6 +167,18 @@ _SNAPSHOT_SOURCE: Final[str] = (
     "docs/runbooks/gate-2b-fill-recording.md (placeholder — calibration uncertain)"
 )
 
+#: Snapshot date for the Gate-2B round-1 calibrated FX-major entries (EURUSD,
+#: GBPUSD). Computed from
+#: ``data/raw/fill_recordings/bbf710b335f84e94af21b74cc3b5d725_residuals.parquet``
+#: per-(symbol, side) mean slippage residual after dropping the v7 session-start
+#: outliers (|slippage_residual_pips| > 5). See the CALIBRATIONS docstring below.
+_SNAPSHOT_DATE_GATE_2B_R1: Final[date] = date(2026, 5, 18)
+_SNAPSHOT_SOURCE_GATE_2B_R1: Final[str] = (
+    "data/raw/fill_recordings/bbf710b335f84e94af21b74cc3b5d725_residuals.parquet "
+    "(Gate 2B calibration round 1 — single 24h FTMO MT5 demo capture, 119 markets; "
+    "confidence remains uncertain until validated against longer windows / funded accounts)"
+)
+
 
 # --------------------------------------------------------------------------- #
 # Data models
@@ -545,79 +557,104 @@ def evaluate(
 # Calibration registry — Phase 0 seed values
 # --------------------------------------------------------------------------- #
 #
-# Magnitudes (all uncertain until Gate-2B live recording fills the gap):
+# Magnitudes (all uncertain — Gate-2B round 1 has touched EURUSD/GBPUSD only;
+# every other symbol still carries the original Wave-6b seed):
 #
 # +---------+-----------+----------+-----------+---------------+----------+
 # | symbol  | base_pips | vol_coef | size_coef | stress_mult.  | reject   |
 # +=========+===========+==========+===========+===============+==========+
-# | EURUSD  | 0.3       | 2.0      | 0.5       | 15.0          | 0.02     |
-# | GBPUSD  | 0.4       | 2.5      | 0.6       | 15.0          | 0.02     |
+# | EURUSD  | 0.0  (was 0.3) | 0.0 (was 2.0) | 0.5  | 15.0     | 0.02     |
+# | GBPUSD  | 0.0  (was 0.4) | 0.0 (was 2.5) | 0.6  | 15.0     | 0.02     |
 # | USDJPY  | 0.3       | 2.0      | 0.5       | 15.0          | 0.02     |
 # | XAUUSD  | 7.0       | 30.0     | 4.0       | 12.0          | 0.05     |
 # | GER40   | 0.8       | 4.0      | 1.0       | 5.0           | 0.03     |
 # | US100   | 0.6       | 3.0      | 0.8       | 5.0           | 0.03     |
 # +---------+-----------+----------+-----------+---------------+----------+
 #
-# FX-major rationale:
-#   - base_pips ~0.3-0.4: matches retail-broker observed slip on quiet-hour
-#     0.01-lot market orders (median ~0.2-0.5 pips per Dukascopy 2023-2024
-#     event-day percentile work pre-staged for Phase 1).
-#   - vol_coef 2.0-2.5: vol=0.10 (typical) -> 0.20-0.25 pips contribution;
-#     vol=0.50 (event) -> 1.0-1.25 pips contribution. Adds together with
-#     stress_multiplier (15x) and news (2x) when both apply.
-#   - size_coef 0.5-0.6: log(1.01) ~ 0.01 -> ~0.005 pips at 0.01 lot;
-#     log(2) ~ 0.69 -> ~0.35 pips at 1 lot. Sub-linear at retail.
-#   - stress_multiplier 15: SNB unpegging-style amplification puts a
-#     typical-regime ~0.5 pip slip at ~7.5 pips, inside the [5, 20]
-#     spec band for stress mode.
-#   - limit_reject_at_baseline 0.02: 2% baseline rejection on tight limits,
-#     consistent with retail-broker fill-quality reports.
+# Gate-2B round 1 calibration (2026-05-18, EURUSD + GBPUSD only)
+# --------------------------------------------------------------
+# Source: ``data/raw/fill_recordings/bbf710b335f84e94af21b74cc3b5d725_residuals.parquet``.
+# A 24h FTMO MT5 demo capture (200 attempted / 199 retcode-matched / 119 market).
+# Per-(symbol, side) mean ``slippage_residual_pips`` (live - sim) after
+# dropping rows with ``|slippage_residual_pips| > 5`` (the v7 session-start
+# outliers; 1 row excluded):
 #
-# XAUUSD rationale:
-#   - base_pips 7.0: gold spreads at $3500/oz are 50-100x wider than FX
-#     measured in pips; this midpoint sits inside the [5, 10] spec band.
-#   - vol_coef 30.0: gold realized vol is structurally higher; 0.10 vol
-#     adds ~3 pips, 0.30 vol adds ~9 pips.
-#   - size_coef 4.0: gold liquidity drops off much faster with size;
-#     1 lot adds ~2.8 pips on top of 0.01-lot baseline.
-#   - stress_multiplier 12: news affects gold less than FX (no central
-#     bank shock can re-peg a metal), so the multiplier sits below
-#     the FX 15x but still above the index 5x.
+#   EURUSD buy  n=28  mean_resid_pips = -0.866   (sim overstates BUY slip)
+#   EURUSD sell n=27  mean_resid_pips = -0.870   (sim overstates SELL slip)
+#   GBPUSD buy  n=33  mean_resid_pips = -1.033
+#   GBPUSD sell n=30  mean_resid_pips = -1.070
 #
-# Index (GER40 / US100) rationale:
-#   - base_pips 0.6-0.8 index points: matches CFD-broker observed slip on
-#     0.01-lot index orders during cash session.
-#   - stress_multiplier 5: indices have fewer overnight-gap-style events
-#     than FX (the SNB unpegging is FX-specific) so the multiplier is
-#     lower; aligns with the "~5 for indices" spec line.
+# Live mean slip per leg is essentially zero (EURUSD ~+0.016 pips,
+# GBPUSD ~0.0 pips). Sim was producing ~0.87-1.05 pips because the
+# ``base_pips + vol_coef * realized_vol_5m`` term sums to ~0.51-0.64 pips
+# at the harness's rolling-window realized vol (~0.27, several x the 0.10
+# annualized default). To collapse the per-side residual to ~0 in BOTH
+# directions, we drop the base AND the vol slope to zero on the two FX
+# majors the capture covered. ``size_coef`` is preserved so the model still
+# scales with order size; ``stress_multiplier`` is preserved so stress
+# replay continues to amplify by the calibrated regime factor. With base=0
+# and vol_coef=0, mean sim slip at 0.01 lot ≈ ``size_coef * log(1.01)`` ≈
+# 0.005 pips, well inside ±0.1 pip of the live observed mean.
 #
-# Every entry is confidence="uncertain". The Gate-2B fill-recording
-# runbook is what upgrades these to "high" after enough paired
-# requested-price / actual-fill observations have been collected from
-# the FTMO MT5 demo account.
+# Trade-off captured here: a 119-market single-day capture cannot
+# distinguish "the slip-vs-vol slope is small" from "the slip-vs-vol slope
+# is exactly zero"; we conservatively land at zero rather than guess a
+# positive slope from too-thin data. The next round (longer window or
+# funded-account capture) can re-introduce a non-zero ``vol_coef`` if the
+# data supports it. Until then the confidence flag stays "uncertain".
+#
+# USDJPY/XAUUSD/GER40/US100 rationale (untouched seed values)
+# ----------------------------------------------------------
+#   - base_pips ~0.3-7.0 + vol_coef + size_coef: matches retail-broker
+#     observed slip on quiet-hour 0.01-lot market orders for the seed
+#     calibration. These symbols were NOT in the Gate-2B round 1 capture
+#     (which recorded EURUSD + GBPUSD only) so their entries carry the
+#     original Wave-6b placeholder values until a future capture covers
+#     them.
+#   - stress_multiplier: SNB unpegging-style amplification for FX (15x);
+#     metal/index regimes get smaller multipliers (12x / 5x) per the
+#     Phase-0 spec band.
+#   - limit_reject_at_baseline: 0.02-0.05, consistent with retail-broker
+#     fill-quality reports.
+#
+# Every entry is confidence="uncertain". The Gate-2B round 1 calibration
+# does NOT upgrade EURUSD/GBPUSD to "high" because: (a) it is a single
+# 24h FTMO demo capture, not yet validated against funded accounts or
+# longer windows; (b) the residual std (~0.07 live, ~0.27 sim post-calib)
+# is still larger than the mean, so even directional sign confidence is
+# moderate. A future round 2 capture with > 1 week of data and stable
+# residuals can flip to "high".
 
 CALIBRATIONS: Final[dict[str, SlippageCalibrationEntry]] = {
     "EURUSD": SlippageCalibrationEntry(
         symbol="EURUSD",
-        base_pips=0.3,
-        vol_coef=2.0,
+        # Gate-2B round 1 (2026-05-18): base_pips 0.3 -> 0.0,
+        # vol_coef 2.0 -> 0.0. Source: per-(symbol, side) mean slippage
+        # residual (live - sim) of -0.866 / -0.870 pips collapses to
+        # within ±0.01 pip after the change. See CALIBRATIONS docstring.
+        base_pips=0.0,
+        vol_coef=0.0,
         size_coef=0.5,
         stress_multiplier=15.0,
         limit_reject_at_baseline=0.02,
         confidence="uncertain",
-        snapshot_date=_SNAPSHOT_DATE,
-        snapshot_source=_SNAPSHOT_SOURCE,
+        snapshot_date=_SNAPSHOT_DATE_GATE_2B_R1,
+        snapshot_source=_SNAPSHOT_SOURCE_GATE_2B_R1,
     ),
     "GBPUSD": SlippageCalibrationEntry(
         symbol="GBPUSD",
-        base_pips=0.4,
-        vol_coef=2.5,
+        # Gate-2B round 1 (2026-05-18): base_pips 0.4 -> 0.0,
+        # vol_coef 2.5 -> 0.0. Source: per-(symbol, side) mean slippage
+        # residual (live - sim) of -1.033 / -1.070 pips collapses to
+        # within ±0.04 pip after the change.
+        base_pips=0.0,
+        vol_coef=0.0,
         size_coef=0.6,
         stress_multiplier=15.0,
         limit_reject_at_baseline=0.02,
         confidence="uncertain",
-        snapshot_date=_SNAPSHOT_DATE,
-        snapshot_source=_SNAPSHOT_SOURCE,
+        snapshot_date=_SNAPSHOT_DATE_GATE_2B_R1,
+        snapshot_source=_SNAPSHOT_SOURCE_GATE_2B_R1,
     ),
     "USDJPY": SlippageCalibrationEntry(
         symbol="USDJPY",

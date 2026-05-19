@@ -5,11 +5,19 @@ Usage::
     python scripts/run_gate_2b.py --capture-parquet data/raw/fill_recordings/{run_id}.parquet
     python scripts/run_gate_2b.py --capture-parquet ... --execution-latency-ms 170
 
-Exit codes:
+Exit codes (Gate-2B round 1 — reviewer follow-up B4):
 
 * 0 - verdict == "pass" (cost models well-calibrated against live; Wave 6d unblocks)
-* 1 - verdict == "fail" or "investigate"
-* 2 - error before the gate could run (missing parquet, schema mismatch, etc.)
+* 1 - verdict == "fail" (at least one FAIL-band condition tripped)
+* 2 - verdict == "investigate" (a metric is in the INVESTIGATE band — no FAIL)
+* 3 - error before the gate could run (missing parquet, schema mismatch, etc.)
+
+Round-1 changes vs the original CLI:
+
+* Previously INVESTIGATE and FAIL both mapped to exit 1. Now INVESTIGATE has
+  its own dedicated exit code (2) so CI can route INVESTIGATE differently
+  from FAIL (e.g. INVESTIGATE → soft-fail merge, FAIL → hard-block).
+* The startup-error exit code moved from 2 to 3 to make room.
 """
 
 from __future__ import annotations
@@ -81,18 +89,31 @@ def _print_report(report: Gate2BReport) -> None:
         typer.echo(line)
 
 
+#: CLI verdict → exit-code map. Round-1 broke INVESTIGATE out from FAIL so
+#: CI can route the two outcomes differently (INVESTIGATE → soft-fail merge,
+#: FAIL → hard-block).
+_VERDICT_EXIT_CODE: dict[str, int] = {
+    "pass": 0,
+    "fail": 1,
+    "investigate": 2,
+}
+
+
 @app.command()
 def main(
     capture_parquet: Path = _CAPTURE_OPT,
     output_dir: Path | None = _OUTPUT_DIR_OPT,
     execution_latency_ms: float | None = _LATENCY_OPT,
 ) -> None:
-    """Run Gate 2B against a captured parquet. Exit 0 on PASS, 1 otherwise."""
+    """Run Gate 2B against a captured parquet.
+
+    Exit codes: 0=PASS, 1=FAIL, 2=INVESTIGATE, 3=startup error.
+    """
     try:
         capture = capture_parquet.resolve()
         if not capture.exists():
             typer.echo(f"ERROR: capture parquet not found: {capture}", err=True)
-            raise typer.Exit(code=2)
+            raise typer.Exit(code=3)
         output_parquet_path: Path | None
         output_markdown_path: Path | None
         if output_dir is not None:
@@ -111,10 +132,10 @@ def main(
         )
     except (FileNotFoundError, ValueError) as exc:
         typer.echo(f"ERROR: gate execution raised: {exc!r}", err=True)
-        raise typer.Exit(code=2) from exc
+        raise typer.Exit(code=3) from exc
 
     _print_report(report)
-    sys.exit(0 if report.verdict == "pass" else 1)
+    sys.exit(_VERDICT_EXIT_CODE[report.verdict])
 
 
 __all__ = ["app", "main"]
