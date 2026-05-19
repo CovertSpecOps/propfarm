@@ -19,8 +19,8 @@ The script writes:
 ```
 
 Worked example: EURUSD 2024-03-15 10:00 UTC → `data/raw/dukascopy/EURUSD/2024/02/15/10h_ticks.bi5`
-(February is `02` here because Dukascopy's URL convention is 0-indexed:
-January = `00`, December = `11`).
+(March is `02` here because Dukascopy's URL convention is 0-indexed:
+January = `00`, February = `01`, March = `02`, …, December = `11`).
 
 This is **the same layout** `propfarm.data.ingest._hour_ts_from_path()` parses
 back. The contract is locked by both:
@@ -112,6 +112,17 @@ file on disk, so they're treated as "still to fetch".
 Quick check that resume is doing the right thing: run with `--dry-run`
 after an interruption and confirm `hours to fetch` matches your
 expectation.
+
+### ETA banner vs observed wall-clock
+
+The startup ETA banner uses a conservative **0.3s/hour** constant (sleep
++ Dukascopy RTT ceiling) for arithmetic. Real CDN latency averages
+~0.05-0.15s for cached hours and ~0.3-0.6s for cold hours; total
+observed wall-clock is typically **3-5× faster** than the banner's
+estimate. For the 2 sym × 11 yr × 100ms scope the banner reads ~21h
+but the empirical overnight runs land at 3-8h — this is not a bug,
+the banner is deliberately the upper bound so the operator never
+under-budgets the run.
 
 ## Disk-space budget
 
