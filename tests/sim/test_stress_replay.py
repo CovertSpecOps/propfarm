@@ -677,24 +677,44 @@ def test_event_calibration_does_not_mutate_global_registry() -> None:
     global SPREAD_CALIBRATIONS/SLIPPAGE_CALIBRATIONS at
     stress_mode=False, news_window=False; if stress replay leaked an
     inflated multiplier into the global, that test would fail.
-    """
-    pre_eurusd_spread_baseline = SPREAD_CALIBRATIONS["EURUSD"].baseline_bps
-    pre_eurusd_spread_news = SPREAD_CALIBRATIONS["EURUSD"].news_multiplier
-    pre_eurusd_slip_stress = SLIPPAGE_CALIBRATIONS["EURUSD"].stress_multiplier
 
-    # Run all windows.
+    2026-05-19 Wave 6d reviewer (LOW) follow-up: original assertion only
+    checked 3 scalar fields (baseline_bps, news_multiplier,
+    stress_multiplier) on EURUSD, so a future change that swaps the
+    entry's identity while keeping those 3 values identical (a no-op
+    refactor) would silently pass even if the swap leaked. Strengthened
+    to full ``model_dump()`` equality + ``id()`` preservation across
+    EURUSD AND GBPUSD entries for BOTH registries.
+    """
+    # Capture full pydantic dumps + object identities for ALL FX-major
+    # entries — not just the 3 scalar fields the original assertion
+    # checked.
+    pre_spread_dumps = {sym: SPREAD_CALIBRATIONS[sym].model_dump() for sym in ("EURUSD", "GBPUSD")}
+    pre_slip_dumps = {sym: SLIPPAGE_CALIBRATIONS[sym].model_dump() for sym in ("EURUSD", "GBPUSD")}
+    pre_spread_ids = {sym: id(SPREAD_CALIBRATIONS[sym]) for sym in ("EURUSD", "GBPUSD")}
+    pre_slip_ids = {sym: id(SLIPPAGE_CALIBRATIONS[sym]) for sym in ("EURUSD", "GBPUSD")}
+
+    # Run all windows (includes try/finally restore paths).
     run_all_stress_windows()
 
-    # Assert no field on the global registry changed.
-    assert SPREAD_CALIBRATIONS["EURUSD"].baseline_bps == pre_eurusd_spread_baseline, (
-        "stress replay leaked into global SPREAD_CALIBRATIONS.baseline_bps"
-    )
-    assert SPREAD_CALIBRATIONS["EURUSD"].news_multiplier == pre_eurusd_spread_news, (
-        "stress replay leaked into global SPREAD_CALIBRATIONS.news_multiplier"
-    )
-    assert SLIPPAGE_CALIBRATIONS["EURUSD"].stress_multiplier == pre_eurusd_slip_stress, (
-        "stress replay leaked into global SLIPPAGE_CALIBRATIONS.stress_multiplier"
-    )
+    # Full pydantic state unchanged + object identity preserved per symbol.
+    for sym in ("EURUSD", "GBPUSD"):
+        assert SPREAD_CALIBRATIONS[sym].model_dump() == pre_spread_dumps[sym], (
+            f"stress replay leaked into SPREAD_CALIBRATIONS[{sym!r}]: "
+            "model_dump differs from pre-run snapshot"
+        )
+        assert SLIPPAGE_CALIBRATIONS[sym].model_dump() == pre_slip_dumps[sym], (
+            f"stress replay leaked into SLIPPAGE_CALIBRATIONS[{sym!r}]: "
+            "model_dump differs from pre-run snapshot"
+        )
+        assert id(SPREAD_CALIBRATIONS[sym]) == pre_spread_ids[sym], (
+            f"stress replay swapped SPREAD_CALIBRATIONS[{sym!r}] identity; "
+            "even a value-equal swap means a future leak via mutable nested "
+            "state would silently slip past this guard"
+        )
+        assert id(SLIPPAGE_CALIBRATIONS[sym]) == pre_slip_ids[sym], (
+            f"stress replay swapped SLIPPAGE_CALIBRATIONS[{sym!r}] identity"
+        )
 
 
 def test_synthetic_tick_stream_is_deterministic() -> None:

@@ -50,25 +50,35 @@ repos:
         stages: [pre-commit]
 
   # --------------------------------------------------------------------------
-  # mypy --strict. Mirrors the [tool.mypy] block in pyproject.toml.
-  # additional_dependencies seeds the hook's isolated env with the type stubs
-  # we know we'll need early in Phase 0. Add more as modules import them.
+  # mypy --strict — runs from the project's active venv (typically `.venv`).
+  #
+  # 2026-05-19 switched from `repo: https://github.com/pre-commit/mirrors-mypy`
+  # to `repo: local` with `language: system`. Rationale (from STATUS.md
+  # 2026-05-19 #4 deferred-ledger entry): the mirrors-mypy hook spawns an
+  # ISOLATED venv with only `additional_dependencies` installed, so it does
+  # NOT have the `propfarm` package itself; every `from propfarm.sim.* import
+  # ...` in tests/ raised `Cannot find implementation or library stub for
+  # module named 'propfarm.sim.*'`. Pre-existing on `tests/sim/test_spread.py`
+  # (5 errors) and `tests/sim/test_stress_replay.py` (7 errors) — Wave 6d's
+  # commit `6dd9bba` shipped past this somehow. Switching to `language: system`
+  # uses the developer's active environment (the same venv that runs pytest
+  # under the pre-push hook below), which has `propfarm` installed editable
+  # via `pip install -e ".[dev]"`. Mypy's [tool.mypy] block in pyproject.toml
+  # is auto-discovered from CWD; no args needed beyond --strict.
+  #
+  # Trade-off: the hook now requires the venv to have mypy installed; the
+  # repo's optional-dependencies.dev pins mypy, so `pip install -e ".[dev]"`
+  # is the operator contract. Documented in CONTRIBUTING / README before
+  # Phase 1 dispatch.
   # --------------------------------------------------------------------------
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.20.2
+  - repo: local
     hooks:
       - id: mypy
-        args: [--strict]
-        additional_dependencies:
-          - polars
-          - pydantic
-          - types-PyYAML
-          - pandas-stubs
-          - pyarrow
-          - numpy
-          - pytest
-          - hypothesis
-          - typer
+        name: mypy
+        entry: mypy --strict
+        language: system
+        types: [python]
+        pass_filenames: true
         stages: [pre-commit]
         exclude: ^scripts/spike_mt5\.py$
 
