@@ -546,9 +546,10 @@ def test_write_recording_round_trip(tmp_path: Path) -> None:
     assert manifest["n_attempted"] == 2
     assert manifest["n_filled"] == 1
     assert manifest["n_rejected"] == 1
-    # Schema bumped to 1.2 on 2026-05-14 fix v2 reviewer follow-up
-    # (market-only denominator for the Gate 2B threshold).
-    assert manifest["schema_version"] == "1.2"
+    # Schema bumped to 1.3 on 2026-05-19 fix v8 (Part B session-start
+    # sweep). The 1.2 bump was the prior market-only denominator
+    # follow-up.
+    assert manifest["schema_version"] == "1.3"
     assert manifest["vps_host_redacted"] is True
     # Default `n_market_lookup_failures` when no failures supplied: 0.
     assert manifest["n_market_lookup_failures"] == 0
@@ -2260,6 +2261,390 @@ def test_resolve_fill_from_deal_path_0_retries_then_succeeds_on_second_attempt(
     assert "[record_fills:lookup_probe_path0_match_result]" not in captured.err
 
 
+# --------------------------------------------------------------------------- #
+# 2026-05-19 fix v8 — path-0 hardening tests (Part A + Part B).
+# --------------------------------------------------------------------------- #
+def test_resolve_fill_from_deal_path_0_skipped_for_limit_orders_on_hedging(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v8 Part A: path 0 must NOT engage on limit orders even on hedging accounts.
+
+    Limit (and stop) pending orders DO NOT generate positions at
+    order_send time — the broker queues them; the position only
+    materializes when the pending price triggers. Yet v7 fired path 0
+    unconditionally on hedging accounts, so the path-0 volume+side
+    fallback matcher could latch onto a residual position from a prior
+    session — exactly the 1-anomaly-per-session signature the v8 fix
+    closes.
+
+    This test stages the exact bug condition:
+
+    * Hedging account margin mode.
+    * Limit order (not market).
+    * A residual position with matching symbol+volume+side from a
+      prior session sitting in positions_get.
+
+    Under v7 the fallback matcher would have returned the residual's
+    price — adverse-fill telemetry for an order that did not even
+    fill. Under v8 path 0 is skipped entirely; the helper falls
+    straight through to paths 1-3, which correctly return empty for
+    an unfilled pending order, and the helper returns ``(None, None)``.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    # Residual from a prior session — same symbol/volume/side as the
+    # limit order we're about to place. Under v7 the fallback would
+    # have matched this.
+    residual_position = SimpleNamespace(
+        ticket=111111111,
+        symbol="GBPUSD",
+        price_open=1.34400,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,
+        type=1,  # POSITION_TYPE_SELL → side "sell"
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"GBPUSD": (residual_position,)},
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    # Pending limit-sell order — should fall straight through to paths
+    # 1-3 without ever consulting positions_get.
+    result = SimpleNamespace(retcode=10009, deal=0, order=999999999, position=0)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="GBPUSD",
+            order_type="limit",  # <-- the critical gate value
+            side="sell",
+            idx=0,
+        ),
+    )
+    # No fill — pending order; the helper soft-fails.
+    assert price is None, (
+        f"v8 Part A: limit order must NOT pick up a residual position via path 0; "
+        f"got price={price!r}. This was the 1-anomaly-per-session signature."
+    )
+    assert fill_time is None
+    # The load-bearing assertion: positions_get was NEVER called.
+    assert mock_mt5.positions_get_calls == [], (
+        f"v8 Part A: path 0 (positions_get) must NOT engage for limit orders "
+        f"on hedging accounts; got {mock_mt5.positions_get_calls}"
+    )
+    # Also: NO path-0 probe block fires (path 0 never engaged).
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_path0_args]" not in captured.err
+    assert "[record_fills:lookup_probe_path0_match_result]" not in captured.err
+
+
+def test_resolve_fill_from_deal_path_0_skipped_for_stop_orders_on_hedging(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v8 Part A: same gate as limit orders — stop orders must skip path 0.
+
+    Stops are the second pending-order class; same broker semantics
+    (no position until the stop price triggers). The order_type gate
+    must apply to all non-market types.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 12, 0, tzinfo=UTC)
+    residual_position = SimpleNamespace(
+        ticket=222222222,
+        symbol="EURUSD",
+        price_open=1.10050,
+        time=int(request_time.timestamp()) + 10800,
+        volume=0.01,
+        type=0,  # POSITION_TYPE_BUY
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (residual_position,)},
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=888888888, position=0)
+    price, fill_time = rf._resolve_fill_from_deal(
+        mock_mt5,
+        result,
+        success_retcode=10009,
+        server_time_offset_seconds=10800,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+        **_resolve_kwargs(
+            request_time_utc=request_time,
+            symbol="EURUSD",
+            order_type="stop",  # <-- the critical gate value
+            side="buy",
+            idx=0,
+        ),
+    )
+    assert price is None
+    assert fill_time is None
+    assert mock_mt5.positions_get_calls == [], (
+        f"v8 Part A: path 0 must NOT engage for stop orders on hedging "
+        f"accounts; got {mock_mt5.positions_get_calls}"
+    )
+    captured = capsys.readouterr()
+    assert "[record_fills:lookup_probe_path0_args]" not in captured.err
+
+
+def test_session_start_sweep_closes_residual_positions_b1(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v8 Part B1: session-start sweep closes residual positions via opposing market orders.
+
+    Stages two residual positions on different symbols; the sweep
+    calls order_send to close each, then re-polls positions_get to
+    confirm the symbols are clear. The B1 happy path: both closes
+    succeed (retcode=success), so the stale_set is empty and the
+    next path-0 lookup has a clean slate.
+    """
+    rf = _load_module()
+
+    # Pre-stage two residual positions on EURUSD and GBPUSD. Each has
+    # a unique ticket so the mock can distinguish them when the close
+    # round-trip removes them.
+    eurusd_residual = SimpleNamespace(
+        ticket=11111,
+        symbol="EURUSD",
+        price_open=1.10050,
+        time=1000,
+        volume=0.01,
+        type=0,  # POSITION_TYPE_BUY
+    )
+    gbpusd_residual = SimpleNamespace(
+        ticket=22222,
+        symbol="GBPUSD",
+        price_open=1.34400,
+        time=1001,
+        volume=0.01,
+        type=1,  # POSITION_TYPE_SELL
+    )
+
+    class _SweepMockMt5(_MockMt5):
+        """Mock with a positions_get that empties on close."""
+
+        def __init__(self, **kw: Any) -> None:
+            super().__init__(**kw)
+            self.close_requests: list[dict[str, Any]] = []
+
+        def order_send(self, req: dict[str, Any]) -> SimpleNamespace:
+            self.close_requests.append(req)
+            # Simulate successful close: remove the position from the
+            # symbol's bucket so the verification re-poll returns empty.
+            sym = req["symbol"]
+            tkt = int(req.get("position", 0))
+            existing = list(self._positions_by_symbol.get(sym, ()))
+            self._positions_by_symbol[sym] = tuple(
+                p for p in existing if int(getattr(p, "ticket", 0)) != tkt
+            )
+            return SimpleNamespace(retcode=10009, comment="filled")
+
+    mock = _SweepMockMt5(
+        positions_by_symbol={
+            "EURUSD": (eurusd_residual,),
+            "GBPUSD": (gbpusd_residual,),
+        },
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    constants = {
+        "TRADE_ACTION_DEAL": 1,
+        "TRADE_ACTION_PENDING": 5,
+        "ORDER_TYPE_BUY": 0,
+        "ORDER_TYPE_SELL": 1,
+        "ORDER_TYPE_BUY_LIMIT": 2,
+        "ORDER_TYPE_SELL_LIMIT": 3,
+        "ORDER_TYPE_BUY_STOP": 4,
+        "ORDER_TYPE_SELL_STOP": 5,
+    }
+    template = {"deviation": 10, "type_filling": 2}
+
+    stale_set, n_residual = rf.run_session_start_sweep(
+        mock,
+        symbols=("EURUSD", "GBPUSD"),
+        constants=constants,
+        template=template,
+        success_retcode=10009,
+        sleep_func=lambda _: None,
+    )
+    # Two residuals found and both closed successfully → empty stale_set.
+    assert n_residual == 2
+    assert stale_set == set()
+    # Two close-orders sent (one per residual).
+    assert len(mock.close_requests) == 2
+    # Opposite-side semantics: the EURUSD buy residual closes via
+    # ORDER_TYPE_SELL; the GBPUSD sell residual closes via ORDER_TYPE_BUY.
+    eurusd_close = next(r for r in mock.close_requests if r["symbol"] == "EURUSD")
+    gbpusd_close = next(r for r in mock.close_requests if r["symbol"] == "GBPUSD")
+    assert eurusd_close["type"] == constants["ORDER_TYPE_SELL"]
+    assert gbpusd_close["type"] == constants["ORDER_TYPE_BUY"]
+    # After the sweep both symbols should be clear in positions_get.
+    assert mock.positions_get(symbol="EURUSD") == ()
+    assert mock.positions_get(symbol="GBPUSD") == ()
+    # Sweep summary line emitted to stderr with action=closed.
+    captured = capsys.readouterr()
+    assert "[record_fills:session_start_sweep]" in captured.err
+    assert "found 2 residual positions" in captured.err
+    assert "action=closed" in captured.err
+
+
+def test_session_start_sweep_records_stale_set_b2(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v8 Part B2: when close fails (e.g. market closed), residual lands in stale_set.
+
+    Simulates the failure case the v8 spec documents: the broker
+    rejects the close order (retcode=10018 "Market closed"), the
+    sweep cannot remove the residual, and so it falls into the
+    session-scoped stale_set that path 0's matchers refuse to match
+    against (the B2 fallback).
+    """
+    rf = _load_module()
+    residual = SimpleNamespace(
+        ticket=42,
+        symbol="EURUSD",
+        price_open=1.10050,
+        time=1000,
+        volume=0.01,
+        type=0,
+    )
+
+    class _MarketClosedMt5(_MockMt5):
+        """Mock whose order_send returns retcode=10018 (market closed)."""
+
+        def __init__(self, **kw: Any) -> None:
+            super().__init__(**kw)
+            self.close_requests: list[dict[str, Any]] = []
+
+        def order_send(self, req: dict[str, Any]) -> SimpleNamespace:
+            self.close_requests.append(req)
+            # 10018 = TRADE_RETCODE_MARKET_CLOSED — the close failed
+            # and the position remains in positions_get.
+            return SimpleNamespace(retcode=10018, comment="Market closed")
+
+    mock = _MarketClosedMt5(
+        positions_by_symbol={"EURUSD": (residual,)},
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    constants = {
+        "TRADE_ACTION_DEAL": 1,
+        "TRADE_ACTION_PENDING": 5,
+        "ORDER_TYPE_BUY": 0,
+        "ORDER_TYPE_SELL": 1,
+        "ORDER_TYPE_BUY_LIMIT": 2,
+        "ORDER_TYPE_SELL_LIMIT": 3,
+        "ORDER_TYPE_BUY_STOP": 4,
+        "ORDER_TYPE_SELL_STOP": 5,
+    }
+    template = {"deviation": 10, "type_filling": 2}
+    stale_set, n_residual = rf.run_session_start_sweep(
+        mock,
+        symbols=("EURUSD",),
+        constants=constants,
+        template=template,
+        success_retcode=10009,
+        sleep_func=lambda _: None,
+    )
+    # One residual found; close FAILED so it lands in stale_set.
+    assert n_residual == 1
+    assert stale_set == {42}, (
+        f"v8 Part B2: failed close must record the ticket in stale_set; got {stale_set}"
+    )
+    assert len(mock.close_requests) == 1
+    # Sweep summary line names action=recorded_in_stale_set.
+    captured = capsys.readouterr()
+    assert "[record_fills:session_start_sweep]" in captured.err
+    assert "found 1 residual positions" in captured.err
+    assert "action=recorded_in_stale_set" in captured.err
+
+
+def test_path_0_refuses_to_match_stale_set_tickets(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """v8 Part B2: path 0 falls through if every candidate is in the stale_set.
+
+    The defense-in-depth: even if positions_get returns a residual
+    whose ticket matches the freshly-sent order ticket (extremely
+    unlikely but pathologically possible on broker ticket reuse) AND
+    that ticket is in the stale_set, the path-0 matchers must refuse
+    to attribute the residual's price_open to the new order.
+
+    Concrete fixture: stale_set contains ticket=42; positions_get
+    returns a position with ticket=42 (same ticket as result.order)
+    AND matching symbol+volume+side. Under v7 (no stale_set check)
+    path 0 would have returned the residual's price. Under v8 the
+    helper falls through to paths 1-3 (which return empty), and
+    main()'s loud market_lookup_failure log fires.
+    """
+    rf = _load_module()
+    request_time = datetime(2026, 5, 14, 18, 56, 31, tzinfo=UTC)
+    server_offset = 10800
+    # Residual position whose ticket happens to match the new order's
+    # ticket — the strict-ticket matcher's pathological collision case.
+    residual_with_collision = SimpleNamespace(
+        ticket=42,  # = result.order below AND in stale_set
+        symbol="EURUSD",
+        price_open=1.10050,
+        time=int(request_time.timestamp()) + server_offset,
+        volume=0.01,
+        type=0,
+    )
+    mock_mt5 = _make_mock_mt5(
+        deal_by_ticket={},
+        deals_by_position={},
+        deals_for_time_range=(),
+        positions_by_symbol={"EURUSD": (residual_with_collision,)},
+        server_time_offset_seconds=server_offset,
+        account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+    )
+    result = SimpleNamespace(retcode=10009, deal=0, order=42, position=0)
+
+    stale = {42}
+
+    import unittest.mock as _m
+
+    with _m.patch.object(rf.time, "sleep", lambda _: None):
+        price, fill_time = rf._resolve_fill_from_deal(
+            mock_mt5,
+            result,
+            success_retcode=10009,
+            server_time_offset_seconds=server_offset,
+            account_margin_mode=rf.ACCOUNT_MARGIN_MODE_RETAIL_HEDGING,
+            session_start_stale_set=stale,
+            **_resolve_kwargs(
+                request_time_utc=request_time,
+                symbol="EURUSD",
+                order_type="market",
+                side="buy",
+                idx=0,
+            ),
+        )
+    # Path 0 refused to match → fell through → paths 1-3 also empty → soft-fail.
+    assert price is None, (
+        f"v8 Part B2: path 0 must refuse to match against stale_set tickets; got price={price!r}"
+    )
+    assert fill_time is None
+    # Path 0 was tried (the retry loop ran) but every candidate was
+    # filtered out by the stale_set guard.
+    assert len(mock_mt5.positions_get_calls) == rf.PATH0_MAX_ATTEMPTS, (
+        f"path 0 retry loop should exhaust attempts when stale_set blocks every "
+        f"candidate; got {len(mock_mt5.positions_get_calls)} calls"
+    )
+    captured = capsys.readouterr()
+    # Path-0 probe block fires (retries exhausted with no match).
+    assert "[record_fills:lookup_probe_path0_args]" in captured.err
+    assert "[record_fills:lookup_probe_path0_match_result] matched=False" in captured.err
+
+
 def test_resolve_fill_from_deal_path_2_no_entry_filter_returns_match_by_volume_side(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2545,16 +2930,17 @@ def test_mock_symbol_info_tick_reflects_configured_offset() -> None:
 # --------------------------------------------------------------------------- #
 # Manifest schema v1.1 — n_market_lookup_failures field.
 # --------------------------------------------------------------------------- #
-def test_session_manifest_schema_version_bumped_to_1_2() -> None:
-    """SCHEMA_VERSION constant + manifest default must be '1.2'.
+def test_session_manifest_schema_version_bumped_to_1_3() -> None:
+    """SCHEMA_VERSION constant + manifest default must be '1.3'.
 
-    Bumped from 1.1 → 1.2 on the 2026-05-14 fix v2 reviewer follow-up,
-    when ``n_filled_market`` was added so Gate 2B's market-lookup-failure
-    ratio uses a market-only denominator instead of the all-fills
-    denominator (which mixed market + pending and was lenient by ~2x).
+    Bumped from 1.2 → 1.3 on the 2026-05-19 fix v8, when
+    ``n_residual_positions_at_session_start`` was added so the
+    session-start sweep (Part B) has a forensic field to record how
+    many residuals it found. Existing 1.0 / 1.1 / 1.2 manifests still
+    parse — the new field defaults to 0 (pydantic forward-compat).
     """
     rf = _load_module()
-    assert rf.SCHEMA_VERSION == "1.2"
+    assert rf.SCHEMA_VERSION == "1.3"
     manifest = rf.SessionManifest(
         run_id="test",
         start_utc=datetime(2026, 5, 14, 0, 0, tzinfo=UTC),
@@ -2563,9 +2949,67 @@ def test_session_manifest_schema_version_bumped_to_1_2() -> None:
         n_filled=0,
         n_rejected=0,
     )
-    assert manifest.schema_version == "1.2"
+    assert manifest.schema_version == "1.3"
     assert manifest.n_market_lookup_failures == 0
     assert manifest.n_filled_market == 0
+    assert manifest.n_residual_positions_at_session_start == 0
+
+
+def test_session_manifest_v1_2_back_compat() -> None:
+    """Existing v1.2 manifests still parse cleanly (forward-compat).
+
+    The v1.3 bump added one optional field with a default of 0; pydantic
+    parses a 1.2 JSON manifest (no
+    ``n_residual_positions_at_session_start`` key) without error.
+    """
+    rf = _load_module()
+    import json as _json
+
+    v1_2_json = _json.dumps(
+        {
+            "run_id": "v1_2-back-compat",
+            "start_utc": "2026-05-14T00:00:00+00:00",
+            "end_utc": "2026-05-14T01:00:00+00:00",
+            "n_attempted": 10,
+            "n_filled": 9,
+            "n_filled_market": 6,
+            "n_rejected": 1,
+            "n_market_lookup_failures": 0,
+            "schema_version": "1.2",
+            "vps_host_redacted": True,
+        }
+    )
+    manifest = rf.SessionManifest.model_validate_json(v1_2_json)
+    assert manifest.n_residual_positions_at_session_start == 0
+    assert manifest.schema_version == "1.2"
+
+
+def test_session_manifest_v1_0_back_compat() -> None:
+    """Existing v1.0 manifests still parse cleanly (forward-compat).
+
+    Even older v1.0 manifests (without n_market_lookup_failures or
+    n_filled_market) parse — both new fields default to 0.
+    """
+    rf = _load_module()
+    import json as _json
+
+    v1_0_json = _json.dumps(
+        {
+            "run_id": "v1_0-back-compat",
+            "start_utc": "2026-05-13T00:00:00+00:00",
+            "end_utc": "2026-05-13T01:00:00+00:00",
+            "n_attempted": 5,
+            "n_filled": 5,
+            "n_rejected": 0,
+            "schema_version": "1.0",
+            "vps_host_redacted": True,
+        }
+    )
+    manifest = rf.SessionManifest.model_validate_json(v1_0_json)
+    assert manifest.n_residual_positions_at_session_start == 0
+    assert manifest.n_market_lookup_failures == 0
+    assert manifest.n_filled_market == 0
+    assert manifest.schema_version == "1.0"
 
 
 def test_write_recording_persists_n_market_lookup_failures(tmp_path: Path) -> None:
@@ -2602,9 +3046,11 @@ def test_write_recording_persists_n_market_lookup_failures(tmp_path: Path) -> No
 
     manifest = _json.loads(mf.read_text())
     assert manifest["n_market_lookup_failures"] == 3
-    assert manifest["schema_version"] == "1.2"
+    assert manifest["schema_version"] == "1.3"
     # The single row above is order_type="market" + retcode=10009 → counted.
     assert manifest["n_filled_market"] == 1
+    # 2026-05-19 fix v8: new field defaults to 0 when sweep didn't run.
+    assert manifest["n_residual_positions_at_session_start"] == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -267,6 +267,86 @@ soft-fail.
 stays at ``"1.2"`` — recording the detected offset in the manifest was
 considered for forensics but rejected to avoid a v1.3 bump for a
 diagnostic value already logged to stderr.
+
+2026-05-19 fix v8 — path-0 hardening (confidence=high)
+------------------------------------------------------
+
+Two captures (Friday 2026-05-15 ``56c954a`` partial 1/53 + Monday
+2026-05-18 ``bbf710b3`` full 1/119) showed an identical signature:
+exactly ONE anomalous fill per session, ALWAYS the first market order,
+with suspicious sub-50ms latency (12.6ms vs ~160ms typical) and a
+slippage residual of ±40 pip or more vs the spread-model predicted
+band. The mechanism is now fully understood from these two captures
+— path 0's symbol+volume+side fallback matcher (v7 reviewer
+follow-up) latched onto a residual position left over from a PRIOR
+session that happened to share the same symbol / volume / side as the
+first market order. Confidence is **high**: same signature, same
+position in the session, two independent captures.
+
+Fix v8 closes the defect with two changes, both gated on the
+hedging-account path:
+
+* **Part A — gate path 0 on ``order_type == "market"``.** Limit and
+  stop pending orders DO NOT generate positions at order_send time
+  (the broker queues them; the position only materializes when the
+  pending price triggers). Yet v7 fired path 0 unconditionally on
+  hedging accounts, so the v7 ``idx=000 GBPUSD limit sell at
+  12.6ms`` anomaly was path 0's fallback matcher picking up a
+  residual position when it should have fallen straight through to
+  paths 1-3 (which would correctly return empty for an unfilled
+  pending order). v8 entry condition: path 0 fires iff
+  ``account_margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING`` AND
+  ``order_type == "market"``.
+
+* **Part B — session-start residual-position sweep (close-on-startup,
+  B1).** Before the first ``order_send``, ``main()`` enumerates
+  ``mt5.positions_get(symbol=symbol)`` for every symbol the schedule
+  will touch and closes any residual positions via opposing-side
+  market orders. This is the **B1 (close-on-startup)** option from
+  the v8 fix-up spec; **B2 (record in a stale_set)** is the
+  documented fallback for symbols whose close fails (e.g. market
+  closed on a residual carrying over from a Friday-late session into
+  a Sunday-late restart).
+
+  Decision rationale (B1 over B2): closing the residuals on startup
+  removes the failure mode entirely, rather than leaving a
+  shadow-state set that future code touching path 0 must remember
+  to consult. The B2 stale-set is only used as a fallback for the
+  failure case where the close itself fails — at which point we
+  cannot remove the residual, and path 0's fallback matcher must
+  refuse to match against the recorded tickets. The two-tier design
+  keeps the common case clean and only pays the stale-set cost when
+  the broker prevents closure.
+
+  Failure mode B1 → B2: per-symbol close attempt fails (e.g.
+  ``mt5.order_send`` returns ``retcode != TRADE_RETCODE_DONE``,
+  most likely 10018 "Market closed"). The sweep logs a warning,
+  records the residual tickets in a session-scoped
+  ``session_start_stale_set: set[int]``, and threads that set into
+  ``_resolve_fill_from_deal``. Path 0's fallback matcher refuses to
+  match against any ticket in this set (treating it as
+  already-claimed by a prior session). The first market order on
+  that symbol may then soft-fail to ``NaN`` if no other recoverable
+  position exists, which is the **correct** behavior — a NaN row
+  is salvageable; a wrong-residual row is poison.
+
+New stderr line at session start (emitted after the sweep):
+
+::
+
+    [record_fills:session_start_sweep] found N residual positions on
+    symbols [S1, S2, ...]; action=closed|recorded_in_stale_set
+
+If the sweep finds nothing the line still fires with ``found 0
+residual positions on symbols []; action=closed`` so the operator
+has a positive confirmation that the sweep ran.
+
+``FillRecord`` parquet schema unchanged. ``SessionManifest`` schema
+bumps **1.2 → 1.3** with a new ``n_residual_positions_at_session_start:
+int`` field counting how many residual positions the sweep found
+(closed or recorded). Existing 1.0 / 1.1 / 1.2 manifests still parse
+(field defaults to 0). Gate 2B does not consume this field; it is
+forensic only.
 """
 
 from __future__ import annotations
@@ -292,9 +372,11 @@ OrderType = Literal["market", "limit", "stop"]
 Side = Literal["buy", "sell"]
 
 #: Manifest schema version. Bumped to "1.1" on 2026-05-14 fix v2 to add
-#: ``n_market_lookup_failures``. FillRecord (parquet column) schema is
-#: unchanged — only the sidecar JSON manifest gains the new field.
-SCHEMA_VERSION: Final[str] = "1.2"
+#: ``n_market_lookup_failures``. Bumped to "1.3" on 2026-05-19 fix v8 to
+#: add ``n_residual_positions_at_session_start``. FillRecord (parquet
+#: column) schema is unchanged — only the sidecar JSON manifest gains
+#: the new field.
+SCHEMA_VERSION: Final[str] = "1.3"
 LOT_SIZE: Final[float] = 0.01
 MAX_SIMULTANEOUS_POSITIONS: Final[int] = 5
 HARD_TIME_LIMIT_HOURS: Final[float] = 48.0
@@ -468,16 +550,24 @@ class SessionManifest(BaseModel):
       capture has unreliable ``fill_price`` data for some market rows.
       Gate 2B's harness refuses to consume a manifest whose ratio
       ``n_market_lookup_failures / max(n_filled_market, 1) > 0.05``.
+    * **1.3** (2026-05-19 fix v8) — added
+      ``n_residual_positions_at_session_start``. Counts the number of
+      residual positions the session-start sweep found across all
+      symbols in the schedule. ``0`` is the healthy case (no stale
+      state). A positive value indicates the prior session left
+      positions on the account; the sweep either closed them (B1) or
+      recorded them in the session-scoped stale_set (B2 fallback).
+      Forensic-only — Gate 2B does not currently consume this field.
 
     Notes
     -----
 
     ``schema_version`` defaults to the current :data:`SCHEMA_VERSION` so
     every newly-written manifest carries the latest version. Existing
-    on-disk manifests written under v1.0 (e.g. the unusable
-    ``24e00278…`` capture's manifest) are still readable as plain
-    JSON; Gate 2B's loader treats a missing ``n_market_lookup_failures``
-    key as ``0`` (forward-compat).
+    on-disk manifests written under v1.0 / v1.1 / v1.2 are still
+    readable as plain JSON; Gate 2B's loader treats missing fields
+    (``n_market_lookup_failures``, ``n_filled_market``,
+    ``n_residual_positions_at_session_start``) as ``0`` (forward-compat).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -490,6 +580,7 @@ class SessionManifest(BaseModel):
     n_filled_market: int = 0
     n_rejected: int
     n_market_lookup_failures: int = 0
+    n_residual_positions_at_session_start: int = 0
     schema_version: str = SCHEMA_VERSION
     vps_host_redacted: bool = True
 
@@ -1065,6 +1156,33 @@ _LOG_PREFIX_LOOKUP_PROBE_PATH0_MATCH_RESULT: Final[str] = (
 PATH0_MAX_ATTEMPTS: Final[int] = 3
 PATH0_RETRY_SLEEP_SECONDS: Final[float] = 0.05
 
+#: 2026-05-19 fix v8 — session-start residual-position sweep. Emitted
+#: after the sweep runs (BEFORE the first ``order_send`` in main()) so
+#: the operator has positive confirmation the sweep ran and how it
+#: resolved. ``action=closed`` for the B1 happy path (all residuals
+#: closed); ``action=recorded_in_stale_set`` for the B2 fallback (one
+#: or more closes failed, e.g. market closed); ``action=mixed`` if
+#: SOME closed and others fell to the stale_set across the symbol
+#: list. Fires unconditionally — even if zero residuals were found,
+#: the line emits with ``found 0`` so the operator can confirm the
+#: sweep ran on this VPS / this MT5 build.
+_LOG_PREFIX_SESSION_START_SWEEP: Final[str] = "[record_fills:session_start_sweep]"
+
+#: 2026-05-19 fix v8 — per-residual-close diagnostic. Emitted ONCE per
+#: residual position the sweep encounters, with the close retcode so
+#: the operator can grep ``retcode != 10009`` to find the B1 -> B2
+#: degradations.
+_LOG_PREFIX_SESSION_START_SWEEP_CLOSE: Final[str] = "[record_fills:session_start_sweep_close]"
+
+#: 2026-05-19 fix v8 — wait window for the post-close positions_get
+#: verification. After sending the opposing-side close orders, the
+#: sweep waits up to this many seconds (polling at
+#: PATH0_RETRY_SLEEP_SECONDS intervals — the same 50ms cadence path 0
+#: uses) for ``positions_get(symbol)`` to confirm the symbol is clear.
+#: 2s = 40 polls is more than generous for a market-open close which
+#: typically completes in < 200ms.
+SESSION_START_SWEEP_VERIFY_TIMEOUT_SECONDS: Final[float] = 2.0
+
 
 def detect_server_time_offset_seconds(
     tick_time_server_unix: int | float,
@@ -1219,6 +1337,7 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     claimed_deal_tickets: set[int] | None = None,
     server_time_offset_seconds: int = 0,
     account_margin_mode: int = ACCOUNT_MARGIN_MODE_RETAIL_NETTING,
+    session_start_stale_set: set[int] | None = None,
 ) -> tuple[float | None, datetime | None]:
     """Resolve the deal-record fill price + time for a successful order.
 
@@ -1297,6 +1416,15 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
         params ("Set by the 'datetime' object or as a number of
         seconds elapsed since 1970.01.01"). Default ``0`` preserves
         unit-test back-compat for tests that don't model the offset.
+    session_start_stale_set
+        2026-05-19 fix v8 (Part B2 fallback) — optional session-scoped
+        set of position tickets that the session-start sweep failed to
+        close (e.g. market closed on a Friday-late residual). Path 0's
+        strict-ticket and fallback matchers MUST refuse to match against
+        any ticket in this set; the residuals are NOT this session's
+        fills, and matching against them is exactly the 1-anomaly-per-
+        session bug the v8 fix closes. Default ``None`` disables stale-
+        set checking (for tests that don't model residuals).
 
     Returns
     -------
@@ -1327,7 +1455,17 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
     # position fields on the ``OrderSendResult`` for hedging accounts,
     # so paths 1-3 are structurally inert. Path 0 fires FIRST on
     # hedging accounts; paths 1-3 stay as the netting-account fallback.
-    if account_margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING:
+    #
+    # 2026-05-19 fix v8 (Part A) — additional gate: ``order_type ==
+    # "market"``. Limit and stop pending orders DO NOT generate
+    # positions at order_send time (the broker queues them; the
+    # position only materializes when the pending price triggers). The
+    # v7 anomaly signature (idx=000 GBPUSD limit sell at 12.6ms
+    # latency) was path 0's volume+side fallback picking up a RESIDUAL
+    # position from a prior session — exactly the bug the order_type
+    # gate closes. Pending orders now fall straight through to paths
+    # 1-3, which correctly return empty for an unfilled pending order.
+    if account_margin_mode == ACCOUNT_MARGIN_MODE_RETAIL_HEDGING and order_type == "market":
         order_ticket_p0 = int(getattr(order_send_result, "order", 0) or 0)
         if order_ticket_p0:
             # 2026-05-15 fix v7 — retry loop + symbol/volume/side fallback.
@@ -1363,8 +1501,23 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
                 attempts_diagnostics.append(attempt_record)
 
                 # First try: strict ticket match.
+                #
+                # 2026-05-19 fix v8 (Part B2) — refuse to match against any
+                # ticket in ``session_start_stale_set``. The strict-ticket
+                # branch would rarely hit this in practice (the order
+                # ticket the broker JUST returned shouldn't collide with a
+                # residual ticket from a prior session); the defensive
+                # check costs nothing and protects against a pathological
+                # ticket-reuse scenario.
                 for pos in last_positions:
-                    if int(getattr(pos, "ticket", 0) or 0) != order_ticket_p0:
+                    pos_ticket = int(getattr(pos, "ticket", 0) or 0)
+                    if pos_ticket != order_ticket_p0:
+                        continue
+                    if (
+                        session_start_stale_set is not None
+                        and pos_ticket in session_start_stale_set
+                    ):
+                        # Stale residual — fall through past the match.
                         continue
                     price_open = float(getattr(pos, "price_open", 0.0) or 0.0)
                     if price_open == 0.0:
@@ -1387,6 +1540,15 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
                 # to ``request_time_utc``. Defensive guard against
                 # claimed_deal_tickets so a previously-attributed
                 # position isn't double-claimed.
+                #
+                # 2026-05-19 fix v8 (Part B2) — also refuse to match
+                # against any ticket in ``session_start_stale_set``. This
+                # is the CRITICAL guard: the v7 anomaly mechanism was
+                # exactly this matcher latching onto a residual
+                # symbol+volume+side position from a prior session. The
+                # B1 sweep removes residuals in the common case; this
+                # check covers the B1-failure-falls-to-B2 case where the
+                # close itself failed (e.g. market closed).
                 candidates = [
                     p
                     for p in last_positions
@@ -1395,6 +1557,10 @@ def _resolve_fill_from_deal(  # pragma: no cover - integration path
                     and (
                         claimed_deal_tickets is None
                         or int(getattr(p, "ticket", 0) or 0) not in claimed_deal_tickets
+                    )
+                    and (
+                        session_start_stale_set is None
+                        or int(getattr(p, "ticket", 0) or 0) not in session_start_stale_set
                     )
                 ]
                 if candidates:
@@ -2223,6 +2389,195 @@ def _output_paths(run_id: str, root: pathlib.Path) -> tuple[pathlib.Path, pathli
     return (out_dir / f"{run_id}.parquet", out_dir / f"{run_id}.json")
 
 
+def run_session_start_sweep(
+    mt5: Any,
+    *,
+    symbols: tuple[str, ...],
+    constants: dict[str, int],
+    template: dict[str, Any],
+    success_retcode: int,
+    verify_timeout_seconds: float = SESSION_START_SWEEP_VERIFY_TIMEOUT_SECONDS,
+    poll_interval_seconds: float = PATH0_RETRY_SLEEP_SECONDS,
+    sleep_func: Any = None,
+) -> tuple[set[int], int]:
+    """Close residual positions on each scheduled symbol before the first order_send.
+
+    2026-05-19 fix v8 (Part B) — session-start residual-position sweep.
+    Closes positions left over from a prior session via opposing-side
+    market orders (B1, the preferred path). If a close fails (e.g.
+    ``mt5.order_send`` returns ``retcode != TRADE_RETCODE_DONE`` — most
+    commonly 10018 "Market closed" on a residual carrying over from a
+    Friday-late session into a Sunday-late restart), the residual's
+    ticket is recorded in the session-scoped ``stale_set`` and returned
+    to ``main()`` so it can be threaded into ``_resolve_fill_from_deal``
+    as ``session_start_stale_set``. Path 0's matchers then refuse to
+    match against any ticket in the set (B2 fallback).
+
+    The function is testable WITHOUT a real MT5 connection by passing
+    in a mock ``mt5`` whose ``positions_get`` / ``order_send`` /
+    ``symbol_info_tick`` methods return the staged shapes. The
+    ``sleep_func`` parameter is dependency-injected for tests that need
+    a synchronous no-op (the production call site passes ``time.sleep``).
+
+    Parameters
+    ----------
+    mt5
+        The MetaTrader5 module (or a mock in tests).
+    symbols
+        Every symbol the recording schedule will touch. For each, the
+        sweep calls ``mt5.positions_get(symbol=...)`` and iterates the
+        returned positions.
+    constants
+        The same ``ORDER_TYPE_BUY`` / ``ORDER_TYPE_SELL`` / etc. dict
+        ``main()`` builds for the per-iteration order_send calls.
+    template
+        Order-request template providing ``deviation`` + ``type_filling``
+        defaults; the symbol is overridden per close.
+    success_retcode
+        ``mt5.TRADE_RETCODE_DONE`` — used to detect close failures
+        (anything other than this counts as a failed close and the
+        residual falls into the stale_set).
+    verify_timeout_seconds
+        Maximum time to wait for ``positions_get(symbol)`` to confirm
+        the symbol is clear after sending close orders. Defaults to
+        2 seconds (40 polls x 50ms). If the timeout fires with positions
+        still present, the unrecorded survivors fall into the stale_set.
+    poll_interval_seconds
+        Interval between verification polls. Defaults to 50ms (the same
+        cadence path 0's retry loop uses).
+    sleep_func
+        Injected sleep function (defaults to ``time.sleep``). Tests pass
+        a no-op so the verification loop runs in ~0ms.
+
+    Returns
+    -------
+    tuple[set[int], int]
+        ``(stale_set, n_residual_positions_found)`` — the set of
+        position tickets the sweep could NOT close (B2 fallback content),
+        and the total count of residual positions found across all
+        symbols. ``len(stale_set)`` is ≤ ``n_residual_positions_found``
+        — equal in the all-B2 case, strictly less when the B1 close
+        succeeded for at least one residual.
+    """
+    if sleep_func is None:
+        sleep_func = time.sleep
+
+    stale_set: set[int] = set()
+    n_residual_total = 0
+    symbols_with_residuals: list[str] = []
+    n_closed = 0
+    n_recorded = 0
+
+    for symbol in symbols:
+        positions = mt5.positions_get(symbol=symbol) or ()
+        positions_list = list(positions)
+        if not positions_list:
+            continue
+        symbols_with_residuals.append(symbol)
+        n_residual_total += len(positions_list)
+
+        # Attempt B1 — close every residual on this symbol via opposing-
+        # side market orders.
+        symbol_failed_tickets: list[int] = []
+        for pos in positions_list:
+            pos_ticket = int(getattr(pos, "ticket", 0) or 0)
+            pos_volume = float(getattr(pos, "volume", 0.0) or 0.0)
+            pos_type = int(getattr(pos, "type", -1))
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                # Cannot price the close — record and continue.
+                symbol_failed_tickets.append(pos_ticket)
+                print(
+                    f"{_LOG_PREFIX_SESSION_START_SWEEP_CLOSE} "
+                    f"symbol={symbol} ticket={pos_ticket} action=skip "
+                    f'reason="tick None"',
+                    file=sys.stderr,
+                )
+                continue
+            opposite_type = (
+                constants["ORDER_TYPE_SELL"]
+                if pos_type == constants["ORDER_TYPE_BUY"]
+                else constants["ORDER_TYPE_BUY"]
+            )
+            close_price = float(
+                tick.bid if opposite_type == constants["ORDER_TYPE_SELL"] else tick.ask
+            )
+            close_req = {
+                "action": constants["TRADE_ACTION_DEAL"],
+                "symbol": symbol,
+                "volume": pos_volume,
+                "type": opposite_type,
+                "position": pos_ticket,
+                "price": close_price,
+                "deviation": int(template["deviation"]),
+                "type_filling": int(template["type_filling"]),
+                "sl": 0.0,
+                "tp": 0.0,
+            }
+            close_result = mt5.order_send(close_req)
+            close_retcode = int(getattr(close_result, "retcode", 0) or 0) if close_result else 0
+            close_comment = (
+                str(getattr(close_result, "comment", "") or "") if close_result else "None"
+            )
+            print(
+                f"{_LOG_PREFIX_SESSION_START_SWEEP_CLOSE} "
+                f"symbol={symbol} ticket={pos_ticket} "
+                f"retcode={close_retcode} "
+                f'comment="{close_comment}"',
+                file=sys.stderr,
+            )
+            if close_retcode != success_retcode:
+                symbol_failed_tickets.append(pos_ticket)
+
+        # Verify the symbol is clear post-close (poll positions_get until
+        # empty or timeout). Any survivors land in the stale_set.
+        max_polls = max(1, int(verify_timeout_seconds / poll_interval_seconds))
+        for _ in range(max_polls):
+            remaining = mt5.positions_get(symbol=symbol) or ()
+            if not remaining:
+                break
+            sleep_func(poll_interval_seconds)
+        else:
+            remaining = mt5.positions_get(symbol=symbol) or ()
+
+        if remaining:
+            for pos in remaining:
+                t = int(getattr(pos, "ticket", 0) or 0)
+                if t:
+                    stale_set.add(t)
+                    n_recorded += 1
+        # Tickets we explicitly know failed to close above (e.g. tick
+        # None) — record in case they're not in `remaining` due to a
+        # broker quirk.
+        for t in symbol_failed_tickets:
+            if t and t not in stale_set:
+                stale_set.add(t)
+                n_recorded += 1
+
+    n_closed = n_residual_total - len(stale_set)
+    if n_closed < 0:
+        # Defensive: never negative even if positions reappear mid-sweep.
+        n_closed = 0
+
+    action: str
+    if n_residual_total == 0:
+        action = "closed"  # vacuously true — nothing to do
+    elif len(stale_set) == 0:
+        action = "closed"
+    elif n_closed == 0:
+        action = "recorded_in_stale_set"
+    else:
+        action = "mixed"
+
+    print(
+        f"{_LOG_PREFIX_SESSION_START_SWEEP} "
+        f"found {n_residual_total} residual positions on symbols "
+        f"{symbols_with_residuals}; action={action}",
+        file=sys.stderr,
+    )
+    return stale_set, n_residual_total
+
+
 def write_recording(
     rows: list[dict[str, Any]],
     *,
@@ -2232,6 +2587,7 @@ def write_recording(
     root: pathlib.Path,
     success_retcode: int = 10009,
     n_market_lookup_failures: int = 0,
+    n_residual_positions_at_session_start: int = 0,
 ) -> tuple[pathlib.Path, pathlib.Path]:
     """Persist ``rows`` to parquet and write the session manifest.
 
@@ -2248,6 +2604,11 @@ def write_recording(
     exceeds 5%. Callers running the integration path should thread the
     session-scoped counter through every flush so the manifest reflects
     the cumulative count, not just the post-last-flush slice.
+
+    Manifest schema v1.3 (2026-05-19 fix v8): the manifest carries a
+    ``n_residual_positions_at_session_start`` integer counting how many
+    residual positions the session-start sweep found across all
+    scheduled symbols. Forensic-only — ``0`` is healthy.
     """
     parquet_path, manifest_path = _output_paths(run_id, root)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2274,6 +2635,7 @@ def write_recording(
         n_filled_market=n_filled_market,
         n_rejected=n_rejected,
         n_market_lookup_failures=int(n_market_lookup_failures),
+        n_residual_positions_at_session_start=int(n_residual_positions_at_session_start),
     )
     manifest_path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
     return parquet_path, manifest_path
@@ -2479,6 +2841,22 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             "type_filling": mt5.ORDER_FILLING_IOC,
         }
 
+        # 2026-05-19 fix v8 (Part B) — session-start residual-position
+        # sweep. Closes residuals from a prior session (B1) or, if a
+        # close fails (e.g. market closed), records them in a stale_set
+        # (B2 fallback) that path 0's matchers refuse to match against.
+        # MUST run BEFORE the first ``order_send`` so the first market
+        # order's path-0 lookup cannot pick up a residual position from
+        # a prior session — the exact 1-anomaly-per-session signature
+        # the v8 fix closes.
+        session_start_stale_set, n_residual_positions_at_session_start = run_session_start_sweep(
+            mt5,
+            symbols=symbols,
+            constants=constants,
+            template=template,
+            success_retcode=success_retcode,
+        )
+
         session_deadline = start_utc + timedelta(hours=HARD_TIME_LIMIT_HOURS)
         rows: list[dict[str, Any]] = []
         rng = random.Random(int(args.seed) ^ 0xA5A5)  # for inside_spread flips
@@ -2606,6 +2984,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                     claimed_deal_tickets=claimed_deal_tickets,
                     account_margin_mode=account_margin_mode,
                     server_time_offset_seconds=server_time_offset_seconds,
+                    session_start_stale_set=session_start_stale_set,
                 )
 
                 # Market-vs-pending lookup-failure distinction. A market
@@ -2699,6 +3078,9 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                         root=repo_root,
                         success_retcode=success_retcode,
                         n_market_lookup_failures=n_market_lookup_failures,
+                        n_residual_positions_at_session_start=(
+                            n_residual_positions_at_session_start
+                        ),
                     )
                     rows = []  # already on disk; avoid double-append next flush
             except SystemExit:
@@ -2714,6 +3096,9 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
                         root=repo_root,
                         success_retcode=success_retcode,
                         n_market_lookup_failures=n_market_lookup_failures,
+                        n_residual_positions_at_session_start=(
+                            n_residual_positions_at_session_start
+                        ),
                     )
                 except Exception:  # pragma: no cover — best-effort flush
                     pass
@@ -2748,6 +3133,7 @@ def main(argv: list[str] | None = None) -> None:  # pragma: no cover - integrati
             root=repo_root,
             success_retcode=success_retcode,
             n_market_lookup_failures=n_market_lookup_failures,
+            n_residual_positions_at_session_start=n_residual_positions_at_session_start,
         )
         # Summary to stderr too, so the operator can confirm completion even
         # if stdout was discarded by the scheduler.
