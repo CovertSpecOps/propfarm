@@ -262,6 +262,28 @@ five windows, and asserts the values are byte-identical afterward.
    read as far-outside-spread phantom fills. Documenting this in the
    runbook + module + test prevents a future refactor from silently
    regressing.
+6. **The "no fills outside bid/ask" pass is structural, not empirical**
+   (Wave 6d reviewer LOW finding). Per-window event factors were tuned
+   so `spread_event_factor` (5-100×) ≫ `slip_event_factor` (2-8×),
+   giving half-spread ≫ slip at every tick. SNB headroom: half-spread
+   p99 = 394 pip vs slip p99 = 5.77 pip (388-pip cushion). The
+   containment property holds **by construction** rather than by
+   independent realism. **Treat the Wave 6d PASS as a no-crash sanity
+   probe, NOT a forecast-quality fit.** If round-3 re-introduces a
+   non-zero `vol_coef` on FX majors, the event_factors MUST be
+   re-derived against EURCHF tick data (or equivalent) before the
+   stress-day output is fit for backtest cost-model use.
+7. **Operator caller-contract on stops/limits during a gap** (Wave 6d
+   reviewer NIT). `simulate_fill` has no independent quote feed and
+   cannot detect a stale trigger price. **Callers of
+   `simulate_fill` on stop/limit orders during a gap MUST pass the
+   post-gap quote as `requested_price`.** If a strategy passes the
+   pre-gap stop-loss / take-profit price into a fill at a gap-affected
+   tick, the engine will produce a fill near that stale price (it's a
+   "phantom fill at requested" from the operator's view). The
+   `fill_engine.py` module docstring's "Per-request semantics" section
+   makes this explicit; the reviewer-mandated cross-link from this
+   runbook closes the operator-facing documentation gap.
 
 ## Recommendations for round-3
 
@@ -281,6 +303,17 @@ Wave 6d findings that bear on those candidates:
   to fit it. Until then, the calibrated `stress_multiplier` (× the
   per-window event factor) carries the regime — which IS in the model
   but is a multiplicative amplifier rather than a vol-responsive term.
+  **Wave 6d reviewer caveat**: the impl agent's "20-50 pips with
+  vol_coef" claim numerically overshoots. At Wave-6b seed values
+  (base_pips=0.3, vol_coef=2.0) with SNB synthetic vol=2.0, raw =
+  0.3 + 2.0×2.0 = 4.3 pip → multiplied by stress_multiplier=15 ×
+  event_factor=8 → slip ≈ 521 pip. The event_factor and vol_coef are
+  COUPLED in the model. Round-3 must do a sensitivity sweep, not just
+  re-introduce the seed vol_coef — and the per-window `event_factor`
+  must be re-derived to keep the spread-vs-slip ratio inside the
+  bid/ask containment band (otherwise the round-3 stress windows would
+  start producing legitimate "fills outside bid/ask" not because of
+  the news_window scope bug but because slip overshoots spread).
 * **The 100x event factor on SNB is a load-bearing override.** It
   reflects the documented 1900-pip EURCHF gap, not a fitted residual.
   When EURCHF is added to `SUPPORTED_SYMBOLS`, this factor should be
