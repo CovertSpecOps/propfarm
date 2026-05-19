@@ -1,0 +1,12 @@
+{
+  "run_id": "bbf710b335f84e94af21b74cc3b5d725",
+  "start_utc": "2026-05-18T01:34:26.669598Z",
+  "end_utc": "2026-05-19T01:04:12.950090Z",
+  "n_attempted": 200,
+  "n_filled": 199,
+  "n_filled_market": 119,
+  "n_rejected": 1,
+  "n_market_lookup_failures": 0,
+  "schema_version": "1.2",
+  "vps_host_redacted": true
+}
